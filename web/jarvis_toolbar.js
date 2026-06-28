@@ -34,22 +34,10 @@
 //   3. Build ulang WASM dengan emcc
 // ============================================================
 
-// 🔒 SERVERLESS GUARD — Skip semua jika Jarvis AI dimatikan
-if (typeof PLATFORM !== 'undefined' && !PLATFORM.JARVIS_ENABLED) {
-    console.log("%c[JARVIS-TB] Disabled — serverless mode (PLATFORM.JARVIS_ENABLED = false)", "color:#888");
-    // Expose no-op public API agar code lain tidak error
-    window.JarvisToolbar = {
-        toggle: function() {}, show: function() {}, hide: function() {},
-        sync: function() {}, state: function() { return {}; },
-        openTools: function() {}, openPanel: function() {}, openReplay: function() {},
-        resync: function() {}
-    };
-    // Stop — jangan buat UI, jangan sync posisi, jangan polling
-} else {
 // ── TOOLBAR ENABLED — load full toolbar overlay ──
-
 (function() {
 'use strict';
+
 
 // ── Config ──────────────────────────────────────────────────
 const ASSETS_PATH = 'assets/';          // Folder PNG (sama kayak C++ pakai)
@@ -274,7 +262,10 @@ function buildHTML() {
          berdasarkan orientasi frame ImGui (width vs height) -->
     <div id="jt-drawing-toolbar" class="jt-toolbar">
         <div class="jt-toolbar-inner">
-            ${DRAWING_TOOLS.map(tool => buildButtonHTML(tool, 'drawing')).join('')}
+            ${DRAWING_TOOLS.filter(tool => {
+                if (tool.id === 'jarvis' && typeof PLATFORM !== 'undefined' && !PLATFORM.JARVIS_ENABLED) return false;
+                return true;
+            }).map(tool => buildButtonHTML(tool, 'drawing')).join('')}
         </div>
     </div>
 
@@ -1032,5 +1023,3 @@ window.JarvisToolbar = {
 };
 
 })();
-
-} // end else JARVIS_ENABLED
