@@ -495,111 +495,6 @@ async function fetchOlderCandles(uiSymbol, beforeTimeSec, limitBars) {
     return await fetchCandlesFromHL(uiSymbol, startMs, endMs);
 }
 
-/**
- * Download dan parse binary candle file (.bin) dari folder data/
- * Format MTVC: Header(12 bytes) + Body(N × 24 bytes)
- *   Header: Magic"MTVC"(4) + Version uint32(4) + Count uint32(4)
- *   Candle: time uint32(4) + open float32(4) + high float32(4)
- *           + low float32(4) + close float32(4) + vol float32(4)
- *
- * File ini di-generate dari candles.db via export_candles_binary.py
- * dan di-upload ke GitHub bersama project.
- * Hanya dipakai saat user pertama kali buka (IndexedDB kosong).
- */
-async function downloadBinaryHistory(uiSymbol) {
-    const url = `data/${uiSymbol}.bin`;
-    logInfo(`[BIN] ⬇️ Downloading ${url}...`);
-    showLoadingOverlay(`Downloading ${uiSymbol} history...`, 5);
-
-    try {
-        const resp = await fetch(url);
-        if (!resp.ok) {
-            logWarn(`[BIN] ${url} not found (HTTP ${resp.status}) → fallback HL REST`);
-            return null;
-        }
-
-        const contentLength = resp.headers.get('content-length');
-        const totalBytes = contentLength ? parseInt(contentLength) : 0;
-
-        // Stream download dengan progress
-        let buffer;
-        if (totalBytes > 0 && resp.body && resp.body.getReader) {
-            const reader = resp.body.getReader();
-            const chunks = [];
-            let received = 0;
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                chunks.push(value);
-                received += value.length;
-                const pct = Math.round((received / totalBytes) * 40); // 0-40%
-                showLoadingOverlay(`Downloading ${uiSymbol} (${(received/1024/1024).toFixed(1)} MB)`, pct);
-            }
-            // Gabungkan chunks
-            const merged = new Uint8Array(received);
-            let pos = 0;
-            for (const chunk of chunks) {
-                merged.set(chunk, pos);
-                pos += chunk.length;
-            }
-            buffer = merged.buffer;
-        } else {
-            buffer = await resp.arrayBuffer();
-        }
-
-        const view = new DataView(buffer);
-
-        // Parse header (12 bytes)
-        if (buffer.byteLength < 12) {
-            logErr(`[BIN] File terlalu kecil: ${buffer.byteLength} bytes`);
-            return null;
-        }
-        const magic = String.fromCharCode(
-            view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)
-        );
-        if (magic !== 'MTVC') {
-            logErr(`[BIN] Invalid magic: "${magic}" (expected MTVC)`);
-            return null;
-        }
-
-        const version = view.getUint32(4, true);  // little-endian
-        const count   = view.getUint32(8, true);
-
-        logInfo(`[BIN] Format MTVC v${version} — ${count.toLocaleString()} candles`);
-
-        // Parse body
-        const HEADER  = 12;
-        const CANDLE  = 24;  // 6 × float32/uint32
-        const expectedSize = HEADER + (count * CANDLE);
-        if (buffer.byteLength < expectedSize) {
-            logErr(`[BIN] Ukuran file tidak sesuai: ${buffer.byteLength} < ${expectedSize}`);
-            return null;
-        }
-
-        showLoadingOverlay(`Parsing ${count.toLocaleString()} candles...`, 45);
-
-        const candles = new Array(count);
-        for (let i = 0; i < count; i++) {
-            const off = HEADER + (i * CANDLE);
-            candles[i] = {
-                time: view.getUint32(off,      true),
-                o:    view.getFloat32(off + 4,  true),
-                h:    view.getFloat32(off + 8,  true),
-                l:    view.getFloat32(off + 12, true),
-                c:    view.getFloat32(off + 16, true),
-                v:    view.getFloat32(off + 20, true)
-            };
-        }
-
-        logGood(`[BIN] ✅ ${candles.length.toLocaleString()} candles parsed dari ${uiSymbol}.bin`);
-        return candles;
-
-    } catch (e) {
-        logErr(`[BIN] Download error: ${e.message}`);
-        return null;
-    }
-}
-
 // =========================================================
 // 7. HYPERLIQUID WEBSOCKET ADAPTER (BARU)
 // =========================================================
@@ -904,87 +799,27 @@ window.SetActiveSymbol = async function(newSym) {
         logInfo(`[INIT] Initial load selesai — lazy diizinkan`);
 
     } else {
-        // CACHE MISS → coba download binary dulu, fallback HL REST
-        logWarn(`[CACHE MISS] ${CURRENT_SYMBOL} → download...`);
-        showLoadingOverlay(`Loading ${CURRENT_SYMBOL}...`, 0);
+        // CACHE MISS atau incomplete → download fresh dari HL REST
+        logWarn(`[CACHE MISS] ${CURRENT_SYMBOL} → download dari Hyperliquid`);
+        showLoadingOverlay(`Downloading ${CURRENT_SYMBOL} history`, 0);
         isDownloading = true;
 
-        // ═══════════════════════════════════════════════════════════
-        // TAHAP 1: Coba download binary file (.bin) dari folder data/
-        //   File ini berisi ~90.000 candle M1 dari candles.db lokal
-        //   yang sudah di-export dan di-upload ke GitHub.
-        //   Ukuran hanya ~2 MB per symbol (format MTVC binary).
-        // ═══════════════════════════════════════════════════════════
-        let candles = await downloadBinaryHistory(CURRENT_SYMBOL);
-        let usedBinary = false;
+        const candles = await fetchHistoryPaginated(CURRENT_SYMBOL, PLATFORM.HISTORY_BARS);
 
-        if (candles && candles.length > 0) {
-            // ✅ Binary berhasil! Simpan ke IndexedDB
-            usedBinary = true;
-            logGood(`[BIN] ${candles.length.toLocaleString()} candles dari binary → simpan ke IDB`);
-            showLoadingOverlay(`Importing ${CURRENT_SYMBOL} (${candles.length.toLocaleString()} candles)`, 50);
+        if (candles.length > 0) {
+            updateProgress(candles.length, candles.length, "Saving");
             addToBuffer(CURRENT_SYMBOL, candles);
             await flushBuffer();
-
-            // ═══════════════════════════════════════════════════════
-            // TAHAP 2: Gap fill — binary mungkin sudah lama,
-            //   ambil candle terbaru dari Hyperliquid REST
-            // ═══════════════════════════════════════════════════════
-            const latestBinTime = candles[candles.length - 1].time;
-            const nowEpoch = Math.floor(Date.now() / 1000);
-            const gapSec = nowEpoch - latestBinTime;
-            const gapMin = Math.floor(gapSec / 60);
-
-            if (gapSec > 60) {
-                logInfo(`[BIN-GAP] ${gapMin}m gap setelah binary → fill dari HL REST`);
-                showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (+${gapMin}m terbaru)`, 70);
-
-                let gapCandles;
-                if (gapMin > 4500) {
-                    // Gap besar → gunakan pagination (HL max 5000 per request)
-                    gapCandles = await fetchHistoryPaginated(CURRENT_SYMBOL, gapMin);
-                } else {
-                    // Gap kecil → 1 request cukup
-                    gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestBinTime);
-                }
-
-                if (gapCandles && gapCandles.length > 0) {
-                    addToBuffer(CURRENT_SYMBOL, gapCandles);
-                    await flushBuffer();
-                    logGood(`[BIN-GAP] ✅ +${gapCandles.length.toLocaleString()} candles terbaru dari HL`);
-                } else {
-                    logInfo(`[BIN-GAP] Tidak ada gap candle baru (market tutup?)`);
-                }
-            } else {
-                logInfo(`[BIN-GAP] Data binary masih fresh (gap ${gapSec}s)`);
-            }
-        } else {
-            // ═══════════════════════════════════════════════════════
-            // FALLBACK: Binary tidak ada (404) → fetch dari HL REST
-            // ═══════════════════════════════════════════════════════
-            logWarn(`[FALLBACK] Binary tidak tersedia → fetch ${PLATFORM.HISTORY_BARS} candles dari Hyperliquid REST`);
-            candles = await fetchHistoryPaginated(CURRENT_SYMBOL, PLATFORM.HISTORY_BARS);
-            if (candles && candles.length > 0) {
-                updateProgress(candles.length, candles.length, "Saving");
-                addToBuffer(CURRENT_SYMBOL, candles);
-                await flushBuffer();
-            }
-        }
-
-        // Rebuild chart dari IndexedDB
-        if (candles && candles.length > 0) {
-            showLoadingOverlay(`Rendering ${CURRENT_SYMBOL} chart`, 90);
             await rebuildFullFromDB(CURRENT_SYMBOL);
         } else {
-            logErr(`[DOWNLOAD] Tidak ada data untuk ${CURRENT_SYMBOL}`);
+            logErr(`[DOWNLOAD] Tidak ada data dari Hyperliquid untuk ${CURRENT_SYMBOL}`);
         }
 
         hideLoadingOverlay();
         isDownloading = false;
         g_initialLoadDone = true;
 
-        const source = usedBinary ? 'binary + HL gap' : 'HL REST';
-        logGood(`✅ ${CURRENT_SYMBOL} fully loaded! (source: ${source})`);
+        logGood(`✅ ${CURRENT_SYMBOL} fully loaded!`);
 
         if (pendingSymbolSwitch) {
             const next = pendingSymbolSwitch;
