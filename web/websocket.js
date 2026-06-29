@@ -218,7 +218,7 @@ async function saveBufferToDB(data) {
     if (!db || !data.length) return;
     const bigWrite = data.length > 500;
     if (bigWrite && window._spinnerShow) window._spinnerShow();
-    const BATCH = 500;
+    const BATCH = 3000;
     for (let i = 0; i < data.length; i += BATCH) {
         const chunk = data.slice(i, i + BATCH);
         await new Promise((res, rej) => {
@@ -229,7 +229,7 @@ async function saveBufferToDB(data) {
             t.onerror    = e  => { console.error('[DB] Save error:', e); res(); };
         });
         if (i + BATCH < data.length)
-            await new Promise(r => requestAnimationFrame(r));
+            await new Promise(r => setTimeout(r, 0));
     }
     if (bigWrite && window._spinnerHide) window._spinnerHide();
 }
@@ -250,6 +250,74 @@ async function flushBuffer() {
     const tmp = [...candleBuffer];
     candleBuffer = [];
     await saveBufferToDB(tmp);
+}
+
+/**
+ * TURBO MODE: Push candle langsung ke WASM tanpa lewat IndexedDB.
+ * Chart langsung muncul tanpa menunggu IDB selesai menyimpan.
+ * Data sudah harus terurut (oldest → newest).
+ */
+function pushCandlesDirectToWASM(symbol, candles) {
+    if (!isWasmReady || !candles.length) return;
+
+    logGood(`[DIRECT] ${candles.length.toLocaleString()} bars → push langsung ke WASM...`);
+    isRendering = true;
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+
+    for (let i = 0; i < candles.length; i++) {
+        const c = candles[i];
+        notifyWASM_candle(
+            c.o || c.open,  c.h || c.high,
+            c.l || c.low,   c.c || c.close,
+            c.time,         c.v || c.volume || 1
+        );
+        if (c.time > lastWasmTime) lastWasmTime = c.time;
+    }
+
+    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+    isRendering = false;
+    downloadedSymbols.add(symbol);
+
+    logGood(`[DIRECT] ✅ ${symbol}: ${candles.length.toLocaleString()} bars rendered!`);
+}
+
+/**
+ * Background IDB Save: Simpan candle ke IndexedDB tanpa blocking UI.
+ * Dipanggil SETELAH chart sudah muncul, jadi user tidak perlu menunggu.
+ * Menggunakan batch besar (5000) dan setTimeout(0) agar tidak mengganggu rendering.
+ */
+async function saveToIDBBackground(symbol, candles) {
+    if (!db || !candles.length) return;
+
+    const data = candles.map(c => ({
+        symbol,
+        time: c.time || c.t,
+        o: c.o || c.open,  h: c.h || c.high,
+        l: c.l || c.low,   c: c.c || c.close,
+        v: c.v || c.volume || 1
+    }));
+
+    const BATCH = 5000;
+    const totalBatches = Math.ceil(data.length / BATCH);
+    logInfo(`[BG-SAVE] 💾 Menyimpan ${data.length.toLocaleString()} candles ke IDB (${totalBatches} batch, background)...`);
+
+    for (let i = 0; i < data.length; i += BATCH) {
+        const chunk = data.slice(i, i + BATCH);
+        const batchNum = Math.floor(i / BATCH) + 1;
+        await new Promise((res) => {
+            const t = db.transaction([STORE], 'readwrite');
+            const s = t.objectStore(STORE);
+            chunk.forEach(item => s.put(item));
+            t.oncomplete = () => res();
+            t.onerror    = () => res();
+        });
+        logInfo(`[BG-SAVE] batch ${batchNum}/${totalBatches} done`);
+        // Yield ke main thread agar chart tetap responsif
+        await new Promise(r => setTimeout(r, 10));
+    }
+
+    logGood(`[BG-SAVE] ✅ ${data.length.toLocaleString()} candles tersimpan di IDB`);
 }
 
 async function getOlderCandlesFromDB(symbol, beforeTime, limit = 10000) {
@@ -911,20 +979,14 @@ window.SetActiveSymbol = async function(newSym) {
 
         // ═══════════════════════════════════════════════════════════
         // TAHAP 1: Coba download binary file (.bin) dari folder data/
-        //   File ini berisi ~90.000 candle M1 dari candles.db lokal
-        //   yang sudah di-export dan di-upload ke GitHub.
-        //   Ukuran hanya ~2 MB per symbol (format MTVC binary).
         // ═══════════════════════════════════════════════════════════
         let candles = await downloadBinaryHistory(CURRENT_SYMBOL);
         let usedBinary = false;
+        let allCandles = [];  // semua candle (binary + gap) untuk IDB save
 
         if (candles && candles.length > 0) {
-            // ✅ Binary berhasil! Simpan ke IndexedDB
             usedBinary = true;
-            logGood(`[BIN] ${candles.length.toLocaleString()} candles dari binary → simpan ke IDB`);
-            showLoadingOverlay(`Importing ${CURRENT_SYMBOL} (${candles.length.toLocaleString()} candles)`, 50);
-            addToBuffer(CURRENT_SYMBOL, candles);
-            await flushBuffer();
+            allCandles = [...candles];
 
             // ═══════════════════════════════════════════════════════
             // TAHAP 2: Gap fill — binary mungkin sudah lama,
@@ -936,31 +998,41 @@ window.SetActiveSymbol = async function(newSym) {
             const gapMin = Math.floor(gapSec / 60);
 
             if (gapSec > 60) {
-                logInfo(`[BIN-GAP] ${gapMin}m gap setelah binary → fill dari HL REST`);
-                showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (+${gapMin}m terbaru)`, 70);
+                logInfo(`[BIN-GAP] ${gapMin}m gap → fill dari HL REST`);
+                showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (+${gapMin}m terbaru)`, 60);
 
                 let gapCandles;
                 if (gapMin > 4500) {
-                    // Gap besar → gunakan pagination (HL max 5000 per request)
                     gapCandles = await fetchHistoryPaginated(CURRENT_SYMBOL, gapMin);
                 } else {
-                    // Gap kecil → 1 request cukup
                     gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestBinTime);
                 }
 
                 if (gapCandles && gapCandles.length > 0) {
-                    addToBuffer(CURRENT_SYMBOL, gapCandles);
-                    await flushBuffer();
+                    allCandles = [...candles, ...gapCandles];
                     logGood(`[BIN-GAP] ✅ +${gapCandles.length.toLocaleString()} candles terbaru dari HL`);
-                } else {
-                    logInfo(`[BIN-GAP] Tidak ada gap candle baru (market tutup?)`);
                 }
-            } else {
-                logInfo(`[BIN-GAP] Data binary masih fresh (gap ${gapSec}s)`);
             }
+
+            // ═══════════════════════════════════════════════════════
+            // TURBO: Push LANGSUNG ke WASM → chart muncul INSTAN!
+            //   Tidak perlu simpan ke IDB dulu!
+            // ═══════════════════════════════════════════════════════
+            showLoadingOverlay(`Rendering ${CURRENT_SYMBOL} (${allCandles.length.toLocaleString()} bars)`, 80);
+            pushCandlesDirectToWASM(CURRENT_SYMBOL, allCandles);
+            hideLoadingOverlay();
+
+            // Chart sudah muncul! ✅ Sekarang simpan ke IDB di background
+            // User sudah bisa scroll/zoom chart sementara IDB menyimpan
+            logInfo(`[TURBO] Chart sudah tampil! Menyimpan ke IDB di background...`);
+            saveToIDBBackground(CURRENT_SYMBOL, allCandles).then(() => {
+                logGood(`[TURBO] ✅ IDB background save selesai — lazy load siap!`);
+            });
+
         } else {
             // ═══════════════════════════════════════════════════════
             // FALLBACK: Binary tidak ada (404) → fetch dari HL REST
+            //   (alur lama, tetap pakai IDB karena data kecil)
             // ═══════════════════════════════════════════════════════
             logWarn(`[FALLBACK] Binary tidak tersedia → fetch ${PLATFORM.HISTORY_BARS} candles dari Hyperliquid REST`);
             candles = await fetchHistoryPaginated(CURRENT_SYMBOL, PLATFORM.HISTORY_BARS);
@@ -968,22 +1040,17 @@ window.SetActiveSymbol = async function(newSym) {
                 updateProgress(candles.length, candles.length, "Saving");
                 addToBuffer(CURRENT_SYMBOL, candles);
                 await flushBuffer();
+                await rebuildFullFromDB(CURRENT_SYMBOL);
+            } else {
+                logErr(`[DOWNLOAD] Tidak ada data untuk ${CURRENT_SYMBOL}`);
             }
+            hideLoadingOverlay();
         }
 
-        // Rebuild chart dari IndexedDB
-        if (candles && candles.length > 0) {
-            showLoadingOverlay(`Rendering ${CURRENT_SYMBOL} chart`, 90);
-            await rebuildFullFromDB(CURRENT_SYMBOL);
-        } else {
-            logErr(`[DOWNLOAD] Tidak ada data untuk ${CURRENT_SYMBOL}`);
-        }
-
-        hideLoadingOverlay();
         isDownloading = false;
         g_initialLoadDone = true;
 
-        const source = usedBinary ? 'binary + HL gap' : 'HL REST';
+        const source = usedBinary ? 'TURBO binary + HL gap' : 'HL REST';
         logGood(`✅ ${CURRENT_SYMBOL} fully loaded! (source: ${source})`);
 
         if (pendingSymbolSwitch) {
