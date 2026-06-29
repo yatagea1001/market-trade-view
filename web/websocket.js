@@ -110,8 +110,13 @@ function showLoadingOverlay(msg, pct = 0) {
             display:flex;flex-direction:column;align-items:center;justify-content:center;
             color:#0af;font-family:'Segoe UI',sans-serif;pointer-events:none;`;
         ov.innerHTML = `
+            <style>
+            @keyframes ov_spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            .ov-spinner { border: 4px solid rgba(0, 170, 255, 0.2); border-top: 4px solid #0af; border-radius: 50%; width: 40px; height: 40px; animation: ov_spin 1s linear infinite; margin: 0 auto 15px auto; }
+            </style>
             <div style="text-align:center">
-              <div id="ov-msg"  style="font-size:18px;font-weight:bold;margin-bottom:20px">Loading...</div>
+              <div class="ov-spinner"></div>
+              <div id="ov-msg"  style="font-size:18px;font-weight:bold;margin-bottom:20px;letter-spacing:1px">Synchronizing...</div>
               <div style="width:320px;height:8px;background:#222;border-radius:4px;overflow:hidden;margin-bottom:10px">
                 <div id="ov-bar" style="width:0%;height:100%;background:linear-gradient(90deg,#0af,#0f0);transition:width .3s"></div>
               </div>
@@ -576,8 +581,8 @@ async function fetchOlderCandles(uiSymbol, beforeTimeSec, limitBars) {
  */
 async function downloadBinaryHistory(uiSymbol) {
     const url = `data/${uiSymbol}.bin`;
-    logInfo(`[BIN] ⬇️ Downloading ${url}...`);
-    showLoadingOverlay(`Downloading ${uiSymbol} history...`, 5);
+    logInfo(`[BIN] ⬇️ Syncing ${url}...`);
+    showLoadingOverlay(`Synchronizing ${uiSymbol}...`, 5);
 
     try {
         const resp = await fetch(url);
@@ -601,7 +606,7 @@ async function downloadBinaryHistory(uiSymbol) {
                 chunks.push(value);
                 received += value.length;
                 const pct = Math.round((received / totalBytes) * 40); // 0-40%
-                showLoadingOverlay(`Downloading ${uiSymbol} (${(received/1024/1024).toFixed(1)} MB)`, pct);
+                showLoadingOverlay(`Synchronizing ${uiSymbol}`, pct);
             }
             // Gabungkan chunks
             const merged = new Uint8Array(received);
@@ -644,7 +649,7 @@ async function downloadBinaryHistory(uiSymbol) {
             return null;
         }
 
-        showLoadingOverlay(`Parsing ${count.toLocaleString()} candles...`, 45);
+        showLoadingOverlay(`Processing Data...`, 45);
 
         const candles = new Array(count);
         for (let i = 0; i < count; i++) {
@@ -973,8 +978,8 @@ window.SetActiveSymbol = async function(newSym) {
 
     } else {
         // CACHE MISS → coba download binary dulu, fallback HL REST
-        logWarn(`[CACHE MISS] ${CURRENT_SYMBOL} → download...`);
-        showLoadingOverlay(`Loading ${CURRENT_SYMBOL}...`, 0);
+        logWarn(`[CACHE MISS] ${CURRENT_SYMBOL} → sync...`);
+        showLoadingOverlay(`Synchronizing ${CURRENT_SYMBOL}...`, 0);
         isDownloading = true;
 
         // ═══════════════════════════════════════════════════════════
@@ -999,7 +1004,7 @@ window.SetActiveSymbol = async function(newSym) {
 
             if (gapSec > 60) {
                 logInfo(`[BIN-GAP] ${gapMin}m gap → fill dari HL REST`);
-                showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (+${gapMin}m terbaru)`, 60);
+                showLoadingOverlay(`Synchronizing ${CURRENT_SYMBOL}`, 60);
 
                 let gapCandles;
                 if (gapMin > 4500) {
@@ -1018,7 +1023,7 @@ window.SetActiveSymbol = async function(newSym) {
             // TURBO: Push LANGSUNG ke WASM → chart muncul INSTAN!
             //   Tidak perlu simpan ke IDB dulu!
             // ═══════════════════════════════════════════════════════
-            showLoadingOverlay(`Rendering ${CURRENT_SYMBOL} (${allCandles.length.toLocaleString()} bars)`, 80);
+            showLoadingOverlay(`Completing Sync...`, 80);
             pushCandlesDirectToWASM(CURRENT_SYMBOL, allCandles);
             hideLoadingOverlay();
 
