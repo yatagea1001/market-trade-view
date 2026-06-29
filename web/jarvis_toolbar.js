@@ -359,7 +359,7 @@ function buildCSS() {
         justify-content: flex-start;/* rata KIRI (axis primary) */
         gap: 3px;                   /* gap kecil biar merapat */
         pointer-events: auto;
-        padding: 4px;               /* 🔥 padding 0 = dempet ke title bar ImGui */
+        padding: 2px;               /* 🔥 padding 0 = dempet ke title bar ImGui */
         background: transparent;
         width: 100%;
         height: 100%;
