@@ -15,7 +15,7 @@ const PLATFORM = {
     HL_WS_URL:   "wss://api.hyperliquid.xyz/ws",
 
     // ── Fitur Toggle ──────────────────────────────────────────
-    JARVIS_ENABLED: false,           // AI assistant — dimatikan dulu
+    JARVIS_ENABLED: true,            // AI assistant — aktif (butuh localhost:3000)
     AUTH_ENABLED:   false,           // Login/register — dimatikan (guest mode)
 
     // ── Data Settings ─────────────────────────────────────────
