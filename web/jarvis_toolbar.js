@@ -34,10 +34,8 @@
 //   3. Build ulang WASM dengan emcc
 // ============================================================
 
-// ── TOOLBAR ENABLED — load full toolbar overlay ──
 (function() {
 'use strict';
-
 
 // ── Config ──────────────────────────────────────────────────
 const ASSETS_PATH = 'assets/';          // Folder PNG (sama kayak C++ pakai)
@@ -47,7 +45,7 @@ const ACCENT_COLOR = '#10b981';           // sama kayak jarvis_chat.js
 
 // ── State ───────────────────────────────────────────────────
 let overlay;                              // root container
-let drawingBar, rightBar, replayBtn;      // 3 grup toolbar
+let drawingBar, rightBar, replayBtn, navBar;  // 4 grup toolbar (drawing, panel, replay, nav)
 let tooltipEl;                            // tooltip element
 let wasmReady = false;
 let pollTimer = null;
@@ -234,6 +232,83 @@ const RIGHT_BAR_TOOLS = [
     }
 ];
 
+// ── Navigation Toolbar — 5 tombol (Symbol, TF, Candle, Indicator, + New) ──
+// Beda dengan DRAWING_TOOLS/RIGHT_BAR_TOOLS:
+// - Tombol lebih lebar (karena ada label teks)
+// - Klik → panggil wasm_nav_click_segment(segIdx) — set active segment
+// - Active segment dapat glow (slider animation via CSS)
+// - Scrollable (sama kayak toolbar lain)
+// - Symbol & Candle icon DINAMIS (update dari C++ sesuai state aktif)
+const NAV_TOOLS = [
+    {
+        id: 'nav-symbol',
+        segIdx: 0,
+        icon: 'assets/gold.png',   // default, akan di-update JS sesuai symbol aktif
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M9 10h6M9 14h6"/></svg>',
+        label: 'Symbol',
+        tooltip: 'Pilih Symbol (XAUUSD, EURUSD, BTCUSD, dll)',
+        isWide: true,
+        dynamicIcon: true   // 🔥 icon update dari C++ via wasm_nav_get_symbol_icon
+    },
+    {
+        id: 'nav-tf',
+        segIdx: 1,
+        icon: null,
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>',
+        label: 'TF',
+        tooltip: 'Pilih Timeframe (M1, M5, H1, dll)',
+        isWide: true
+    },
+    {
+        id: 'nav-candle',
+        segIdx: 2,
+        icon: null,   // 🔥 icon update dari C++ via wasm_nav_get_candle_style
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="8" width="4" height="10"/><line x1="8" y1="4" x2="8" y2="20"/><rect x="14" y="6" width="4" height="12"/><line x1="16" y1="2" x2="16" y2="22"/></svg>',
+        label: 'Candle',
+        tooltip: 'Pilih Style Candle (Line, Area, Footprint)',
+        isWide: true,
+        dynamicIcon: true   // 🔥 icon update dari C++ via wasm_nav_get_candle_style
+    },
+    {
+        id: 'nav-indicator',
+        segIdx: 3,
+        icon: null,
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="14 7 21 7 21 14"/></svg>',
+        label: 'Indicator',
+        tooltip: 'Buka Panel Indikator',
+        isWide: true
+    },
+    {
+        id: 'nav-new',
+        segIdx: 4,
+        icon: null,
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+        label: '+ New',
+        tooltip: 'Tambah Chart Baru',
+        isWide: true
+    }
+];
+
+// ── SVG icons untuk Candle Style (index 0-4) ──
+// Index sesuai enum CandleRenderStyle di CandleStyleManager.h:
+//   0 = RENDER_CANDLE (candlestick classic)
+//   1 = RENDER_LINE (garis close price)
+//   2 = RENDER_FP_OVERLAY (footprint overlay — box bid/ask di atas candle)
+//   3 = RENDER_FP_PROFILE (footprint profile — grid bid/ask)
+//   4 = RENDER_FP_BAR (footprint bar — proportional buy/sell bars)
+const NAV_CANDLE_SVGS = [
+    // 0: Candlestick classic
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="8" width="4" height="10"/><line x1="8" y1="4" x2="8" y2="20"/><rect x="14" y="6" width="4" height="12"/><line x1="16" y1="2" x2="16" y2="22"/></svg>',
+    // 1: Line chart
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 17 9 11 13 15 21 7"/></svg>',
+    // 2: Footprint overlay (candle + box overlay)
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="6" width="14" height="12"/><line x1="5" y1="10" x2="19" y2="10"/><line x1="5" y1="14" x2="19" y2="14"/><line x1="12" y1="6" x2="12" y2="18"/></svg>',
+    // 3: Footprint profile (grid)
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16"/><line x1="4" y1="8" x2="20" y2="8"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="16" x2="20" y2="16"/><line x1="8" y1="4" x2="8" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="16" y1="4" x2="16" y2="20"/></svg>',
+    // 4: Footprint bar (bars)
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="10" width="8" height="4"/><rect x="13" y="8" width="8" height="8"/></svg>'
+];
+
 // ── WASM Ready Guard ────────────────────────────────────────
 function isWasmReady() {
     if (wasmReady) return true;
@@ -262,11 +337,9 @@ function buildHTML() {
          berdasarkan orientasi frame ImGui (width vs height) -->
     <div id="jt-drawing-toolbar" class="jt-toolbar">
         <div class="jt-toolbar-inner">
-            ${DRAWING_TOOLS.filter(tool => {
-                if (tool.id === 'jarvis' && typeof PLATFORM !== 'undefined' && !PLATFORM.JARVIS_ENABLED) return false;
-                return true;
-            }).map(tool => buildButtonHTML(tool, 'drawing')).join('')}
+            ${DRAWING_TOOLS.map(tool => buildButtonHTML(tool, 'drawing')).join('')}
         </div>
+        <div class="jt-scroll-indicator"></div>
     </div>
 
     <!-- Right Main Toolbar (toggle panels)
@@ -275,6 +348,7 @@ function buildHTML() {
         <div class="jt-toolbar-inner">
             ${RIGHT_BAR_TOOLS.map(tool => buildButtonHTML(tool, 'right')).join('')}
         </div>
+        <div class="jt-scroll-indicator"></div>
     </div>
 
     <!-- Replay Floating Button
@@ -286,10 +360,34 @@ function buildHTML() {
                 <span class="jt-replay-pulse"></span>
             </button>
         </div>
+        <div class="jt-scroll-indicator"></div>
+    </div>
+
+    <!-- Navigation Toolbar — 5 tombol (Symbol, TF, Candle, Indicator, + New)
+         Klik tombol → set active segment (visual feedback). Popup tetap C++. -->
+    <div id="jt-nav-toolbar" class="jt-toolbar">
+        <div class="jt-toolbar-inner">
+            ${NAV_TOOLS.map(tool => buildNavButtonHTML(tool)).join('')}
+        </div>
+        <div class="jt-scroll-indicator"></div>
     </div>
 
     <!-- Tooltip (shared) -->
     <div id="jt-tooltip" class="jt-tooltip"></div>
+    `;
+}
+
+// Builder khusus untuk tombol navigasi (lebih lebar + label dinamis)
+function buildNavButtonHTML(tool) {
+    const iconHTML = tool.icon
+        ? `<img src="${tool.icon}" alt="${tool.label}" class="jt-icon-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"/><span class="jt-icon-svg" style="display:none;">${tool.svg}</span>`
+        : `<span class="jt-icon-svg">${tool.svg}</span>`;
+
+    return `
+    <button class="jt-btn jt-nav-btn" data-tool-id="${tool.id}" data-seg-idx="${tool.segIdx}" data-tooltip="${tool.tooltip}" data-active="false">
+        ${iconHTML}
+        <span class="jt-nav-label" data-nav-label="${tool.id}">${tool.label}</span>
+    </button>
     `;
 }
 
@@ -338,8 +436,7 @@ function buildCSS() {
     /* ── Toolbar Container (posisi di-set JS dari rect ImGui) ──
        Container = persis di atas content area ImGui (rect dari C++).
        overflow:hidden → ikon tidak pernah keluar dari frame ImGui.
-       display:flex + align/justify flex-start → ikon SELALU rata ATAS-KIRI
-       (top-left aligned), walau frame di-drag/dock/resize. */
+       position:relative → anchor untuk scrollbar overlay (absolute). */
     .jt-toolbar {
         position: absolute;
         pointer-events: none;       /* Container tembus, hanya tombol yang pegang event */
@@ -348,26 +445,70 @@ function buildCSS() {
     }
     .jt-toolbar.jt-visible { display: flex; }
 
-    /* 🎯 INNER = RATA ATAS-KIRI (top-left aligned)
-       align-items + justify-content → flex-start (atas & kiri)
-       flex-wrap: wrap → kalau frame sempit, ikon pindah baris (merapat)
-       width/height 100% → isi penuh content area ImGui
-       padding 0px → DEMPET ke title bar ImGui (no space) */
+    /* 🎯 INNER = RATA ATAS-KIRI (top-left aligned) + SCROLLABLE
+       - align-items + justify-content → flex-start (atas & kiri)
+       - flex-wrap: nowrap → TIDAK pindah baris, tetap 1 jalur
+       - overflow:auto → bisa scroll kalau konten lebih besar dari container
+       - Scrollbar overlay (muncul saat scroll/hover, hilang otomatis)
+       - Width/height 100% → isi penuh content area ImGui
+       - padding 0px → DEMPET ke title bar ImGui (no space) */
     .jt-toolbar-inner {
         display: flex;
         align-items: flex-start;    /* rata ATAS (axis secondary) */
         justify-content: flex-start;/* rata KIRI (axis primary) */
         gap: 3px;                   /* gap kecil biar merapat */
         pointer-events: auto;
-        padding: 2px;               /* 🔥 padding 0 = dempet ke title bar ImGui */
+        padding: 0px;               /* 🔥 padding 0 = dempet ke title bar ImGui */
         background: transparent;
         width: 100%;
         height: 100%;
         box-sizing: border-box;
-        flex-wrap: wrap;            /* kalau sempit, pindah baris rapi */
-        align-content: flex-start;  /* baris-baris ikon rata atas */
+        flex-wrap: nowrap;          /* 🔥 TIDAK pindah baris — tetap 1 jalur panjang */
+        align-content: flex-start;
         min-width: 0;
         min-height: 0;
+        overflow: auto;             /* 🔥 SCROLL otomatis kalau konten overflow */
+        scroll-behavior: smooth;    /* scroll halus saat wheel/swipe */
+
+        /* 🔥 Sembunyikan scrollbar default (akan pakai overlay custom) */
+        scrollbar-width: none;      /* Firefox */
+        -ms-overflow-style: none;   /* IE10+ */
+    }
+    .jt-toolbar-inner::-webkit-scrollbar {
+        display: none;              /* Chrome/Safari/Edge — sembunyikan default */
+    }
+
+    /* 🎨 OVERLAY SCROLLBAR — muncul saat hover/scroll, hilang otomatis
+       - Position absolute di dalam container (.jt-toolbar position:relative)
+       - Transisi opacity smooth
+       - Style: tipis, accent color, rounded */
+    .jt-scroll-indicator {
+        position: absolute;
+        background: rgba(16, 185, 129, 0.5);
+        border-radius: 3px;
+        pointer-events: none;       /* tidak block klik tombol */
+        opacity: 0;                 /* default: hilang */
+        transition: opacity 0.3s ease;
+        z-index: 10;
+    }
+    .jt-scroll-indicator.jt-visible {
+        opacity: 1;                 /* muncul saat hover/swipe */
+    }
+    /* Mode horizontal — scrollbar di bawah */
+    .jt-horizontal .jt-scroll-indicator {
+        bottom: 2px;
+        left: 0;
+        height: 3px;
+        width: 40px;                /* akan di-update JS berdasarkan ratio */
+        min-width: 20px;
+    }
+    /* Mode vertical — scrollbar di kanan */
+    .jt-vertical .jt-scroll-indicator {
+        right: 2px;
+        top: 0;
+        width: 3px;
+        height: 40px;               /* akan di-update JS berdasarkan ratio */
+        min-height: 20px;
     }
     /* 🔄 AUTO-ORIENT: ikon berjajar horizontal/vertical ikut orientasi frame */
     .jt-horizontal .jt-toolbar-inner { flex-direction: row; }
@@ -406,6 +547,47 @@ function buildCSS() {
     }
     .jt-btn:focus-visible {
         box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.5);
+    }
+
+    /* ── Nav Button (lebih lebar + label teks) ── */
+    .jt-nav-btn {
+        width: auto !important;           /* auto-width, bukan 36px fixed */
+        min-width: 80px;
+        max-width: 200px;
+        padding: 4px 10px !important;     /* padding horizontal untuk label */
+        gap: 6px;
+        flex-direction: row !important;   /* selalu horizontal: ikon + teks */
+        flex-shrink: 0;
+    }
+    .jt-nav-btn .jt-icon-img,
+    .jt-nav-btn .jt-icon-svg {
+        width: 18px; height: 18px;
+        max-width: 18px; max-height: 18px;
+        flex-shrink: 0;
+    }
+    .jt-nav-label {
+        font-size: 11px;
+        font-weight: 500;
+        color: #ccc;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: none;
+        letter-spacing: 0.3px;
+    }
+    .jt-nav-btn:hover .jt-nav-label,
+    .jt-nav-btn[data-active="true"] .jt-nav-label {
+        color: #10b981;
+    }
+    /* Nav button di mode vertical — label di bawah ikon */
+    .jt-vertical .jt-nav-btn {
+        flex-direction: column !important;
+        padding: 4px 6px !important;
+        min-width: 50px;
+        gap: 2px;
+    }
+    .jt-vertical .jt-nav-label {
+        font-size: 9px;
     }
 
     /* ── Active State (glow — cuma ini yang berwarna) ── */
@@ -616,6 +798,7 @@ function init() {
     drawingBar = overlay.querySelector('#jt-drawing-toolbar');
     rightBar   = overlay.querySelector('#jt-right-toolbar');
     replayBtn  = overlay.querySelector('#jt-replay-btn');
+    navBar     = overlay.querySelector('#jt-nav-toolbar');
     tooltipEl  = overlay.querySelector('#jt-tooltip');
 
     // Deteksi mobile (untuk adjust ukuran tombol)
@@ -626,7 +809,9 @@ function init() {
     bindDrawingToolbar();
     bindRightToolbar();
     bindReplayButton();
+    bindNavToolbar();    // 🔥 Bind nav toolbar
     bindTooltips();
+    bindScrollbars();   // 🔥 Bind scroll event untuk show/hide overlay scrollbar
 
     // ── POSITION SYNC LOOP (60fps) ──
     // Baca rect ImGui frame dari C++ setiap frame, posisikan overlay
@@ -669,6 +854,12 @@ function syncPosition() {
     syncOneFrame(replayBtn, 'wasm_jt_get_replay_visible',
                  'wasm_jt_get_replay_x', 'wasm_jt_get_replay_y',
                  'wasm_jt_get_replay_w', 'wasm_jt_get_replay_h',
+                 screenW, screenH);
+
+    // 🔥 Sync nav frame (Navigasi)
+    syncOneFrame(navBar, 'wasm_jt_get_nav_visible',
+                 'wasm_jt_get_nav_x', 'wasm_jt_get_nav_y',
+                 'wasm_jt_get_nav_w', 'wasm_jt_get_nav_h',
                  screenW, screenH);
 
     requestAnimationFrame(syncPosition);
@@ -730,38 +921,55 @@ function syncOneFrame(el, visFn, xFn, yFn, wFn, hFn, screenW, screenH) {
         el.classList.remove('jt-horizontal');
     }
 
-    // 📏 DYNAMIC GAP (hanya untuk mode horizontal) — saat frame di-geser
-    // sempit, gap antar ikon mengecil sampai 0. Kalau sudah 0 dan masih
-    // sempit, flex-wrap otomatis pindah baris.
-    // Mode vertical: gap tetap (default dari CSS).
+    // 🎨 UPDATE OVERLAY SCROLLBAR
+    // Hitung ratio konten vs container — kalau konten lebih besar, perlu scroll
     const inner = el.querySelector('.jt-toolbar-inner');
-    if (inner) {
+    const scrollIndicator = el.querySelector('.jt-scroll-indicator');
+    if (inner && scrollIndicator) {
         if (el.classList.contains('jt-horizontal')) {
-            // Hitung jumlah tombol (exclude separator)
-            const buttons = inner.querySelectorAll('.jt-btn, .jt-replay-btn');
-            const n = buttons.length;
-            // Hitung total lebar tombol (36px per tombol) + separator (1px each)
-            const separators = inner.querySelectorAll('.jt-separator');
-            const sepCount = separators.length;
-            const buttonWidth = 36;   // fixed .jt-btn width
-            const replayWidth = 44;   // .jt-replay-btn width
-            // Cek apakah ada tombol replay
-            let hasReplay = false;
-            buttons.forEach(b => { if (b.classList.contains('jt-replay-btn')) hasReplay = true; });
-            const totalButtonWidth = hasReplay ? replayWidth : (n * buttonWidth);
-            const totalSepWidth = sepCount * 1;  // 1px per separator
-            const padding = 8;  // 4px left + 4px right dari .jt-toolbar-inner
-            const available = width - padding;
-            const contentWidth = totalButtonWidth + totalSepWidth;
-            const remainingSpace = available - contentWidth;
-            // gap = remaining / (n - 1) atau (n + sepCount - 1), clamp [0, 6]
-            const divider = Math.max(1, (n - 1) + sepCount);
-            let gap = remainingSpace / divider;
-            gap = Math.max(0, Math.min(6, gap));
-            inner.style.gap = gap + 'px';
-        } else {
-            // Mode vertical: gap tetap 3px
+            // Mode horizontal: gap tetap 3px (tidak shrink), pakai scroll
             inner.style.gap = '3px';
+            const contentW = inner.scrollWidth;
+            const containerW = inner.clientWidth;
+            if (contentW > containerW + 1) {
+                // Perlu scroll horizontal
+                const ratio = containerW / contentW;
+                const thumbW = Math.max(20, containerW * ratio);
+                const maxScroll = contentW - containerW;
+                const scrollPercent = maxScroll > 0 ? inner.scrollLeft / maxScroll : 0;
+                const thumbX = scrollPercent * (containerW - thumbW);
+                scrollIndicator.style.width = thumbW + 'px';
+                scrollIndicator.style.height = '3px';
+                scrollIndicator.style.left = thumbX + 'px';
+                scrollIndicator.style.top = '';
+                scrollIndicator.style.bottom = '2px';
+                scrollIndicator.style.right = '';
+                el.classList.add('jt-scrollable');
+            } else {
+                el.classList.remove('jt-scrollable');
+            }
+        } else {
+            // Mode vertical: gap tetap 3px, pakai scroll
+            inner.style.gap = '3px';
+            const contentH = inner.scrollHeight;
+            const containerH = inner.clientHeight;
+            if (contentH > containerH + 1) {
+                // Perlu scroll vertical
+                const ratio = containerH / contentH;
+                const thumbH = Math.max(20, containerH * ratio);
+                const maxScroll = contentH - containerH;
+                const scrollPercent = maxScroll > 0 ? inner.scrollTop / maxScroll : 0;
+                const thumbY = scrollPercent * (containerH - thumbH);
+                scrollIndicator.style.height = thumbH + 'px';
+                scrollIndicator.style.width = '3px';
+                scrollIndicator.style.top = thumbY + 'px';
+                scrollIndicator.style.right = '2px';
+                scrollIndicator.style.left = '';
+                scrollIndicator.style.bottom = '';
+                el.classList.add('jt-scrollable');
+            } else {
+                el.classList.remove('jt-scrollable');
+            }
         }
     }
 
@@ -885,6 +1093,92 @@ function bindReplayButton() {
     });
 }
 
+// ── Bind: Nav Toolbar (5 tombol navigasi) ───────────────────
+function bindNavToolbar() {
+    overlay.querySelectorAll('#jt-nav-toolbar .jt-nav-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            const segIdx = parseInt(btn.dataset.segIdx, 10);
+            if (isNaN(segIdx)) return;
+
+            // Panggil C++ untuk set active segment
+            safeCcall('wasm_nav_click_segment', null, ['number'], [segIdx]);
+
+            // Update visual: reset semua nav btn, set yang ini active
+            overlay.querySelectorAll('#jt-nav-toolbar .jt-nav-btn').forEach(b => {
+                b.dataset.active = 'false';
+            });
+            btn.dataset.active = 'true';
+
+            flashButton(btn);
+        });
+    });
+}
+
+// ── Sync Nav State — update label & icon dari C++ ──────────
+// Dipanggil dari syncState() setiap POLL_INTERVAL ms.
+// Baca symbol/TF/candle style dari C++ → update label + icon tombol JS.
+function syncNavState() {
+    if (!navBar) return;
+
+    // ── Update Symbol label + icon ──
+    const symbol = safeCcall('wasm_nav_get_symbol', 'string', [], []);
+    if (symbol) {
+        const labelEl = navBar.querySelector('[data-nav-label="nav-symbol"]');
+        if (labelEl) labelEl.textContent = symbol;
+    }
+    const symbolIcon = safeCcall('wasm_nav_get_symbol_icon', 'string', [], []);
+    if (symbolIcon) {
+        const symBtn = navBar.querySelector('[data-tool-id="nav-symbol"]');
+        if (symBtn) {
+            const imgEl = symBtn.querySelector('.jt-icon-img');
+            if (imgEl && imgEl.src.indexOf(symbolIcon) === -1) {
+                imgEl.src = symbolIcon;
+                imgEl.style.display = '';
+                const svgEl = symBtn.querySelector('.jt-icon-svg');
+                if (svgEl) svgEl.style.display = 'none';
+            }
+        }
+    }
+
+    // ── Update TF label ──
+    const tf = safeCcall('wasm_nav_get_tf', 'string', [], []);
+    if (tf) {
+        const labelEl = navBar.querySelector('[data-nav-label="nav-tf"]');
+        if (labelEl) labelEl.textContent = tf;
+    }
+
+    // ── Update Candle label + icon (dinamis sesuai style) ──
+    const candleStyle = safeCcall('wasm_nav_get_candle_style', 'number', [], []);
+    if (candleStyle !== null && candleStyle >= 0 && candleStyle < NAV_CANDLE_SVGS.length) {
+        const candleBtn = navBar.querySelector('[data-tool-id="nav-candle"]');
+        if (candleBtn) {
+            // Sembunyikan img, tampilkan SVG sesuai style
+            const imgEl = candleBtn.querySelector('.jt-icon-img');
+            const svgEl = candleBtn.querySelector('.jt-icon-svg');
+            if (imgEl) imgEl.style.display = 'none';
+            if (svgEl) {
+                svgEl.innerHTML = NAV_CANDLE_SVGS[candleStyle];
+                svgEl.style.display = 'flex';
+            }
+        }
+    }
+    const candleName = safeCcall('wasm_nav_get_candle_style_name', 'string', [], []);
+    if (candleName) {
+        const labelEl = navBar.querySelector('[data-nav-label="nav-candle"]');
+        if (labelEl) labelEl.textContent = candleName;
+    }
+
+    // ── Update active segment glow ──
+    const activeSeg = safeCcall('wasm_nav_get_active_segment', 'number', [], []);
+    if (activeSeg !== null) {
+        overlay.querySelectorAll('#jt-nav-toolbar .jt-nav-btn').forEach(btn => {
+            const segIdx = parseInt(btn.dataset.segIdx, 10);
+            btn.dataset.active = (segIdx === activeSeg) ? 'true' : 'false';
+        });
+    }
+}
+
 // ── Tooltip Handler ─────────────────────────────────────────
 function bindTooltips() {
     let tooltipTimer = null;
@@ -919,6 +1213,76 @@ function bindTooltips() {
         replayInner.addEventListener('mouseleave', hideTooltip);
         replayInner.addEventListener('mousedown', hideTooltip);
     }
+}
+
+// ── Scrollbar Overlay Handler ─────────────────────────────────
+// Tampilkan scrollbar overlay saat user scroll/hover, sembunyikan otomatis
+// setelah 1.5 detik idle. Update posisi thumb saat scroll.
+function bindScrollbars() {
+    let hideTimers = new WeakMap();
+
+    overlay.querySelectorAll('.jt-toolbar').forEach(toolbar => {
+        const inner = toolbar.querySelector('.jt-toolbar-inner');
+        const indicator = toolbar.querySelector('.jt-scroll-indicator');
+        if (!inner || !indicator) return;
+
+        // Show indicator saat user hover toolbar (jika scrollable)
+        toolbar.addEventListener('mouseenter', () => {
+            if (toolbar.classList.contains('jt-scrollable')) {
+                indicator.classList.add('jt-visible');
+            }
+        });
+        toolbar.addEventListener('mouseleave', () => {
+            indicator.classList.remove('jt-visible');
+        });
+
+        // Update thumb position + show saat scroll
+        const onScroll = () => {
+            if (!toolbar.classList.contains('jt-scrollable')) return;
+            indicator.classList.add('jt-visible');
+
+            // Update thumb position
+            if (toolbar.classList.contains('jt-horizontal')) {
+                const contentW = inner.scrollWidth;
+                const containerW = inner.clientWidth;
+                const ratio = containerW / contentW;
+                const thumbW = Math.max(20, containerW * ratio);
+                const maxScroll = contentW - containerW;
+                const scrollPercent = maxScroll > 0 ? inner.scrollLeft / maxScroll : 0;
+                const thumbX = scrollPercent * (containerW - thumbW);
+                indicator.style.width = thumbW + 'px';
+                indicator.style.left = thumbX + 'px';
+            } else {
+                const contentH = inner.scrollHeight;
+                const containerH = inner.clientHeight;
+                const ratio = containerH / contentH;
+                const thumbH = Math.max(20, containerH * ratio);
+                const maxScroll = contentH - containerH;
+                const scrollPercent = maxScroll > 0 ? inner.scrollTop / maxScroll : 0;
+                const thumbY = scrollPercent * (containerH - thumbH);
+                indicator.style.height = thumbH + 'px';
+                indicator.style.top = thumbY + 'px';
+            }
+
+            // Auto-hide setelah 1.5s idle
+            clearTimeout(hideTimers.get(toolbar));
+            const t = setTimeout(() => {
+                indicator.classList.remove('jt-visible');
+            }, 1500);
+            hideTimers.set(toolbar, t);
+        };
+
+        inner.addEventListener('scroll', onScroll, { passive: true });
+
+        // Mouse wheel → scroll horizontal di mode horizontal
+        inner.addEventListener('wheel', (e) => {
+            if (toolbar.classList.contains('jt-horizontal') && toolbar.classList.contains('jt-scrollable')) {
+                e.preventDefault();
+                inner.scrollLeft += e.deltaY;
+                onScroll();
+            }
+        }, { passive: false });
+    });
 }
 
 // ── Visual Feedback: Flash ──────────────────────────────────
@@ -978,6 +1342,9 @@ function syncState() {
         const replayInnerBtn = replayBtn.querySelector('.jt-replay-btn');
         if (replayInnerBtn) replayInnerBtn.dataset.active = replayActive ? 'true' : 'false';
     }
+
+    // 🔥 Sync Nav state (label symbol/TF + active segment glow)
+    syncNavState();
 }
 
 // ── Auto-init when Module is FULLY ready ────────────────────
@@ -1018,6 +1385,7 @@ window.JarvisToolbar = {
     openTools:  () => safeCcall('wasm_jt_toggle_tools',  'number', [], []),
     openPanel:  () => safeCcall('wasm_jt_toggle_panel',  'number', [], []),
     openReplay: () => safeCcall('wasm_jt_toggle_replay', 'number', [], []),
+    openNav:    () => safeCcall('wasm_jt_toggle_nav',    'number', [], []),
     // Force re-sync position
     resync:  syncPosition
 };
