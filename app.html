@@ -100,8 +100,11 @@ button:hover { background: #008ccb; }
 
 <body>
 <div id="loading-spinner" style="
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #0af; font-family: sans-serif; font-size: 14px; z-index: 1; pointer-events: none;">
+</div>
+
     <!-- Firebase Gatekeeper Active -->
-    
     <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
 
 <script>
