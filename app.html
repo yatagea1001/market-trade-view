@@ -181,7 +181,11 @@ button:hover { background: #008ccb; }
                 pctEl.innerText = pct + "%";
             } else {
                 statusEl.innerText = text ? text.toUpperCase() : "SYSTEM READY";
-                if(!text) { barEl.style.width = "100%"; pctEl.innerText = "100%"; }
+                // Emscripten passes "" or "Running..." when it finishes
+                if(!text || text.toLowerCase() === "running...") { 
+                    barEl.style.width = "100%"; pctEl.innerText = "100%"; 
+                    Module.hideBootScreen();
+                }
             }
         },
         totalDependencies: 0,
@@ -189,8 +193,10 @@ button:hover { background: #008ccb; }
             this.totalDependencies = Math.max(this.totalDependencies, left);
             Module.setStatus(left ? 'PREPARING MODULES... (' + (this.totalDependencies-left) + '/' + this.totalDependencies + ')' : 'ALL DOWNLOADS COMPLETE.');
         },
-        onRuntimeInitialized: function() { 
-            console.log("[WASM] Engine Loaded.");
+        hideBootScreen: function() {
+            if (Module._bootScreenHidden) return;
+            Module._bootScreenHidden = true;
+            console.log("[WASM] Engine Loaded & Boot Screen Hidden.");
             
             var statusEl = document.getElementById('boot-status');
             if (statusEl) {
@@ -199,7 +205,6 @@ button:hover { background: #008ccb; }
                 document.getElementById('boot-pct').innerText = "100%";
             }
             
-            // Beri jeda sedikit agar user bisa lihat angka 100% (efek psikologis)
             setTimeout(function() {
                 var overlay = document.getElementById('boot-overlay');
                 if(overlay) {
@@ -212,8 +217,16 @@ button:hover { background: #008ccb; }
 
                 if (Module._wasm_on_login_success) Module._wasm_on_login_success();
                 if (typeof connectWS === 'function') connectWS();
-            }, 800); 
-        }
+            }, 500);
+        },
+        onRuntimeInitialized: function() { 
+            Module.hideBootScreen();
+        },
+        postRun: [
+            function() {
+                Module.hideBootScreen();
+            }
+        ]
     };
     Module.setStatus('ESTABLISHING CONNECTION...');
     
