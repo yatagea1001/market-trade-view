@@ -99,9 +99,51 @@ button:hover { background: #008ccb; }
 </head>
 
 <body>
-<div id="loading-spinner" style="
-    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    color: #0af; font-family: sans-serif; font-size: 14px; z-index: 1; pointer-events: none;">
+<style>
+/* === HACKER BOOT SCREEN === */
+#boot-overlay {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: #000; z-index: 10000;
+    display: flex; flex-direction: column; justify-content: center; align-items: center;
+    font-family: monospace; transition: opacity 0.8s ease;
+}
+.cyber-grid {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background-image: 
+        linear-gradient(rgba(0, 255, 170, 0.1) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 255, 170, 0.1) 1px, transparent 1px);
+    background-size: 30px 30px;
+    z-index: -1; opacity: 0.3;
+}
+.scanline {
+    position: absolute; top: 0; left: 0; width: 100%; height: 10px;
+    background: rgba(0, 255, 170, 0.3); opacity: 0.5;
+    animation: scan 3s linear infinite; z-index: -1;
+}
+@keyframes scan { 0% { top: 0%; } 100% { top: 100%; } }
+
+.hacker-text { color: #00ffaa; font-size: 18px; margin-bottom: 20px; letter-spacing: 2px; text-shadow: 0 0 10px rgba(0,255,170,0.5); text-align: center; }
+.error-text { color: #ff0055 !important; text-shadow: 0 0 10px rgba(255,0,85,0.5) !important; }
+
+.progress-box {
+    width: 300px; height: 15px; border: 2px solid #00ffaa;
+    position: relative; box-shadow: 0 0 10px rgba(0,255,170,0.3);
+}
+.progress-bar {
+    width: 0%; height: 100%; background: #00ffaa;
+    box-shadow: 0 0 15px #00ffaa; transition: width 0.1s ease;
+}
+.progress-pct { margin-top: 15px; color: #00ffaa; font-size: 16px; font-weight: bold; text-shadow: 0 0 5px rgba(0,255,170,0.5); }
+</style>
+
+<div id="boot-overlay">
+    <div class="cyber-grid"></div>
+    <div class="scanline"></div>
+    <div class="hacker-text" id="boot-status">INITIALIZING SYSTEM...</div>
+    <div class="progress-box">
+        <div class="progress-bar" id="boot-bar"></div>
+    </div>
+    <div class="progress-pct" id="boot-pct">0%</div>
 </div>
 
     <!-- Firebase Gatekeeper Active -->
@@ -120,20 +162,73 @@ button:hover { background: #008ccb; }
             canvas.addEventListener("webglcontextlost", function(e) { alert('WebGL context lost. Reload page.'); e.preventDefault(); }, false);
             return canvas;
         })(),
-       onRuntimeInitialized: function() { 
-        console.log("[WASM] Engine Loaded.");
-        var spinner = document.getElementById('loading-spinner');
-        if(spinner) spinner.style.display = 'none';
+        setStatus: function(text) {
+            if (!Module.setStatus.last) Module.setStatus.last = { time: Date.now(), text: '' };
+            if (text === Module.setStatus.last.text) return;
+            
+            var statusEl = document.getElementById('boot-status');
+            var barEl = document.getElementById('boot-bar');
+            var pctEl = document.getElementById('boot-pct');
+            
+            if (!statusEl) return;
+            
+            // Format Emscripten: "Downloading data... (1234/5678)"
+            var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
+            if (m) {
+                var pct = Math.round((parseInt(m[2]) / parseInt(m[4])) * 100);
+                statusEl.innerText = "DOWNLOADING SECURE DATA...";
+                barEl.style.width = pct + "%";
+                pctEl.innerText = pct + "%";
+            } else {
+                statusEl.innerText = text ? text.toUpperCase() : "SYSTEM READY";
+                if(!text) { barEl.style.width = "100%"; pctEl.innerText = "100%"; }
+            }
+        },
+        totalDependencies: 0,
+        monitorRunDependencies: function(left) {
+            this.totalDependencies = Math.max(this.totalDependencies, left);
+            Module.setStatus(left ? 'PREPARING MODULES... (' + (this.totalDependencies-left) + '/' + this.totalDependencies + ')' : 'ALL DOWNLOADS COMPLETE.');
+        },
+        onRuntimeInitialized: function() { 
+            console.log("[WASM] Engine Loaded.");
+            
+            var statusEl = document.getElementById('boot-status');
+            if (statusEl) {
+                statusEl.innerText = "ENGINE BOOTED SUCCESSFULLY.";
+                document.getElementById('boot-bar').style.width = "100%";
+                document.getElementById('boot-pct').innerText = "100%";
+            }
+            
+            // Beri jeda sedikit agar user bisa lihat angka 100% (efek psikologis)
+            setTimeout(function() {
+                var overlay = document.getElementById('boot-overlay');
+                if(overlay) {
+                    overlay.style.opacity = '0';
+                    setTimeout(function(){ overlay.style.display = 'none'; }, 800);
+                }
+                
+                var cv = document.getElementById('canvas');
+                if (cv) { cv.focus(); }
 
-        // Langsung tampilkan canvas
-        var cv = document.getElementById('canvas');
-        if (cv) { cv.focus(); }
-
-        if (Module._wasm_on_login_success) Module._wasm_on_login_success();
-        if (typeof connectWS === 'function') connectWS();
-    }
-};
-    window.onerror = function(event) { console.error("Window Error: " + event); };
+                if (Module._wasm_on_login_success) Module._wasm_on_login_success();
+                if (typeof connectWS === 'function') connectWS();
+            }, 800); 
+        }
+    };
+    Module.setStatus('ESTABLISHING CONNECTION...');
+    
+    window.onerror = function(event) {
+        var statusEl = document.getElementById('boot-status');
+        if(statusEl) {
+            statusEl.innerText = "CRITICAL ERROR: HARDWARE NOT SUPPORTED OR CONNECTION FAILED.";
+            statusEl.classList.add('error-text');
+            var bar = document.getElementById('boot-bar');
+            if (bar) { bar.style.background = '#ff0055'; bar.style.boxShadow = '0 0 15px #ff0055'; }
+            var pct = document.getElementById('boot-pct');
+            if (pct) { pct.innerText = "ERR"; pct.classList.add('error-text'); }
+        }
+        console.error("Window Error: " + event); 
+    };
 </script>
 
 <script>
