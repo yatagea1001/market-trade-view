@@ -3,235 +3,477 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MarketTradeWeb | Advanced Trading Platform</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <title>MarketTradeWeb | Professional Chart Engine</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet">
     <style>
-        /* CSS Reset & Base */
+        /* === RESET & BASE === */
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
-        body {
-            background-color: #050505; color: #ffffff;
-            overflow-x: hidden;
-            background-image: radial-gradient(circle at 50% 0%, #0a192f 0%, #050505 70%);
-        }
-
-        /* Utilities */
+        html { scroll-behavior: smooth; }
+        body { background-color: #050505; color: #ffffff; overflow-x: hidden; }
+        
+        /* === UTILITIES & GLOWS === */
         .container { max-width: 1200px; margin: 0 auto; padding: 0 20px; }
-        .glass-panel {
-            background: rgba(16, 20, 24, 0.6);
-            backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 20px;
+        .text-emerald { color: #34d399; } /* Emerald 400 */
+        .text-emerald-bold { color: #10b981; } /* Emerald 500 */
+        .bg-emerald { background-color: #10b981; }
+        .text-muted { color: #9ca3af; } /* Gray 400 */
+        
+        .glow-bg {
+            position: absolute; border-radius: 50%; pointer-events: none; z-index: -1;
+            filter: blur(120px); opacity: 0.15;
+        }
+        .glow-1 { top: 20%; left: 50%; transform: translateX(-50%); width: 600px; height: 600px; background: #10b981; }
+        .glow-2 { top: 30%; left: 25%; width: 300px; height: 300px; background: #06b6d4; filter: blur(80px); opacity: 0.1; }
+        
+        .badge {
+            display: inline-flex; items-center; padding: 6px 16px; border-radius: 20px;
+            font-size: 13px; font-weight: 600; background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3); color: #34d399;
         }
 
-        /* Navbar */
+        .btn {
+            display: inline-flex; justify-content: center; align-items: center; gap: 8px;
+            padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 15px;
+            cursor: pointer; transition: all 0.2s ease; border: none; text-decoration: none;
+        }
+        .btn-primary { background: #10b981; color: white; }
+        .btn-primary:hover { background: #059669; }
+        .btn-outline { background: transparent; border: 1px solid rgba(255,255,255,0.2); color: white; }
+        .btn-outline:hover { border-color: #34d399; color: #34d399; }
+        .btn-ghost { background: transparent; color: white; }
+        .btn-ghost:hover { background: rgba(255,255,255,0.1); }
+
+        .glass-card {
+            background: rgba(15, 23, 42, 0.5); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 16px; transition: all 0.3s ease;
+        }
+
+        /* === NAVBAR === */
         nav {
-            position: fixed; top: 0; width: 100%; z-index: 100;
-            padding: 20px 0; transition: all 0.3s ease;
+            position: fixed; top: 0; left: 0; width: 100%; z-index: 100;
+            padding: 20px 0; transition: all 0.3s ease; border-bottom: 1px solid transparent;
         }
-        nav.scrolled { background: rgba(5,5,5,0.9); backdrop-filter: blur(10px); padding: 15px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        nav.scrolled {
+            background: rgba(5,5,5,0.8); backdrop-filter: blur(16px);
+            padding: 15px 0; border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
         .nav-content { display: flex; justify-content: space-between; align-items: center; }
-        .logo { font-size: 22px; font-weight: 800; letter-spacing: -1px; display: flex; align-items: center; gap: 10px; }
-        .logo span { color: #00FFAA; }
+        .logo { display: flex; align-items: center; gap: 10px; font-size: 20px; font-weight: 800; }
+        .logo-icon { width: 36px; height: 36px; background: rgba(16, 185, 129, 0.2); border-radius: 8px; display: flex; justify-content: center; align-items: center; }
         
-        .btn-nav {
-            padding: 10px 24px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s ease;
-        }
-        .btn-login { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,0.2); }
-        .btn-login:hover { border-color: #00FFAA; color: #00FFAA; }
-
-        /* Hero Section */
-        .hero {
-            padding: 150px 0 100px; text-align: center; position: relative;
-        }
-        .hero h1 {
-            font-size: 64px; font-weight: 800; line-height: 1.1; margin-bottom: 24px;
-            background: linear-gradient(135deg, #ffffff 0%, #a0a5aa 100%);
-            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        }
-        .hero h1 span {
-            background: linear-gradient(135deg, #00FFAA 0%, #0088ff 100%);
-            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        }
-        .hero p {
-            font-size: 20px; color: #88929b; max-width: 600px; margin: 0 auto 40px; line-height: 1.5;
-        }
-        .btn-cta {
-            display: inline-block; padding: 16px 40px; font-size: 18px; font-weight: 600;
-            background: linear-gradient(135deg, #00FFAA 0%, #0088ff 100%); color: #000;
-            border: none; border-radius: 30px; cursor: pointer;
-            box-shadow: 0 10px 30px rgba(0, 255, 170, 0.3); transition: transform 0.3s ease, box-shadow 0.3s ease;
-        }
-        .btn-cta:hover { transform: translateY(-3px); box-shadow: 0 15px 40px rgba(0, 255, 170, 0.5); }
-
-        /* Dummy Asset Placeholder (Hero Image) */
-        .hero-dashboard-dummy {
-            margin: 60px auto 0; width: 100%; max-width: 1000px; height: 500px;
-            border-radius: 12px; overflow: hidden; position: relative;
-            background: #0d1116; border: 1px solid #1f2937;
-            box-shadow: 0 25px 50px -12px rgba(0,0,0,0.8);
-            display: flex; justify-content: center; align-items: center; flex-direction: column;
-        }
-        /* GANTI SRC GAMBAR/GIF ASLI ANDA DI SINI NANTI */
-        .hero-dashboard-dummy img {
-            position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; /* Ubah opacity jadi 1 saat gambar diisi */
-        }
-        .dummy-text { color: #4b5563; font-size: 24px; font-weight: 600; letter-spacing: 2px; }
-        .dummy-sub { color: #374151; margin-top: 10px; font-size: 14px; }
+        .desktop-menu { display: flex; gap: 30px; align-items: center; }
+        .desktop-menu a { color: #9ca3af; text-decoration: none; font-size: 14px; font-weight: 600; transition: color 0.2s; }
+        .desktop-menu a:hover { color: white; }
         
-        /* Skeleton Animation for Dummy */
-        .skeleton-line { height: 4px; background: #1f2937; width: 100px; margin: 20px auto; border-radius: 2px; overflow: hidden; position: relative; }
-        .skeleton-line::after { content: ''; position: absolute; top:0; left:0; height:100%; width:50%; background: linear-gradient(90deg, transparent, #374151, transparent); animation: scan 1.5s infinite linear; }
+        .nav-auth { display: flex; gap: 10px; }
+        
+        /* Mobile Menu */
+        .mobile-toggle { display: none; background: none; border: none; color: white; font-size: 24px; cursor: pointer; }
+        .mobile-menu {
+            display: none; position: absolute; top: 100%; left: 0; width: 100%;
+            background: rgba(5,5,5,0.95); backdrop-filter: blur(16px); border-top: 1px solid rgba(255,255,255,0.1);
+            padding: 20px; flex-direction: column; gap: 15px; border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .mobile-menu.active { display: flex; }
+        .mobile-menu a { color: #9ca3af; text-decoration: none; font-weight: 600; padding: 10px 0; }
+        .mobile-menu .divider { height: 1px; background: rgba(255,255,255,0.1); margin: 10px 0; }
+
+        @media (max-width: 768px) {
+            .desktop-menu, .nav-auth { display: none; }
+            .mobile-toggle { display: block; }
+        }
+
+        /* === HERO SECTION === */
+        .hero { padding: 160px 0 100px; text-align: center; position: relative; }
+        .hero h1 { font-size: 4.5rem; font-weight: 800; line-height: 1.1; margin-top: 25px; margin-bottom: 25px; letter-spacing: -1px; }
+        .hero p { font-size: 1.25rem; color: #9ca3af; max-width: 650px; margin: 0 auto 40px; line-height: 1.6; }
+        .hero-btns { display: flex; justify-content: center; gap: 15px; flex-wrap: wrap; }
+        
+        .hero-stats { display: flex; justify-content: center; gap: 60px; margin-top: 60px; }
+        .stat-item h3 { font-size: 2rem; font-weight: 800; color: #34d399; }
+        .stat-item p { font-size: 0.875rem; color: #9ca3af; margin-top: 5px; }
+
+        .chart-preview {
+            margin-top: 80px; position: relative; max-width: 1000px; margin-left: auto; margin-right: auto;
+            border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); background: #0d1117; height: 500px;
+            box-shadow: 0 30px 60px rgba(16, 185, 129, 0.1); overflow: hidden;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+        }
+        .chart-preview img { width: 100%; height: 100%; object-fit: cover; opacity: 0; position: absolute; top:0; left:0; }
+        .skeleton-loader { height: 3px; background: #1f2937; width: 150px; margin: 20px auto; border-radius: 2px; position: relative; overflow: hidden; }
+        .skeleton-loader::after { content: ''; position: absolute; top:0; left:0; height:100%; width:50%; background: linear-gradient(90deg, transparent, #34d399, transparent); animation: scan 1.5s infinite linear; }
         @keyframes scan { 0% { transform: translateX(-100%); } 100% { transform: translateX(200%); } }
 
-        /* Features Section */
-        .features { padding: 100px 0; }
-        .section-title { text-align: center; font-size: 36px; margin-bottom: 60px; }
-        .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 30px; }
-        .feature-card { padding: 40px 30px; text-align: center; transition: transform 0.3s ease; }
-        .feature-card:hover { transform: translateY(-10px); }
-        .f-icon { font-size: 40px; margin-bottom: 20px; display: inline-block; }
-        .feature-card h3 { font-size: 20px; margin-bottom: 15px; color: #fff; }
-        .feature-card p { color: #88929b; font-size: 15px; line-height: 1.6; }
+        @media (max-width: 768px) {
+            .hero h1 { font-size: 2.5rem; }
+            .hero p { font-size: 1rem; padding: 0 10px; }
+            .hero-stats { gap: 30px; }
+            .stat-item h3 { font-size: 1.5rem; }
+            .chart-preview { height: 250px; margin-top: 50px; }
+        }
 
-        /* Auth Modal (Popup) */
+        /* === FEATURES SECTION === */
+        .section-header { text-align: center; margin-bottom: 60px; }
+        .section-header h2 { font-size: 2.5rem; font-weight: 800; margin-top: 15px; margin-bottom: 15px; }
+        .section-header p { color: #9ca3af; max-width: 600px; margin: 0 auto; line-height: 1.6; }
+        
+        .features { padding: 100px 0; }
+        .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; }
+        .feature-card { padding: 30px; text-align: left; }
+        .feature-card:hover { border-color: rgba(16, 185, 129, 0.3); background: rgba(16, 185, 129, 0.05); transform: translateY(-5px); }
+        .icon-box { width: 48px; height: 48px; background: rgba(16, 185, 129, 0.1); border-radius: 12px; display: flex; justify-content: center; align-items: center; margin-bottom: 20px; color: #34d399; }
+        .feature-card h3 { font-size: 1.25rem; font-weight: 700; margin-bottom: 10px; }
+        .feature-card p { color: #9ca3af; font-size: 0.95rem; line-height: 1.6; }
+
+        /* === PRICING SECTION === */
+        .pricing { padding: 100px 0; }
+        .pricing-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; max-width: 1000px; margin: 0 auto; }
+        .price-card { padding: 30px; position: relative; display: flex; flex-direction: column; }
+        .price-card.popular { border-color: rgba(16, 185, 129, 0.5); background: rgba(16, 185, 129, 0.05); box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.2); }
+        .pop-badge { position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: #10b981; color: white; font-size: 12px; font-weight: 700; padding: 4px 12px; border-radius: 20px; }
+        
+        .price-name { font-size: 1.125rem; font-weight: 700; margin-bottom: 10px; }
+        .price-amount { display: flex; align-items: baseline; gap: 5px; margin-bottom: 10px; }
+        .price-amount .currency { color: #9ca3af; font-size: 0.875rem; }
+        .price-amount .value { font-size: 2.5rem; font-weight: 800; }
+        .price-amount .period { color: #9ca3af; font-size: 0.875rem; }
+        .price-desc { color: #9ca3af; font-size: 0.875rem; margin-bottom: 30px; }
+        
+        .feature-list { list-style: none; flex-grow: 1; margin-bottom: 30px; }
+        .feature-list li { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; font-size: 0.875rem; }
+        .feature-list li svg { color: #34d399; flex-shrink: 0; width: 18px; height: 18px; margin-top: 2px; }
+
+        /* === TECH SECTION === */
+        .tech { padding: 80px 0; border-top: 1px solid rgba(255,255,255,0.1); }
+        .tech-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 15px; }
+        .tech-card { padding: 20px; text-align: center; background: rgba(15, 23, 42, 0.3); border-radius: 12px; border: 1px solid rgba(255,255,255,0.05); }
+        .tech-card:hover { border-color: rgba(16, 185, 129, 0.2); }
+        .tech-card h4 { font-size: 0.875rem; font-weight: 700; margin-bottom: 5px; }
+        .tech-card p { font-size: 0.75rem; color: #9ca3af; }
+
+        /* === CTA SECTION & FOOTER === */
+        .cta { padding: 100px 0; text-align: center; }
+        .cta-card { padding: 60px 20px; background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 24px; position: relative; overflow: hidden; }
+        .cta-card h2 { font-size: 2rem; font-weight: 800; margin-bottom: 15px; }
+        .cta-card p { color: #9ca3af; margin-bottom: 30px; }
+        
+        footer { padding: 40px 0; border-top: 1px solid rgba(255,255,255,0.1); }
+        .footer-content { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 20px; }
+        .footer-links { display: flex; gap: 20px; }
+        .footer-links a { color: #9ca3af; text-decoration: none; font-size: 0.875rem; }
+
+        @media (max-width: 768px) {
+            .section-header h2 { font-size: 2rem; }
+            .cta-card h2 { font-size: 1.5rem; }
+            .footer-content { flex-direction: column; text-align: center; }
+        }
+
+        /* === AUTH MODAL === */
         .modal-overlay {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.8); backdrop-filter: blur(5px);
+            background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
             z-index: 1000; display: flex; justify-content: center; align-items: center;
             opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
         }
         .modal-overlay.active { opacity: 1; pointer-events: auto; }
         .modal-content {
-            width: 100%; max-width: 400px; transform: translateY(30px); transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-            position: relative;
+            width: 90%; max-width: 400px; transform: translateY(30px); transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            position: relative; background: #0f172a; padding: 40px; border-radius: 20px; border: 1px solid rgba(16, 185, 129, 0.2);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
         }
         .modal-overlay.active .modal-content { transform: translateY(0); }
-        .close-modal {
-            position: absolute; top: 15px; right: 15px; background: none; border: none; color: #889; font-size: 24px; cursor: pointer;
-        }
-        .close-modal:hover { color: #fff; }
-
-        /* Form Styles (From previous iteration) */
-        .auth-form-wrap { padding: 40px; text-align: center; }
-        .auth-form-wrap h2 { font-size: 24px; margin-bottom: 5px; color: #00FFAA; }
-        .auth-form-wrap .subtitle { font-size: 13px; color: #88929b; margin-bottom: 30px; }
-        .input-group { margin-bottom: 20px; text-align: left; }
-        .input-group label { display: block; font-size: 12px; color: #88929b; margin-bottom: 8px; text-transform: uppercase; }
-        .input-group input {
-            width: 100%; padding: 12px 15px; background: rgba(0, 0, 0, 0.5); border: 1px solid #2a3138;
-            border-radius: 8px; color: white; outline: none; transition: all 0.3s ease;
-        }
-        .input-group input:focus { border-color: #00FFAA; box-shadow: 0 0 10px rgba(0, 255, 170, 0.2); }
-        .btn-submit {
-            width: 100%; padding: 14px; background: linear-gradient(135deg, #00FFAA 0%, #0088ff 100%);
-            border: none; border-radius: 8px; color: #000; font-weight: 700; cursor: pointer; transition: transform 0.2s ease;
-        }
-        .btn-submit:hover { transform: translateY(-2px); }
-        .btn-submit:disabled { background: #444; color: #888; cursor: not-allowed; }
-        .toggle-mode { margin-top: 20px; font-size: 13px; color: #88929b; cursor: pointer; }
-        .toggle-mode span { color: #00FFAA; font-weight: 600; }
-        #error-msg { color: #ff4444; font-size: 13px; margin-top: 15px; min-height: 20px; }
         
-        /* Floating Blobs */
-        .blob { position: absolute; border-radius: 50%; filter: blur(100px); z-index: -1; }
-        .blob.cyan { background: rgba(0, 255, 170, 0.15); width: 500px; height: 500px; top: -100px; left: -200px; }
-        .blob.blue { background: rgba(0, 136, 255, 0.15); width: 600px; height: 600px; bottom: 100px; right: -300px; }
+        .close-modal { position: absolute; top: 15px; right: 15px; background: none; border: none; color: #9ca3af; font-size: 24px; cursor: pointer; }
+        .close-modal:hover { color: white; }
+        
+        .auth-form h2 { font-size: 1.5rem; margin-bottom: 5px; color: white; }
+        .auth-form p.subtitle { font-size: 0.875rem; color: #9ca3af; margin-bottom: 25px; }
+        .input-group { margin-bottom: 15px; }
+        .input-group label { display: block; font-size: 0.75rem; color: #9ca3af; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+        .input-group input {
+            width: 100%; padding: 12px 15px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px; color: white; font-size: 1rem; transition: all 0.3s ease;
+        }
+        .input-group input:focus { border-color: #34d399; outline: none; box-shadow: 0 0 0 1px #34d399; }
+        
+        .btn-submit { width: 100%; padding: 14px; background: #10b981; color: white; border: none; border-radius: 8px; font-weight: 700; font-size: 1rem; cursor: pointer; margin-top: 10px; transition: background 0.2s; }
+        .btn-submit:hover { background: #059669; }
+        .btn-submit:disabled { background: #374151; color: #9ca3af; cursor: not-allowed; }
+        
+        .toggle-mode { text-align: center; margin-top: 20px; font-size: 0.875rem; color: #9ca3af; cursor: pointer; }
+        .toggle-mode span { color: #34d399; font-weight: 600; }
+        #error-msg { color: #ef4444; font-size: 0.875rem; margin-top: 15px; min-height: 20px; text-align: center; }
+
     </style>
 </head>
 <body>
 
-    <!-- Blobs -->
-    <div class="blob cyan"></div>
-    <div class="blob blue"></div>
+    <!-- Background Glows -->
+    <div class="glow-bg glow-1"></div>
+    <div class="glow-bg glow-2"></div>
 
-    <!-- Navbar -->
+    <!-- NAVBAR -->
     <nav id="navbar">
         <div class="container nav-content">
             <div class="logo">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#00FFAA" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3"/></svg>
-                MarketTrade<span>Web</span>
+                <div class="logo-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3"/></svg>
+                </div>
+                <div>MarketTrade<span class="text-emerald">Web</span></div>
             </div>
-            <div>
-                <button class="btn-nav btn-login" onclick="openModal()">Client Login</button>
+            
+            <div class="desktop-menu">
+                <a href="#features">Fitur</a>
+                <a href="#pricing">Harga</a>
+                <a href="#tech">Teknologi</a>
             </div>
+            
+            <div class="nav-auth">
+                <button class="btn btn-ghost" onclick="openModal()">Masuk</button>
+                <button class="btn btn-primary" onclick="openModal()">Daftar Gratis <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg></button>
+            </div>
+
+            <button class="mobile-toggle" id="mobile-toggle">☰</button>
+        </div>
+        
+        <!-- Mobile Dropdown -->
+        <div class="mobile-menu" id="mobile-menu">
+            <a href="#features" class="mob-link">Fitur</a>
+            <a href="#pricing" class="mob-link">Harga</a>
+            <a href="#tech" class="mob-link">Teknologi</a>
+            <div class="divider"></div>
+            <button class="btn btn-outline" style="width:100%" onclick="openModal()">Masuk</button>
+            <button class="btn btn-primary" style="width:100%" onclick="openModal()">Daftar Gratis</button>
         </div>
     </nav>
 
-    <!-- Hero Section -->
+    <!-- HERO SECTION -->
     <section class="hero container">
-        <h1>Master The Market with <br><span>Precision Data</span></h1>
-        <p>Advanced Order Flow, Footprint Charts, and Real-Time Market Replay built natively for the Web. Trading at the speed of light.</p>
-        <button class="btn-cta" onclick="openModal()">Start Trading for Free</button>
+        <div class="badge">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+            Powered by WASM + WebGL2 Engine
+        </div>
         
-        <!-- DUMMY ASSET PLACEHOLDER: Ganti tag <img> di bawah ini dengan screenshot/GIF asli Anda -->
-        <div class="hero-dashboard-dummy">
-            <!-- <img src="assets/my_dashboard.gif" alt="App Preview"> -->
-            <div class="dummy-text">[ APP SCREENSHOT / GIF PLACEHOLDER ]</div>
-            <div class="skeleton-line"></div>
-            <div class="dummy-sub">1200 x 600 px recommended</div>
+        <h1>Chart Trading<br><span class="text-emerald">Level Profesional</span><br>Di Browser Anda</h1>
+        
+        <p>Engine C++/WASM yang di-render langsung di browser. Real-time candle, Order Flow, Smart Money Concepts, dan AI Assistant — tanpa install apa pun.</p>
+        
+        <div class="hero-btns">
+            <button class="btn btn-primary btn-lg" style="padding: 16px 32px; font-size:16px" onclick="openModal()">
+                Mulai Gratis <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            </button>
+            <button class="btn btn-outline btn-lg" style="padding: 16px 32px; font-size:16px" onclick="openModal()">Sudah punya akun? Masuk</button>
+        </div>
+
+        <div class="hero-stats">
+            <div class="stat-item"><h3>5+</h3><p>Pair Trading</p></div>
+            <div class="stat-item"><h3>15+</h3><p>Indikator</p></div>
+            <div class="stat-item"><h3>0ms</h3><p>Install</p></div>
+        </div>
+
+        <div class="chart-preview">
+            <!-- GANTI SRC DI BAWAH INI DENGAN GAMBAR ASLI ANDA NANTI -->
+            <!-- <img src="assets/my_app_screenshot.png" alt="App Preview"> -->
+            <div style="color:#9ca3af; font-size:20px; font-weight:700; letter-spacing:1px">[ APP SCREENSHOT / GIF ]</div>
+            <div class="skeleton-loader"></div>
+            <div style="color:#6b7280; font-size:12px; margin-top:10px">Disarankan: Resolusi lebar (1344x768px)</div>
         </div>
     </section>
 
-    <!-- Features Section -->
-    <section class="features container">
-        <h2 class="section-title">Why Choose Us?</h2>
+    <!-- FEATURES SECTION -->
+    <section id="features" class="features container">
+        <div class="section-header">
+            <div class="badge">Fitur Utama</div>
+            <h2>Semua yang Anda butuhkan, <span class="text-emerald">dalam satu platform</span></h2>
+            <p>Dibangun dari nol oleh trader untuk trader. Bukan wrapper chart biasa — ini engine kustom bertenaga tinggi.</p>
+        </div>
+
         <div class="feature-grid">
-            <div class="glass-panel feature-card">
-                <div class="f-icon">📊</div>
-                <h3>Order Flow Footprint</h3>
-                <p>Melihat likuiditas tersembunyi dan jejak langkah institusi besar secara real-time di setiap level harga.</p>
+            <div class="glass-card feature-card">
+                <div class="icon-box"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21V10"/><path d="M15 21V3"/><path d="M3 21h18"/><path d="M9 10H5v6h4z"/><path d="M15 3h-4v12h4z"/></svg></div>
+                <h3>WASM Chart Engine</h3>
+                <p>Engine C++ dikompilasi ke WebAssembly dengan GPU instancing. Render 20,000+ candle tanpa lag — performa desktop di browser.</p>
             </div>
-            <div class="glass-panel feature-card">
-                <div class="f-icon">⏪</div>
-                <h3>Market Replay</h3>
-                <p>Latih mental psikologi trading Anda di akhir pekan dengan fitur pemutaran ulang pergerakan harga masa lalu secara presisi.</p>
+            <div class="glass-card feature-card">
+                <div class="icon-box"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg></div>
+                <h3>Order Flow & Footprint</h3>
+                <p>Lihat volume agresor buy/sell per price level real-time. Tahu di mana institusi menaruh order — bukan tebakan.</p>
             </div>
-            <div class="glass-panel feature-card">
-                <div class="f-icon">🤖</div>
-                <h3>Jarvis AI Assistant</h3>
-                <p>Asisten pintar yang menganalisis chart untuk Anda, mendeteksi manipulasi pasar dan divergensi harga otomatis.</p>
+            <div class="glass-card feature-card">
+                <div class="icon-box"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1v1a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-1H2a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73A2 2 0 1 1 12 2Z"/></svg></div>
+                <h3>AI Assistant (Jarvis)</h3>
+                <p>AI yang bisa analisa chart, deteksi swing, gambar Fibonacci, dan scan pola otomatis. Asisten trading pribadi Anda.</p>
+            </div>
+            <div class="glass-card feature-card">
+                <div class="icon-box"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+                <h3>Smart Money Concepts</h3>
+                <p>BOS, CHOCH, Order Block, dan Breaker Block terdeteksi otomatis. Trading berdasarkan langkah smart money.</p>
+            </div>
+            <div class="glass-card feature-card">
+                <div class="icon-box"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 18a6 6 0 0 0 0-12v12z"/></svg></div>
+                <h3>Order Book Real-time</h3>
+                <p>Langsung dari exchange — zero hop, latency minimal. Lihat depth of market dan imbalance untuk konfirmasi entry.</p>
+            </div>
+            <div class="glass-card feature-card">
+                <div class="icon-box"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg></div>
+                <h3>Multi-Pair & Multi-Tab</h3>
+                <p>Forex dan Crypto dalam satu platform. Buka beberapa chart sekaligus di tab berbeda tanpa mengorbankan RAM.</p>
             </div>
         </div>
     </section>
 
-    <!-- Auth Modal -->
-    <div class="modal-overlay" id="auth-modal">
-        <div class="glass-panel modal-content">
-            <button class="close-modal" onclick="closeModal()">×</button>
-            <div class="auth-form-wrap">
-                <h2 id="form-title">Selamat Datang</h2>
-                <p class="subtitle" id="form-subtitle">Masuk untuk mengakses Platform</p>
-                
-                <form id="auth-form">
-                    <div class="input-group">
-                        <label>Email</label>
-                        <input type="email" id="email" required placeholder="nama@email.com">
-                    </div>
-                    <div class="input-group">
-                        <label>Password</label>
-                        <input type="password" id="password" required placeholder="Minimal 6 karakter">
-                    </div>
-                    <button type="submit" class="btn-submit" id="btn-submit">Masuk ke Platform</button>
-                </form>
-                
-                <p id="error-msg"></p>
-                <div class="toggle-mode" id="toggle-btn" onclick="toggleAuthMode()">Belum punya akun? <span>Daftar di sini</span></div>
+    <!-- PRICING SECTION -->
+    <section id="pricing" class="pricing container">
+        <div class="section-header">
+            <div class="badge">Harga</div>
+            <h2>Investasi untuk <span class="text-emerald">profit konsisten</span></h2>
+            <p>Mulai gratis, upgrade kapan saja. Tanpa biaya tersembunyi.</p>
+        </div>
+
+        <div class="pricing-grid">
+            <!-- Free -->
+            <div class="glass-card price-card">
+                <div class="price-name">Free</div>
+                <div class="price-amount"><span class="currency">Rp</span><span class="value">0</span></div>
+                <div class="price-desc">Coba platform tanpa risiko</div>
+                <ul class="feature-list">
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> 2 pair trading</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Indikator dasar (SMA, EMA, RSI)</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Chart candle real-time</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> 1 workspace</li>
+                </ul>
+                <button class="btn btn-outline" style="width:100%" onclick="openModal()">Mulai Gratis</button>
             </div>
+            
+            <!-- Pro -->
+            <div class="glass-card price-card popular">
+                <div class="pop-badge">Populer</div>
+                <div class="price-name">Pro</div>
+                <div class="price-amount"><span class="currency">Rp</span><span class="value">199K</span><span class="period">/bulan</span></div>
+                <div class="price-desc">Untuk trader serius</div>
+                <ul class="feature-list">
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Semua pair (5+) & Indikator (15+)</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Order Flow & Footprint</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Order Book real-time</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Replay mode & 5 workspace</li>
+                </ul>
+                <button class="btn btn-primary" style="width:100%" onclick="openModal()">Upgrade ke Pro</button>
+            </div>
+
+            <!-- Elite -->
+            <div class="glass-card price-card">
+                <div class="price-name">Elite</div>
+                <div class="price-amount"><span class="currency">Rp</span><span class="value">499K</span><span class="period">/bulan</span></div>
+                <div class="price-desc">Trading dengan AI</div>
+                <ul class="feature-list">
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Semua fitur Pro</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> AI Assistant (Jarvis)</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> SMC auto-detect</li>
+                    <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Alert harga real-time</li>
+                </ul>
+                <button class="btn btn-outline" style="width:100%" onclick="openModal()">Upgrade ke Elite</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- TECH SECTION -->
+    <section id="tech" class="tech container">
+        <div class="section-header">
+            <div class="badge">Teknologi</div>
+            <h2>Dibangun dengan <span class="text-emerald">teknologi terdepan</span></h2>
+        </div>
+        <div class="tech-grid">
+            <div class="tech-card"><h4>C++ / WASM</h4><p>Engine utama</p></div>
+            <div class="tech-card"><h4>WebGL2</h4><p>GPU Rendering</p></div>
+            <div class="tech-card"><h4>Python</h4><p>Data Pipeline</p></div>
+            <div class="tech-card"><h4>WebSocket</h4><p>Real-time Feed</p></div>
+            <div class="tech-card"><h4>Hyperliquid</h4><p>Crypto Data</p></div>
+            <div class="tech-card"><h4>MT5</h4><p>Forex Data</p></div>
+            <div class="tech-card"><h4>TA-Lib</h4><p>Technical Analysis</p></div>
+            <div class="tech-card"><h4>IndexedDB</h4><p>Offline Cache</p></div>
+        </div>
+    </section>
+
+    <!-- CTA SECTION -->
+    <section class="cta container">
+        <div class="cta-card">
+            <h2>Siap trading dengan <span class="text-emerald">teknologi terbaik</span>?</h2>
+            <p>Daftar gratis sekarang dan rasakan perbedaannya. Tanpa kartu kredit, tanpa risiko.</p>
+            <button class="btn btn-primary btn-lg" style="padding: 16px 40px; font-size:16px; margin-top:10px" onclick="openModal()">
+                Daftar Sekarang — Gratis <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            </button>
+        </div>
+    </section>
+
+    <!-- FOOTER -->
+    <footer class="container">
+        <div class="footer-content">
+            <div class="logo">
+                <div class="logo-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2"><path d="M3 3v18h18"/><path d="M18.7 8l-5.1 5.2-2.8-2.7L7 14.3"/></svg></div>
+                <div style="font-size:16px">MarketTrade<span class="text-emerald">Web</span></div>
+            </div>
+            <div class="footer-links">
+                <a href="#features">Fitur</a>
+                <a href="#pricing">Harga</a>
+                <a href="#tech">Teknologi</a>
+            </div>
+            <div style="font-size: 14px; color:#9ca3af;">&copy; 2026 MarketTradeWeb. All rights reserved.</div>
+        </div>
+    </footer>
+
+    <!-- AUTH MODAL -->
+    <div class="modal-overlay" id="auth-modal">
+        <div class="modal-content auth-form">
+            <button class="close-modal" onclick="closeModal()">×</button>
+            <h2 id="form-title">Selamat Datang</h2>
+            <p class="subtitle" id="form-subtitle">Masuk untuk mengakses Platform</p>
+            
+            <form id="auth-form">
+                <div class="input-group">
+                    <label>Email</label>
+                    <input type="email" id="email" required placeholder="nama@email.com">
+                </div>
+                <div class="input-group">
+                    <label>Password</label>
+                    <input type="password" id="password" required placeholder="Minimal 6 karakter">
+                </div>
+                <button type="submit" class="btn-submit" id="btn-submit">Masuk ke Platform</button>
+            </form>
+            
+            <p id="error-msg"></p>
+            <div class="toggle-mode" id="toggle-btn" onclick="toggleAuthMode()">Belum punya akun? <span>Daftar di sini</span></div>
         </div>
     </div>
 
-    <!-- UI Scripts -->
+    <!-- SCRIPTS -->
     <script>
-        const modal = document.getElementById('auth-modal');
-        function openModal() { modal.classList.add('active'); }
-        function closeModal() { modal.classList.remove('active'); }
+        // Mobile Menu Toggle
+        const mobToggle = document.getElementById('mobile-toggle');
+        const mobMenu = document.getElementById('mobile-menu');
+        mobToggle.addEventListener('click', () => {
+            mobMenu.classList.toggle('active');
+            mobToggle.innerText = mobMenu.classList.contains('active') ? '✕' : '☰';
+        });
         
-        // Sticky Navbar Effect
+        // Auto-close mobile menu on link click
+        document.querySelectorAll('.mob-link').forEach(link => {
+            link.addEventListener('click', () => {
+                mobMenu.classList.remove('active');
+                mobToggle.innerText = '☰';
+            });
+        });
+
+        // Sticky Navbar
         window.addEventListener('scroll', () => {
             const nav = document.getElementById('navbar');
             if (window.scrollY > 50) nav.classList.add('scrolled');
             else nav.classList.remove('scrolled');
         });
+
+        // Modal Logic
+        const modal = document.getElementById('auth-modal');
+        function openModal() { modal.classList.add('active'); }
+        function closeModal() { modal.classList.remove('active'); }
     </script>
 
     <!-- FIREBASE MODULE -->
@@ -239,6 +481,7 @@
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
         import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
+        // FIREBASE CONFIG - TETAP MENGGUNAKAN YANG ASLI DARI USER
         const firebaseConfig = {
             apiKey: "AIzaSyAx20fXyKEgOYLXaKqV6N2luncaviY2DSs",
             authDomain: "markettradeweb.firebaseapp.com",
@@ -262,7 +505,7 @@
         
         let isRegister = false;
 
-        // Auto-Login Check
+        // Redirect to app.html if already logged in
         onAuthStateChanged(auth, (user) => {
             if (user) {
                 btnSubmit.innerText = "Memasukkan Anda...";
