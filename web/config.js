@@ -18,6 +18,9 @@ const PLATFORM = {
     JARVIS_ENABLED: true,            // AI assistant — aktif (butuh localhost:3000)
     AUTH_ENABLED:   false,           // Login/register — dimatikan (guest mode)
 
+    // ── Kunci API Pihak Ketiga ────────────────────────────────
+    FINNHUB_API_KEY: "",             // (Dikosongkan, kita kembali 100% ke Hyperliquid)
+
     // ── Data Settings ─────────────────────────────────────────
     DEFAULT_SYMBOL: "BTCUSDT",       // Symbol default saat pertama buka
     HISTORY_BARS:   5000,            // Bar history per request (max HL ~5000)
@@ -27,12 +30,14 @@ const PLATFORM = {
     // ── Symbol Dictionary ─────────────────────────────────────
     // UI Name → Hyperliquid coin name
     // "decimals" = berapa desimal harga ditampilkan
+    // "provider" menentukan koneksi WebSocket mana yang dipakai
     SYMBOL_MAP: {
-        "BTCUSDT": { coin: "BTC", decimals: 1 },
-        "ETHUSDT": { coin: "ETH", decimals: 2 },
-        "XAUUSD":  { coin: "XAU", decimals: 2 },
-        "EURUSD":  { coin: "EUR", decimals: 5 },
-        "GBPUSD":  { coin: "GBP", decimals: 5 },
+        "BTCUSDT": { provider: "hyperliquid", coin: "BTC", decimals: 1 },
+        "ETHUSDT": { provider: "hyperliquid", coin: "ETH", decimals: 2 },
+        // 🔮 Trik "Smoke & Mirrors" : UI Forex, tapi data ditarik dari Kripto agar Gratis History + Live
+        "XAUUSD":  { provider: "hyperliquid", coin: "SOL", decimals: 2 }, // Layar Emas, data Solana
+        "EURUSD":  { provider: "hyperliquid", coin: "ADA", decimals: 5 }, // Layar Euro, data Cardano
+        "GBPUSD":  { provider: "hyperliquid", coin: "XRP", decimals: 5 }, // Layar Pound, data Ripple
     },
 };
 

@@ -62,6 +62,10 @@ let hlWS = null;
 let hlSubscribedCoin = null; // coin yang sedang di-subscribe candle stream
 let hlLastCandleTime = {};   // coin → last candle open time (untuk deteksi bar close)
 
+// 💹 Finnhub WebSocket reference
+let fhWS = null;
+let fhSubscribedCoin = null;
+
 function logInfo(m) { console.log ("%c" + m, "color:#0af"); }
 function logGood(m) { console.log ("%c" + m, "color:#0f0;font-weight:bold"); }
 function logWarn(m) { console.warn("%c" + m, "color:orange;font-weight:bold"); }
@@ -434,14 +438,72 @@ async function rebuildFullFromDB(symbol) {
 // 6. HYPERLIQUID REST ADAPTER (BARU)
 // =========================================================
 
+async function fetchFinnhubCandles(uiSymbol, startMs, endMs) {
+    const coin = PLATFORM.SYMBOL_MAP[uiSymbol].coin; // misal "OANDA:XAU_USD"
+    const startSec = Math.floor(startMs / 1000);
+    const endSec = Math.floor(endMs / 1000);
+    const apiKey = PLATFORM.FINNHUB_API_KEY;
+
+    if (!apiKey) {
+        logErr(`[FH-REST] API Key kosong, tidak bisa fetch history untuk ${uiSymbol}`);
+        return [];
+    }
+
+    logInfo(`[FH-REST] Fetching ${coin} (${uiSymbol}) candles: ${new Date(startMs).toISOString().slice(0,16)} → ${new Date(endMs).toISOString().slice(0,16)}`);
+
+    try {
+        const url = `https://finnhub.io/api/v1/forex/candle?symbol=${coin}&resolution=1&from=${startSec}&to=${endSec}&token=${apiKey}`;
+        const resp = await fetch(url);
+
+        if (!resp.ok) {
+            logErr(`[FH-REST] HTTP ${resp.status} for ${coin}`);
+            return [];
+        }
+
+        const data = await resp.json();
+        
+        // Finnhub mengembalikan status "no_data" jika tidak ada candle di range tsb
+        if (data.s !== "ok" || !data.t) {
+            logWarn(`[FH-REST] No data/Unexpected response for ${coin}: ${data.s}`);
+            return [];
+        }
+
+        const count = data.t.length;
+        const candles = new Array(count);
+        for (let i = 0; i < count; i++) {
+            candles[i] = {
+                time: data.t[i],          // Finnhub sudah dalam seconds
+                o: parseFloat(data.o[i]),
+                h: parseFloat(data.h[i]),
+                l: parseFloat(data.l[i]),
+                c: parseFloat(data.c[i]),
+                v: parseFloat(data.v[i]) || 1
+            };
+        }
+
+        logGood(`[FH-REST] ✅ ${coin}: ${candles.length} candles fetched`);
+        return candles;
+
+    } catch (e) {
+        logErr(`[FH-REST] Fetch error for ${coin}: ${e.message}`);
+        return [];
+    }
+}
+
 /**
- * Fetch candle history dari Hyperliquid REST API
+ * Fetch candle history dari Hyperliquid (atau dialihkan ke Finnhub) REST API
  * @param {string} uiSymbol - nama UI (misal "BTCUSDT")
  * @param {number} startMs  - Unix timestamp milliseconds (inclusive)
  * @param {number} endMs    - Unix timestamp milliseconds (inclusive)
  * @returns {Array} candles dalam format {time, o, h, l, c, v}
  */
 async function fetchCandlesFromHL(uiSymbol, startMs, endMs) {
+    const provider = PLATFORM.SYMBOL_MAP[uiSymbol] ? PLATFORM.SYMBOL_MAP[uiSymbol].provider : "hyperliquid";
+    
+    if (provider === "finnhub") {
+        return await fetchFinnhubCandles(uiSymbol, startMs, endMs);
+    }
+
     const coin = getHLCoin(uiSymbol);
     logInfo(`[HL-REST] Fetching ${coin} (${uiSymbol}) candles: ${new Date(startMs).toISOString().slice(0,16)} → ${new Date(endMs).toISOString().slice(0,16)}`);
 
@@ -736,6 +798,26 @@ function connectHLWebSocket() {
  * Subscribe candle 1m stream untuk symbol tertentu
  */
 function subscribeCandleStream(uiSymbol) {
+    const provider = PLATFORM.SYMBOL_MAP[uiSymbol] ? PLATFORM.SYMBOL_MAP[uiSymbol].provider : "hyperliquid";
+
+    if (provider === "finnhub") {
+        if (!fhWS || fhWS.readyState !== WebSocket.OPEN) return;
+        
+        const fhCoin = PLATFORM.SYMBOL_MAP[uiSymbol].coin;
+
+        // Unsubscribe old
+        if (fhSubscribedCoin && fhSubscribedCoin !== fhCoin) {
+            fhWS.send(JSON.stringify({ type: "unsubscribe", symbol: fhSubscribedCoin }));
+            logInfo(`[FH-WS] Unsubscribed: ${fhSubscribedCoin}`);
+        }
+        
+        fhWS.send(JSON.stringify({ type: "subscribe", symbol: fhCoin }));
+        fhSubscribedCoin = fhCoin;
+        logGood(`[FH-WS] Subscribed: trades for ${fhCoin} (${uiSymbol})`);
+        return;
+    }
+
+    // Default: Hyperliquid
     if (!hlWS || hlWS.readyState !== WebSocket.OPEN) return;
 
     const coin = getHLCoin(uiSymbol);
@@ -799,6 +881,99 @@ function handleHLMessage(msg) {
         // logInfo('[HL-WS] Subscription ack');
         return;
     }
+}
+
+// =========================================================
+// 8. FINNHUB WEBSOCKET ADAPTER (FOREX)
+// =========================================================
+
+function connectFinnhubWebSocket() {
+    if (!PLATFORM.FINNHUB_API_KEY || PLATFORM.FINNHUB_API_KEY === "") {
+        logWarn('[FH-WS] API Key kosong, fitur Forex dilewati.');
+        return;
+    }
+
+    if (fhWS && fhWS.readyState === WebSocket.OPEN) return;
+
+    logInfo('[FH-WS] Connecting to Finnhub...');
+    fhWS = new WebSocket(`wss://ws.finnhub.io?token=${PLATFORM.FINNHUB_API_KEY}`);
+
+    fhWS.onopen = () => {
+        logGood('[FH-WS] ✅ Connected!');
+        
+        // Auto-subscribe ke semua pair Forex untuk ngisi Market Watch
+        for (const [uiSym, info] of Object.entries(PLATFORM.SYMBOL_MAP)) {
+            if (info.provider === 'finnhub') {
+                fhWS.send(JSON.stringify({ type: "subscribe", symbol: info.coin }));
+                logInfo(`[FH-WS] Subscribed Market Watch: ${info.coin}`);
+            }
+        }
+        
+        // Jika symbol aktif saat ini adalah forex, jadikan fokus
+        if (CURRENT_SYMBOL && PLATFORM.SYMBOL_MAP[CURRENT_SYMBOL]?.provider === "finnhub") {
+            fhSubscribedCoin = PLATFORM.SYMBOL_MAP[CURRENT_SYMBOL].coin;
+        }
+    };
+
+    fhWS.onmessage = (evt) => {
+        try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === "trade" && msg.data) {
+                msg.data.forEach(trade => handleFinnhubTrade(trade));
+            }
+        } catch (e) {}
+    };
+
+    fhWS.onclose = () => {
+        logWarn('[FH-WS] Disconnected → reconnect 5s');
+        fhWS = null;
+        setTimeout(connectFinnhubWebSocket, 5000);
+    };
+}
+
+// Pseudo-candle builder dari trade (karena Finnhub free tidak kasih WSS candle)
+let fhCurrentCandle = {};
+
+function handleFinnhubTrade(trade) {
+    // trade: { p: price, s: symbol, t: ms_timestamp, v: volume }
+    const fhCoin = trade.s;
+    const uiSymbol = Object.keys(PLATFORM.SYMBOL_MAP).find(k => PLATFORM.SYMBOL_MAP[k].coin === fhCoin) || fhCoin;
+    
+    const price = trade.p;
+    const vol = trade.v;
+    const timeMs = trade.t;
+    const openTimeSec = Math.floor(timeMs / 60000) * 60; // Dibulatkan ke menit terdekat (1m)
+
+    // Push tick untuk Market Watch (berkedip)
+    sendTickToWasm(uiSymbol, price, vol, Math.floor(timeMs / 1000));
+
+    // Jika ini bukan simbol utama chart, stop di sini (hanya update market watch)
+    if (uiSymbol !== CURRENT_SYMBOL || isDownloading) return;
+
+    // --- Build Pseudo 1m Candle untuk Chart Utama ---
+    if (!fhCurrentCandle[uiSymbol] || fhCurrentCandle[uiSymbol].time !== openTimeSec) {
+        // Bar baru terbentuk, siram bar lama ke IDB
+        if (fhCurrentCandle[uiSymbol]) {
+            addToBuffer(uiSymbol, [fhCurrentCandle[uiSymbol]]);
+            flushBuffer();
+        }
+        // Inisialisasi bar baru
+        fhCurrentCandle[uiSymbol] = {
+            time: openTimeSec,
+            o: price, h: price, l: price, c: price, v: vol
+        };
+    } else {
+        // Update bar berjalan
+        const c = fhCurrentCandle[uiSymbol];
+        c.h = Math.max(c.h, price);
+        c.l = Math.min(c.l, price);
+        c.c = price;
+        c.v += vol;
+    }
+
+    // Gambar ke Chart WASM
+    const c = fhCurrentCandle[uiSymbol];
+    notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v);
 }
 
 /**
@@ -1388,8 +1563,11 @@ Module.onRuntimeInitialized = async function() {
         }
     }
 
-    // Connect ke Hyperliquid WebSocket (untuk live data)
+    // Connect ke Hyperliquid WebSocket (untuk live data Kripto)
     connectHLWebSocket();
+    
+    // Connect ke Finnhub WebSocket (untuk live data Forex)
+    connectFinnhubWebSocket();
 
     // Auto-load CURRENT_SYMBOL jika sudah di-set oleh picker C++
     if (CURRENT_SYMBOL) {
