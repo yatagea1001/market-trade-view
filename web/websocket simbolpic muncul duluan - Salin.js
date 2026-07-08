@@ -1569,82 +1569,44 @@ Module.onRuntimeInitialized = async function() {
     // Connect ke Finnhub WebSocket (untuk live data Forex)
     connectFinnhubWebSocket();
 
-    // ─────────────────────────────────────────────────────────────────
-    // 🔄 SYNC SYMBOL DARI C++ (single source of truth)
-    //
-    // BUG LAMA (sudah fix):
-    //   Sebelumnya WebSocket baca localStorage "MyTradingApp_ChartState"
-    //   untuk dapat symbol terakhir. Tapi kadang race condition dengan
-    //   C++ → CURRENT_SYMBOL tetap kosong → chart tampil label saja,
-    //   tanpa history & tanpa subscribe HL WS live. Baru lengkap kalau
-    //   user pindah simbol via picker (SetActiveSymbol ter-trigger).
-    //
-    // FIX:
-    //   Ambil langsung dari C++ via wasm_nav_get_symbol(). C++ sudah
-    //   LoadWebLayout() di main() dan set g_symbol sebelum JS init.
-    //   Setelah dapat symbol → panggil SetActiveSymbol penuh, yg akan
-    //   handle:
-    //     1. Clear chart di C++ (Module._wasm_clear_chart)
-    //     2. Load history dari IDB (rebuildFullFromDB) atau download fresh
-    //     3. Gap fill dari HL REST (kalau IDB ada gap)
-    //     4. Subscribe HL WebSocket live stream (subscribeCandleStream)
-    //   → chart lengkap: history + live. Sama seperti user pindah via picker.
-    // ─────────────────────────────────────────────────────────────────
-    let initialSym = "";
-
-    // 1. Prioritas: ambil dari C++ (paling akurat — sesuai chart C++)
-    try {
-        if (Module._wasm_nav_get_symbol) {
-            const symFromCpp = Module.ccall(
-                'wasm_nav_get_symbol', 'string', [], []
-            );
-            if (symFromCpp && symFromCpp.trim().length > 0) {
-                initialSym = symFromCpp.trim();
-                logGood(`[STARTUP] Symbol aktif dari C++: ${initialSym}`);
-            }
-        } else {
-            logWarn(`[STARTUP] wasm_nav_get_symbol tidak tersedia di Module`);
-        }
-    } catch(e) {
-        logWarn(`[STARTUP] Gagal ambil symbol dari C++: ${e.message}`);
-    }
-
-    // 2. Fallback: baca dari localStorage (kalau C++ belum set / bridge gagal)
-    if (!initialSym) {
+    // Ambil symbol terakhir yang dibuka dari localStorage yang disimpan C++
+    if (!CURRENT_SYMBOL) {
         try {
             const savedState = localStorage.getItem("MyTradingApp_ChartState");
             if (savedState) {
                 const j = JSON.parse(savedState);
-                if (j.symbol && j.symbol.trim().length > 0) {
-                    initialSym = j.symbol.trim();
-                    logInfo(`[STARTUP] Symbol dari localStorage (fallback): ${initialSym}`);
-                }
+                if (j.symbol) CURRENT_SYMBOL = j.symbol;
             }
-        } catch(e) {
-            logWarn(`[STARTUP] localStorage parse error: ${e.message}`);
-        }
+        } catch(e) {}
     }
 
-    // 3. Auto-load via SetActiveSymbol — handle history + gap fill + live
-    //
-    //    PENTING: JANGAN set CURRENT_SYMBOL dulu sebelum panggil SetActiveSymbol!
-    //    SetActiveSymbol punya early-return guard:
-    //        if (CURRENT_SYMBOL && CURRENT_SYMBOL === newSym) return;
-    //    Kalau CURRENT_SYMBOL sudah di-set == newSym, guard akan return early
-    //    dan chart gak ke-load. Biarkan SetActiveSymbol yg set CURRENT_SYMBOL
-    //    di dalamnya (line 1095).
-    //
-    //    Race condition dgn connectHLWebSocket() di atas aman:
-    //    - Kalau HL WS sudah open → SetActiveSymbol panggil subscribeCandleStream
-    //      langsung (line 1118).
-    //    - Kalau HL WS belum open → onopen trigger nanti, cek CURRENT_SYMBOL
-    //      (sudah di-set oleh SetActiveSymbol), lalu subscribe (line 768-770).
-    if (initialSym) {
-        logInfo(`[STARTUP] Auto-load ${initialSym} via SetActiveSymbol...`);
-        await window.SetActiveSymbol(initialSym);
-        logGood(`[STARTUP] ✅ ${initialSym} ready (history + live subscribed)`);
+    // Auto-load CURRENT_SYMBOL jika sudah di-set
+    if (CURRENT_SYMBOL) {
+        const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
+        if (existing.length >= MIN) {
+            // Gap fill
+            const latestTime = existing.reduce((max, c) => c.time > max ? c.time : max, 0);
+            const gapSeconds = Math.floor(Date.now()/1000) - latestTime;
+            if (gapSeconds > 30) {
+                const gapMinutes = Math.floor(gapSeconds / 60);
+                logWarn(`[STARTUP-GAP] ${gapMinutes}m gap → fetch dari HL REST`);
+                showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (${gapMinutes}m gap)...`, 0);
+                const gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestTime);
+                if (gapCandles.length > 0) {
+                    addToBuffer(CURRENT_SYMBOL, gapCandles);
+                    await flushBuffer();
+                }
+                logGood(`[STARTUP-GAP] ✅ IDB lengkap → render`);
+            }
+            showLoadingOverlay(`Loading ${CURRENT_SYMBOL}`, 0);
+            await rebuildFullFromDB(CURRENT_SYMBOL);
+            hideLoadingOverlay();
+        } else {
+            // Kalau di IDB kurang data, panggil SetActiveSymbol agar download
+            logWarn(`[STARTUP] ${CURRENT_SYMBOL} di IDB kosong, download fresh`);
+            window.SetActiveSymbol(CURRENT_SYMBOL);
+        }
     } else {
-        // Tidak ada simbol tersimpan → user pertama kali → tampilkan picker
         logInfo("[STARTUP] Menunggu user pilih symbol dari picker...");
         hideLoadingOverlay();
     }
