@@ -1,2 +1,2 @@
 Coba langsung di sini:  
-**[https://yatagea1001.github.io/trading-simulator-demo/](https://yatagea1001.github.io/trading-simulator-demo/)**
+**[https://github.com/yatagea1001/market-trade-view/]([https://yatagea1001.github.io/market-trade-view/))**
