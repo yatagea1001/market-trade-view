@@ -286,6 +286,16 @@ const NAV_TOOLS = [
         label: '+ New',
         tooltip: 'Tambah Chart Baru',
         isWide: true
+    },
+    {
+        id: 'nav-replay',
+        segIdx: -1,              // 🔥 special: bukan segment nav, tapi tombol replay
+        icon: 'assets/replay.png',
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>',
+        label: 'Replay',
+        tooltip: 'Mode Replay',
+        isWide: true,
+        isReplay: true           // 🔥 flag: tombol ini handle replay start/stop
     }
 ];
 
@@ -351,25 +361,31 @@ function buildHTML() {
         <div class="jt-scroll-indicator"></div>
     </div>
 
-    <!-- Replay Floating Button
-         Orientasi auto (biasanya cuma 1 tombol, tapi auto tetap jalan) -->
-    <div id="jt-replay-btn" class="jt-toolbar" data-active="false">
-        <div class="jt-toolbar-inner">
-            <button class="jt-replay-btn" data-tooltip="Mode Replay">
-                <img src="assets/replay.png" alt="Replay" class="jt-replay-icon"/>
-                <span class="jt-replay-pulse"></span>
-            </button>
-        </div>
-        <div class="jt-scroll-indicator"></div>
-    </div>
+    <!-- Replay Button sekarang ada di NAV_TOOLS (tombol "Replay" di nav toolbar).
+         Frame replay lama dihapus — tidak perlu container terpisah lagi. -->
 
-    <!-- Navigation Toolbar — 5 tombol (Symbol, TF, Candle, Indicator, + New)
-         Klik tombol → set active segment (visual feedback). Popup tetap C++. -->
+    <!-- Navigation Toolbar — 6 tombol (Symbol, TF, Candle, Indicator, + New, Replay)
+         Klik tombol → set active segment (visual feedback). Popup tetap C++.
+         Tombol Replay handle start/stop via wasm_replay_start/stop. -->
     <div id="jt-nav-toolbar" class="jt-toolbar">
         <div class="jt-toolbar-inner">
             ${NAV_TOOLS.map(tool => buildNavButtonHTML(tool)).join('')}
         </div>
         <div class="jt-scroll-indicator"></div>
+    </div>
+
+    <!-- Context Menu (klik kanan / long-press) -->
+    <div id="jt-context-menu" class="jt-context-menu">
+        <div class="jt-context-menu-header" id="jt-ctx-header">Tools</div>
+        <div class="jt-context-menu-separator"></div>
+        <div class="jt-context-menu-item" data-action="toggle-title">
+            <span id="jt-ctx-title-icon">👁️</span>
+            <span id="jt-ctx-title-label">Sembunyikan Title Bar</span>
+        </div>
+        <div class="jt-context-menu-item" data-action="close-frame">
+            <span>❌</span>
+            <span>Tutup Frame</span>
+        </div>
     </div>
 
     <!-- Tooltip (shared) -->
@@ -445,7 +461,10 @@ function buildCSS() {
     }
     .jt-toolbar.jt-visible { display: flex; }
 
-    /* 🎯 INNER = RATA ATAS-KIRI (top-left aligned) + SCROLLABLE
+    /* 🎯 INNER = RATA ATAS-KIRI + SCROLLABLE
+       - pointer-events: NONE → click ke area kosong TEMBUS ke ImGui bawah
+         (supaya segitiga ▾ di title bar dock bisa di-klik, close X jalan, dll)
+       - Hanya tombol (.jt-btn, .jt-replay-btn) yang pointer-events: auto
        - align-items + justify-content → flex-start (atas & kiri)
        - flex-wrap: nowrap → TIDAK pindah baris, tetap 1 jalur
        - overflow:auto → bisa scroll kalau konten lebih besar dari container
@@ -457,7 +476,7 @@ function buildCSS() {
         align-items: flex-start;    /* rata ATAS (axis secondary) */
         justify-content: flex-start;/* rata KIRI (axis primary) */
         gap: 3px;                   /* gap kecil biar merapat */
-        pointer-events: auto;
+        pointer-events: none;       /* 🔥 TOMBOL saja yang auto, area kosong TEMBUS ke ImGui */
         padding: 0px;               /* 🔥 padding 0 = dempet ke title bar ImGui */
         background: transparent;
         width: 100%;
@@ -476,6 +495,13 @@ function buildCSS() {
     }
     .jt-toolbar-inner::-webkit-scrollbar {
         display: none;              /* Chrome/Safari/Edge — sembunyikan default */
+    }
+
+    /* 🔥 HANYA tombol yang bisa di-klik — area kosong tembus ke ImGui */
+    .jt-btn,
+    .jt-replay-btn,
+    .jt-scroll-indicator {
+        pointer-events: auto;
     }
 
     /* 🎨 OVERLAY SCROLLBAR — muncul saat hover/scroll, hilang otomatis
@@ -724,6 +750,56 @@ function buildCSS() {
         100% { transform: scale(1.4); opacity: 0; }
     }
 
+    /* ── Context Menu (klik kanan / long-press) ──
+       Muncul saat user klik kanan di toolbar (desktop) atau
+       tap-hold 500ms (mobile). Berisi opsi toggle title bar. */
+    .jt-context-menu {
+        position: fixed;
+        background: rgba(10, 10, 18, 0.98);
+        border: 1px solid rgba(16, 185, 129, 0.4);
+        border-radius: 8px;
+        padding: 6px;
+        z-index: 10000;
+        opacity: 0;
+        transform: scale(0.95);
+        transition: opacity 0.15s ease, transform 0.15s ease;
+        pointer-events: none;
+        min-width: 180px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+        font-size: 12px;
+    }
+    .jt-context-menu.jt-visible {
+        opacity: 1;
+        transform: scale(1);
+        pointer-events: auto;
+    }
+    .jt-context-menu-item {
+        padding: 8px 12px;
+        border-radius: 5px;
+        cursor: pointer;
+        color: #ccc;
+        transition: background 0.12s, color 0.12s;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .jt-context-menu-item:hover {
+        background: rgba(16, 185, 129, 0.15);
+        color: #10b981;
+    }
+    .jt-context-menu-separator {
+        height: 1px;
+        background: rgba(16, 185, 129, 0.2);
+        margin: 4px 0;
+    }
+    .jt-context-menu-header {
+        padding: 6px 12px;
+        font-size: 10px;
+        color: #666;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
     /* ── Tooltip ── */
     .jt-tooltip {
         position: fixed;
@@ -797,8 +873,8 @@ function init() {
     // Cache DOM refs
     drawingBar = overlay.querySelector('#jt-drawing-toolbar');
     rightBar   = overlay.querySelector('#jt-right-toolbar');
-    replayBtn  = overlay.querySelector('#jt-replay-btn');
     navBar     = overlay.querySelector('#jt-nav-toolbar');
+    replayBtn  = null;   // 🔥 Replay sekarang ada di NAV_TOOLS, bukan frame terpisah
     tooltipEl  = overlay.querySelector('#jt-tooltip');
 
     // Deteksi mobile (untuk adjust ukuran tombol)
@@ -808,10 +884,10 @@ function init() {
     // Bind events
     bindDrawingToolbar();
     bindRightToolbar();
-    bindReplayButton();
-    bindNavToolbar();    // 🔥 Bind nav toolbar
+    bindNavToolbar();    // 🔥 Bind nav toolbar (sekarang termasuk tombol Replay)
     bindTooltips();
     bindScrollbars();   // 🔥 Bind scroll event untuk show/hide overlay scrollbar
+    bindContextMenu();  // 🔥 Bind context menu (klik kanan / long-press)
 
     // ── POSITION SYNC LOOP (60fps) ──
     // Baca rect ImGui frame dari C++ setiap frame, posisikan overlay
@@ -851,12 +927,7 @@ function syncPosition() {
                  'wasm_jt_get_panel_w', 'wasm_jt_get_panel_h',
                  screenW, screenH);
 
-    syncOneFrame(replayBtn, 'wasm_jt_get_replay_visible',
-                 'wasm_jt_get_replay_x', 'wasm_jt_get_replay_y',
-                 'wasm_jt_get_replay_w', 'wasm_jt_get_replay_h',
-                 screenW, screenH);
-
-    // 🔥 Sync nav frame (Navigasi)
+    // 🔥 Sync nav frame (Navigasi) — sekarang termasuk tombol Replay
     syncOneFrame(navBar, 'wasm_jt_get_nav_visible',
                  'wasm_jt_get_nav_x', 'wasm_jt_get_nav_y',
                  'wasm_jt_get_nav_w', 'wasm_jt_get_nav_h',
@@ -1101,6 +1172,20 @@ function bindNavToolbar() {
             const segIdx = parseInt(btn.dataset.segIdx, 10);
             if (isNaN(segIdx)) return;
 
+            // 🔥 SPECIAL: tombol Replay (segIdx = -1) → handle start/stop replay
+            if (segIdx === -1) {
+                if (replayActive) {
+                    safeCcall('wasm_replay_stop', null, [], []);
+                    replayActive = false;
+                } else {
+                    safeCcall('wasm_replay_start', null, [], []);
+                    replayActive = true;
+                }
+                btn.dataset.active = replayActive ? 'true' : 'false';
+                flashButton(btn);
+                return;
+            }
+
             // Panggil C++ untuk set active segment
             safeCcall('wasm_nav_click_segment', null, ['number'], [segIdx]);
 
@@ -1213,6 +1298,139 @@ function bindTooltips() {
         replayInner.addEventListener('mouseleave', hideTooltip);
         replayInner.addEventListener('mousedown', hideTooltip);
     }
+}
+
+// ── Context Menu Handler (klik kanan / long-press) ──────────
+// Munculin popup "Sembunyikan/Tampilkan Title Bar" + "Tutup Frame"
+// saat user klik kanan (desktop) atau tap-hold 500ms (mobile) di toolbar.
+let contextMenuTarget = null;   // { el, frameId, frameName }
+let longPressTimer = null;
+
+function bindContextMenu() {
+    const menu = overlay.querySelector('#jt-context-menu');
+
+    // Mapping toolbar ID → frameId + nama
+    // 🔥 Replay frame dihapus — tombol Replay sekarang ada di NAV toolbar
+    const FRAME_MAP = {
+        'jt-drawing-toolbar': { id: 0, name: 'Tools' },
+        'jt-right-toolbar':   { id: 1, name: 'Panel' },
+        'jt-nav-toolbar':     { id: 3, name: 'Navigasi' }
+    };
+
+    // Fungsi show context menu di posisi X,Y
+    const showMenu = (x, y, toolbarId) => {
+        const info = FRAME_MAP[toolbarId];
+        if (!info) return;
+        contextMenuTarget = { toolbarId, frameId: info.id, frameName: info.name };
+
+        // Update header + label sesuai state title bar sekarang
+        const titleBarVisible = safeCcall('wasm_jt_get_title_bar_visible',
+                                          'number', ['number'], [info.id]);
+        const titleLabel = overlay.querySelector('#jt-ctx-title-label');
+        const titleIcon  = overlay.querySelector('#jt-ctx-title-icon');
+        const header     = overlay.querySelector('#jt-ctx-header');
+        if (header) header.textContent = info.name;
+        if (titleLabel) {
+            titleLabel.textContent = (titleBarVisible === 1)
+                ? 'Sembunyikan Title Bar'
+                : 'Tampilkan Title Bar';
+        }
+        if (titleIcon) {
+            titleIcon.textContent = (titleBarVisible === 1) ? '👁️' : '🙈';
+        }
+
+        // Posisi menu — clamp supaya tidak keluar viewport
+        const menuW = 200, menuH = 130;
+        let mx = x, my = y;
+        if (mx + menuW > window.innerWidth)  mx = window.innerWidth - menuW - 4;
+        if (my + menuH > window.innerHeight) my = window.innerHeight - menuH - 4;
+        menu.style.left = mx + 'px';
+        menu.style.top  = my + 'px';
+        menu.classList.add('jt-visible');
+    };
+
+    // Sembunyikan menu
+    const hideMenu = () => {
+        menu.classList.remove('jt-visible');
+        contextMenuTarget = null;
+    };
+
+    // 1. Klik kanan (desktop)
+    overlay.querySelectorAll('.jt-toolbar').forEach(toolbar => {
+        toolbar.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            showMenu(e.clientX, e.clientY, toolbar.id);
+        });
+    });
+
+    // 2. Long-press (mobile) — tahan 500ms
+    overlay.querySelectorAll('.jt-toolbar').forEach(toolbar => {
+        toolbar.addEventListener('touchstart', (e) => {
+            if (e.touches.length !== 1) return;
+            const touch = e.touches[0];
+            const startX = touch.clientX, startY = touch.clientY;
+            const tbId = toolbar.id;
+            longPressTimer = setTimeout(() => {
+                showMenu(startX, startY, tbId);
+            }, 500);  // 500ms = long-press
+        }, { passive: true });
+
+        // Cancel kalau user bergerak (swipe) atau lepas
+        toolbar.addEventListener('touchmove', () => {
+            clearTimeout(longPressTimer);
+        }, { passive: true });
+        toolbar.addEventListener('touchend', () => {
+            clearTimeout(longPressTimer);
+        }, { passive: true });
+        toolbar.addEventListener('touchcancel', () => {
+            clearTimeout(longPressTimer);
+        }, { passive: true });
+    });
+
+    // 3. Klik item menu
+    overlay.querySelectorAll('.jt-context-menu-item').forEach(item => {
+        item.addEventListener('click', () => {
+            if (!contextMenuTarget) return;
+            const action = item.dataset.action;
+            const { frameId, frameName, toolbarId } = contextMenuTarget;
+
+            if (action === 'toggle-title') {
+                // Toggle title bar via WASM
+                safeCcall('wasm_jt_toggle_title_bar', 'number', ['number'], [frameId]);
+                console.log('[JARVIS-TB] Title bar toggled for', frameName);
+            } else if (action === 'close-frame') {
+                // Tutup frame via toggle (klik X virtual)
+                // 🔥 Replay frame dihapus — case 2 tidak dipakai lagi
+                const toggleFn = {
+                    0: 'wasm_jt_toggle_tools',
+                    1: 'wasm_jt_toggle_panel',
+                    3: 'wasm_jt_toggle_nav'
+                }[frameId];
+                if (toggleFn) safeCcall(toggleFn, 'number', [], []);
+                console.log('[JARVIS-TB] Frame closed:', frameName);
+            }
+
+            hideMenu();
+        });
+    });
+
+    // 4. Klik di luar menu → tutup
+    document.addEventListener('click', (e) => {
+        if (!menu.classList.contains('jt-visible')) return;
+        if (menu.contains(e.target)) return;
+        hideMenu();
+    });
+    document.addEventListener('contextmenu', (e) => {
+        // Klik kanan di luar toolbar → tutup menu yang terbuka
+        if (!menu.contains(e.target) && !e.target.closest('.jt-toolbar')) {
+            hideMenu();
+        }
+    });
+
+    // 5. Escape → tutup menu
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') hideMenu();
+    });
 }
 
 // ── Scrollbar Overlay Handler ─────────────────────────────────
@@ -1335,12 +1553,12 @@ function syncState() {
         updateJarvisBtn();
     }
 
-    // Sync Replay state
+    // Sync Replay state — update tombol Replay di NAV toolbar (bukan frame terpisah)
     const rp = safeCcall('wasm_get_replay_active', 'number', [], []);
-    if (rp !== null && replayActive !== (rp === 1)) {
+    if (rp !== null) {
         replayActive = (rp === 1);
-        const replayInnerBtn = replayBtn.querySelector('.jt-replay-btn');
-        if (replayInnerBtn) replayInnerBtn.dataset.active = replayActive ? 'true' : 'false';
+        const navReplayBtn = overlay.querySelector('[data-tool-id="nav-replay"]');
+        if (navReplayBtn) navReplayBtn.dataset.active = replayActive ? 'true' : 'false';
     }
 
     // 🔥 Sync Nav state (label symbol/TF + active segment glow)
