@@ -24,17 +24,12 @@ html, body {
 /* --- 2. CANVAS STANDAR IMGUI WEB --- */
 canvas.emscripten {
     position: absolute;
-    top: 0; left: 0;
-    width: 100%; height: 100%;
+    top: 36px; left: 0;                /* 🔥 offset 36px ke bawah — di bawah header bar */
+    width: 100%; height: calc(100% - 36px);
     border: 0 none;
     background-color: #000;
     outline: none;
-    /* 🔥 Hilangkan highlight biru saat tap di Android */
-    -webkit-tap-highlight-color: transparent; 
-    /* ✅ HAPUS fade-in 2 detik — UI langsung muncul saat WASM ready (native feel).
-       Sebelumnya: opacity: 0; transition: opacity 2s ease;
-       Masalah: selama 2 detik fade-in, mouse event sudah aktif tapi ImGui
-       context belum ready → crash "GImGui != 0L". */
+    -webkit-tap-highlight-color: transparent;
     opacity: 1;
 }
 
@@ -95,10 +90,163 @@ button:hover { background: #008ccb; }
 .toggle-link { margin-top: 20px; font-size: 13px; color: #888; cursor: pointer; }
 #auth-msg { color: #ff5555; font-size: 12px; margin-top: 10px; min-height: 15px; }
 
+/* === APP HEADER BAR — Jarvis Dark Tech Style === */
+#app-header {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 36px;
+    background: linear-gradient(180deg, #0a0a12 0%, #0f0f18 100%);
+    border-bottom: 1px solid rgba(16, 185, 129, 0.25);
+    display: flex;
+    align-items: center;
+    z-index: 9998;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.6);
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+/* Pojok kiri: Nama App */
+.app-header-brand {
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 16px; height: 100%;
+    font-size: 13px; font-weight: 700; letter-spacing: 1.5px;
+    white-space: nowrap; flex-shrink: 0;
+    border-right: 1px solid rgba(16, 185, 129, 0.15);
+}
+.app-header-brand-icon {
+    width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center;
+    background: #000;
+    border-radius: 4px;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    flex-shrink: 0;
+}
+.app-header-brand-icon svg {
+    width: 16px; height: 16px;
+}
+.app-header-brand-icon img {
+    width: 18px; height: 18px;
+    object-fit: contain;
+}
+.app-header-brand-text {
+    background: linear-gradient(90deg, #10b981, #34d399, #10b981);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    animation: brand-shimmer 4s linear infinite;
+}
+@keyframes brand-shimmer {
+    0% { background-position: 0% center; }
+    100% { background-position: 200% center; }
+}
+
+/* Tengah: Ticker Berjalan */
+.app-header-ticker {
+    flex: 1; overflow: hidden; height: 100%;
+    display: flex; align-items: center; position: relative;
+    mask-image: linear-gradient(90deg, transparent 0%, #000 4%, #000 96%, transparent 100%);
+    -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 4%, #000 96%, transparent 100%);
+}
+.app-header-ticker-track {
+    display: flex; align-items: center; gap: 28px;
+    white-space: nowrap; padding-left: 100%;
+    animation: ticker-scroll 40s linear infinite;
+}
+@keyframes ticker-scroll {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(-100%); }
+}
+.ticker-item {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; font-family: 'Consolas', 'Monaco', monospace;
+}
+.ticker-symbol { color: #aaa; font-weight: 600; letter-spacing: 0.5px; }
+.ticker-price  { color: #e0e0e0; }
+.ticker-up     { color: #10b981; font-weight: 600; }
+.ticker-down   { color: #ef4444; font-weight: 600; }
+.ticker-sep    { color: rgba(255,255,255,0.1); }
+
+/* Kanan: Tombol Fullscreen + Exit */
+.app-header-controls {
+    display: flex; align-items: center; gap: 4px;
+    padding: 0 10px; height: 100%; flex-shrink: 0;
+    border-left: 1px solid rgba(16, 185, 129, 0.15);
+    /* 🔥 FIX: align center vertical supaya sejajar dengan ticker */
+    align-self: center;
+}
+.header-btn {
+    width: 28px; height: 28px;
+    display: flex; align-items: center; justify-content: center;
+    background: transparent; border: 1px solid transparent;
+    border-radius: 5px; cursor: pointer; color: #777;
+    transition: all 0.15s ease; padding: 0;
+    /* 🔥 FIX: margin-top 0, align center */
+    margin: 0;
+}
+.header-btn:hover {
+    background: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.3);
+    color: #10b981;
+}
+.header-btn:active { transform: scale(0.92); }
+.header-btn svg { width: 15px; height: 15px; }
+.header-btn-exit:hover {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: rgba(239, 68, 68, 0.3);
+    color: #ef4444;
+}
+
+/* Mobile adjust */
+@media (max-width: 768px) {
+    .app-header-brand-text { font-size: 11px; }
+    .app-header-brand { padding: 0 10px; }
+    .ticker-item { font-size: 11px; }
+}
+
 </style>
 </head>
 
 <body>
+
+<!-- === APP HEADER BAR === -->
+<div id="app-header">
+    <!-- Kiri: Nama App (logo auto-detect: assets/logo.png atau fallback SVG candlestick) -->
+    <div class="app-header-brand">
+        <span class="app-header-brand-icon" id="app-logo">
+            <!-- SVG fallback: candlestick icon di bg hitam (akan di-replace oleh JS kalau logo.png ada) -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2">
+                <line x1="6" y1="3" x2="6" y2="21" stroke="#10b981"/>
+                <rect x="4" y="7" width="4" height="8" fill="#10b981" stroke="#10b981"/>
+                <line x1="14" y1="2" x2="14" y2="22" stroke="#ef4444"/>
+                <rect x="12" y="5" width="4" height="12" fill="#ef4444" stroke="#ef4444"/>
+                <line x1="20" y1="4" x2="20" y2="20" stroke="#10b981"/>
+                <rect x="18" y="9" width="4" height="6" fill="#10b981" stroke="#10b981"/>
+            </svg>
+        </span>
+        <span class="app-header-brand-text">MARKET TRADE VIEW</span>
+    </div>
+    <!-- Tengah: Ticker Berjalan -->
+    <div class="app-header-ticker">
+        <div class="app-header-ticker-track" id="ticker-track"></div>
+    </div>
+    <!-- Kanan: Fullscreen + Exit -->
+    <div class="app-header-controls">
+        <button class="header-btn" id="btn-fullscreen" title="Fullscreen / Exit Fullscreen">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M3 7V3h4M21 7V3h-4M3 17v4h4M21 17v4h-4"/>
+            </svg>
+        </button>
+        <button class="header-btn header-btn-exit" id="btn-exit-app" title="Keluar Aplikasi">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+        </button>
+    </div>
+</div>
+
 <style>
 /* === HACKER BOOT SCREEN === */
 #boot-overlay {
@@ -439,6 +587,134 @@ button:hover { background: #008ccb; }
         Module.ccall('wasm_send_key', null, ['number', 'number'], [e.keyCode, 0]);
         if (e.keyCode === 17) Module.ccall('wasm_send_key', null, ['number', 'number'], [17, 0]); 
     });
+
+    // ====================================================================
+    // 📊 APP HEADER BAR — Fullscreen + Exit + Ticker Berjalan
+    // ====================================================================
+
+    // ── Tombol Fullscreen ──
+    document.getElementById('btn-fullscreen').addEventListener('click', function() {
+        if (!document.fullscreenElement) {
+            document.documentElement.requestFullscreen().catch(function(e) {
+                console.warn('[HEADER] Fullscreen failed:', e);
+            });
+        } else {
+            document.exitFullscreen();
+        }
+    });
+
+    // ── Tombol Exit App ──
+    document.getElementById('btn-exit-app').addEventListener('click', function() {
+        if (confirm('Keluar dari aplikasi?')) {
+            if (window.logoutFirebase) {
+                window.logoutFirebase();
+            } else {
+                window.location.href = 'index.html';
+            }
+        }
+    });
+
+    // ── Ticker Data (default — akan di-update real-time dari websocket) ──
+    // Symbol yang ditampilkan di ticker (urutan)
+    var tickerSymbols = ['XAUUSD', 'BTCUSDT', 'ETHUSDT', 'EURUSD', 'GBPUSD', 'XAGUSD', 'WTIUSD', 'SOLUSDT'];
+    // Default value (akan di-update dari window.g_tickerPrices)
+    var tickerData = {};
+    tickerSymbols.forEach(function(s) {
+        tickerData[s] = { sym: s, price: '---', change: '+0.00%', up: true };
+    });
+
+    function formatPrice(sym, price) {
+        if (price === null || price === undefined || isNaN(price)) return '---';
+        // Format berdasarkan jenis symbol
+        if (sym === 'XAUUSD' || sym === 'XAGUSD') return price.toFixed(2);
+        if (sym === 'WTIUSD') return price.toFixed(2);
+        if (sym === 'EURUSD' || sym === 'GBPUSD') return price.toFixed(4);
+        if (sym.includes('USDT') || sym.includes('USD')) {
+            // Crypto: format ribuan
+            if (price > 1000) return price.toLocaleString('en-US', { maximumFractionDigits: 0 });
+            return price.toFixed(2);
+        }
+        return price.toString();
+    }
+
+    function renderTicker() {
+        var track = document.getElementById('ticker-track');
+        if (!track) return;
+        var items = tickerSymbols.map(function(sym) {
+            var d = tickerData[sym] || { sym: sym, price: '---', change: '+0.00%', up: true };
+            return '<span class="ticker-item">' +
+                '<span class="ticker-symbol">' + d.sym + '</span>' +
+                '<span class="ticker-price">' + d.price + '</span>' +
+                '<span class="' + (d.up ? 'ticker-up' : 'ticker-down') + '">' + d.change + '</span>' +
+                '</span><span class="ticker-sep">|</span>';
+        }).join('');
+        track.innerHTML = items;
+    }
+
+    // 🔥 Update ticker dari window.g_tickerPrices (diisi oleh websocket.js sendTickToWasm)
+    function updateTickerFromWebsocket() {
+        if (!window.g_tickerPrices) return;
+        var changed = false;
+        for (var i = 0; i < tickerSymbols.length; i++) {
+            var sym = tickerSymbols[i];
+            var data = window.g_tickerPrices[sym];
+            if (data && data.price) {
+                var prevPrice = data.prevPrice || data.price;
+                var changePercent = 0;
+                if (prevPrice > 0) {
+                    changePercent = ((data.price - prevPrice) / prevPrice) * 100;
+                }
+                var newPrice = formatPrice(sym, data.price);
+                if (tickerData[sym].price !== newPrice) {
+                    tickerData[sym].price = newPrice;
+                    tickerData[sym].change = (changePercent >= 0 ? '+' : '') + changePercent.toFixed(2) + '%';
+                    tickerData[sym].up = changePercent >= 0;
+                    changed = true;
+                }
+            }
+        }
+        if (changed) renderTicker();
+    }
+
+    // Polling update setiap 500ms (cukup cepat untuk ticker, tidak berat)
+    setInterval(updateTickerFromWebsocket, 500);
+
+    // Hook manual (kalau websocket mau push langsung)
+    window.updateTickerPrice = function(symbol, price, changePercent) {
+        if (!tickerData[symbol]) return;
+        tickerData[symbol].price = formatPrice(symbol, price);
+        tickerData[symbol].change = (changePercent >= 0 ? '+' : '') + changePercent.toFixed(2) + '%';
+        tickerData[symbol].up = changePercent >= 0;
+        renderTicker();
+    };
+
+    // ── Auto-detect logo.png di folder assets ──
+    // Kalau ada, pakai PNG. Kalau tidak, biarkan SVG candlestick fallback.
+    function checkLogoImage() {
+        var logoEl = document.getElementById('app-logo');
+        if (!logoEl) return;
+        var testImg = new Image();
+        testImg.onload = function() {
+            // logo.png ada → ganti SVG dengan <img>
+            logoEl.innerHTML = '<img src="assets/logo.png" alt="Logo">';
+        };
+        testImg.onerror = function() {
+            // logo.png tidak ada → biarkan SVG candlestick (sudah default)
+            console.log('[HEADER] assets/logo.png not found, using SVG candlestick fallback');
+        };
+        testImg.src = 'assets/logo.png';
+    }
+
+    // Init ticker + logo check
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function() {
+            renderTicker();
+            checkLogoImage();
+        });
+    } else {
+        renderTicker();
+        checkLogoImage();
+    }
 
 </script>
 

@@ -913,32 +913,44 @@ function syncPosition() {
         return;
     }
 
-    const screenW = window.innerWidth;
-    const screenH = window.innerHeight;
+    // 🔥 FIX: Baca canvas rect (bukan window) supaya JS overlay ngikutin offset canvas.
+    // Kalau app.html offset canvas top: 36px (header bar), canvas rect.top = 36.
+    // C++ kirim normalized 0-1 relatif terhadap DisplaySize (= canvas size).
+    // JS konversi ke pixel pakai canvas size, lalu tambah canvas offset (left/top).
+    const canvasEl = document.getElementById('canvas');
+    const rect = canvasEl ? canvasEl.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+    const screenW = rect.width;
+    const screenH = rect.height;
+    const offsetX = rect.left;
+    const offsetY = rect.top;
 
-    // ── Sync 3 frame: tools, panel, replay ──
+    // ── Sync 3 frame: tools, panel, nav ──
     syncOneFrame(drawingBar, 'wasm_jt_get_tools_visible',
                  'wasm_jt_get_tools_x', 'wasm_jt_get_tools_y',
                  'wasm_jt_get_tools_w', 'wasm_jt_get_tools_h',
-                 screenW, screenH);
+                 screenW, screenH, offsetX, offsetY);
 
     syncOneFrame(rightBar, 'wasm_jt_get_panel_visible',
                  'wasm_jt_get_panel_x', 'wasm_jt_get_panel_y',
                  'wasm_jt_get_panel_w', 'wasm_jt_get_panel_h',
-                 screenW, screenH);
+                 screenW, screenH, offsetX, offsetY);
 
     // 🔥 Sync nav frame (Navigasi) — sekarang termasuk tombol Replay
     syncOneFrame(navBar, 'wasm_jt_get_nav_visible',
                  'wasm_jt_get_nav_x', 'wasm_jt_get_nav_y',
                  'wasm_jt_get_nav_w', 'wasm_jt_get_nav_h',
-                 screenW, screenH);
+                 screenW, screenH, offsetX, offsetY);
 
     requestAnimationFrame(syncPosition);
 }
 
 // Helper: sync 1 frame
-function syncOneFrame(el, visFn, xFn, yFn, wFn, hFn, screenW, screenH) {
+function syncOneFrame(el, visFn, xFn, yFn, wFn, hFn, screenW, screenH, offsetX, offsetY) {
     if (!el) return;
+
+    // 🔥 Default offset = 0 (kalau tidak di-pass, fallback ke behavior lama)
+    if (offsetX === undefined) offsetX = 0;
+    if (offsetY === undefined) offsetY = 0;
 
     const visible = safeCcall(visFn, 'number', [], []);
     if (!visible) {
@@ -958,18 +970,17 @@ function syncOneFrame(el, visFn, xFn, yFn, wFn, hFn, screenW, screenH) {
         return;
     }
 
-    // Normalized (0-1) → pixel
-    let left   = cx * screenW;
-    let top    = cy * screenH;
+    // Normalized (0-1) → pixel, LALU tambah canvas offset (header bar 36px, dll)
+    let left   = cx * screenW + offsetX;
+    let top    = cy * screenH + offsetY;
     let width  = cw * screenW;
     let height = ch * screenH;
 
     // 🛡️ SAFEGUARD: clamp posisi overlay biar tidak keluar viewport
-    // (kadang ImGui docked frame report rect yang sedikit melebihi viewport)
-    if (left < 0) { width += left; left = 0; }
-    if (top  < 0) { height += top; top = 0; }
-    if (left + width  > screenW) width  = screenW - left;
-    if (top  + height > screenH) height = screenH - top;
+    if (left < offsetX) { width += (left - offsetX); left = offsetX; }
+    if (top  < offsetY) { height += (top - offsetY); top = offsetY; }
+    if (left + width  > offsetX + screenW) width  = offsetX + screenW - left;
+    if (top  + height > offsetY + screenH) height = offsetY + screenH - top;
     if (width <= 0 || height <= 0) {
         el.classList.remove('jt-visible');
         return;

@@ -83,6 +83,15 @@ function sendTickToWasm(symbol, price, vol, time) {
     Module.ccall('wasm_push_tick', null,
         ['string', 'number', 'number', 'number'],
         [symbol,   price,    vol,      time]);
+
+    // 🔥 TAHAP 2: Simpan harga terbaru ke global registry untuk ticker bar
+    if (!window.g_tickerPrices) window.g_tickerPrices = {};
+    const prev = window.g_tickerPrices[symbol];
+    window.g_tickerPrices[symbol] = {
+        price: price,
+        prevPrice: prev ? prev.price : price,   // untuk hitung change
+        time: Date.now()
+    };
 }
 
 function notifyWASM_candle(o, h, l, c, t, v) {
