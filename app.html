@@ -471,13 +471,18 @@ button:hover { background: #008ccb; }
             
             lastTouchX = touch.clientX; lastTouchY = touch.clientY; lastPinchDist = null;
 
-            // 🔥 LANGKAH 1: Teleport Kursor Mouse Virtual ke posisi jari DULUAN
-            Module.ccall('wasm_mouse_move', null, ['number', 'number'], [x, y]);
-            // 🔥 LANGKAH 2: Baru tekan tombol "Klik Kiri" (1 = Down)
-            Module.ccall('wasm_mouse_click', null, ['number', 'number'], [0, 1]); 
-            
-            // Opsional: Kirim raw touch start buat logic lain
+            // 🔥 FIX PAN LOMPAT (versi 3 — THE REAL FIX):
+            // Masalah: wasm_mouse_move teleport mouse → ImGui NewFrame hitung MouseDelta besar
+            //          → ImPlot pan X lompat di frame pertama.
+            //
+            // Solusi: 
+            //   1. Kirim wasm_notify_touch_start DULU → set g_touchJustStarted = true
+            //   2. Kirim wasm_mouse_move → C++ cek g_touchJustStarted, set MousePosPrev = MousePos
+            //      → NewFrame hitung MouseDelta = 0 → ImPlot tidak pan
+            //   3. Kirim wasm_mouse_click → mouse down
             Module.ccall('wasm_notify_touch_start', null, ['number', 'number'], [x, y]);
+            Module.ccall('wasm_mouse_move', null, ['number', 'number'], [x, y]);
+            Module.ccall('wasm_mouse_click', null, ['number', 'number'], [0, 1]); 
         } else if (e.touches.length === 2) {
             // DUAL TOUCH (Zoom / Pan - Lepas Klik Mouse)
             Module.ccall('wasm_mouse_click', null, ['number', 'number'], [0, 0]);
@@ -492,11 +497,23 @@ button:hover { background: #008ccb; }
         var rect = canvas.getBoundingClientRect(); var s = getScale();
 
         if (e.touches.length === 2 && lastPinchDist !== null) {
-            // --- ZOOM LOGIC ---
+            // --- PINCH ZOOM → KONVERSI KE MOUSE WHEEL (supaya ImPlot native zoom jalan) ---
             var currentDist = getPinchDist(e.touches[0], e.touches[1]);
-            var deltaZoom = (currentDist - lastPinchDist) * s.x;
-            Module.ccall('wasm_zoom_chart', null, ['number'], [deltaZoom]);
-            lastPinchDist = currentDist; 
+            var deltaDist = currentDist - lastPinchDist; // positif = zoom in, negatif = zoom out
+            lastPinchDist = currentDist;
+            
+            // Kirim sebagai mouse wheel ke WASM
+            // ImPlot native baca io.MouseWheel untuk zoom
+            // Sensitivitas: 0.02 per pixel delta (bisa di-tune)
+            if (Math.abs(deltaDist) > 1) {
+                var wheelDelta = deltaDist * 0.02;
+                // Set mouse position ke tengah pinch (titik fokus zoom)
+                var centerX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+                var centerY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+                Module.ccall('wasm_mouse_move', null, ['number', 'number'], [centerX * s.x, centerY * s.y]);
+                // Kirim wheel event ke WASM
+                Module.ccall('wasm_mouse_wheel', null, ['number'], [wheelDelta]);
+            }
         } 
         else if (e.touches.length === 1 && lastTouchX !== null) {
             // --- DRAG / DRAW LOGIC ---
