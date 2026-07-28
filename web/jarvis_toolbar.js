@@ -296,6 +296,16 @@ const NAV_TOOLS = [
         tooltip: 'Mode Replay',
         isWide: true,
         isReplay: true           // 🔥 flag: tombol ini handle replay start/stop
+    },
+    {
+        id: 'nav-alert',
+        segIdx: -3,              // 🔥 special: buka Alert Manager panel
+        icon: null,
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
+        label: 'Alert',
+        tooltip: 'Atur Notifikasi Alert',
+        isWide: true,
+        isAlert: true            // 🔥 flag: tombol ini buka Alert Manager
     }
 ];
 
@@ -1182,6 +1192,14 @@ function bindNavToolbar() {
             e.preventDefault();
             const segIdx = parseInt(btn.dataset.segIdx, 10);
             if (isNaN(segIdx)) return;
+
+            // 🔥 SPECIAL: tombol Alert (segIdx = -3) → buka/tutup Alert Manager panel
+            if (segIdx === -3) {
+                const alertVisible = safeCcall('wasm_toggle_alert_panel', 'number', [], []);
+                btn.dataset.active = (alertVisible === 1) ? 'true' : 'false';
+                flashButton(btn);
+                return;
+            }
 
             // 🔥 SPECIAL: tombol Replay (segIdx = -1) → handle start/stop replay
             if (segIdx === -1) {

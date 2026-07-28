@@ -409,6 +409,7 @@ button:hover { background: #008ccb; }
     var canvas = document.getElementById("canvas");
     var isTouching = false; 
     var lastTouchX = null, lastTouchY = null, lastPinchDist = null;
+    var touchHoldTimer = null; // 🔥 Timer untuk touch hold = klik kanan
 
     function getScale() {
         var rect = canvas.getBoundingClientRect();
@@ -472,17 +473,24 @@ button:hover { background: #008ccb; }
             lastTouchX = touch.clientX; lastTouchY = touch.clientY; lastPinchDist = null;
 
             // 🔥 FIX PAN LOMPAT (versi 3 — THE REAL FIX):
-            // Masalah: wasm_mouse_move teleport mouse → ImGui NewFrame hitung MouseDelta besar
-            //          → ImPlot pan X lompat di frame pertama.
-            //
-            // Solusi: 
-            //   1. Kirim wasm_notify_touch_start DULU → set g_touchJustStarted = true
-            //   2. Kirim wasm_mouse_move → C++ cek g_touchJustStarted, set MousePosPrev = MousePos
-            //      → NewFrame hitung MouseDelta = 0 → ImPlot tidak pan
-            //   3. Kirim wasm_mouse_click → mouse down
             Module.ccall('wasm_notify_touch_start', null, ['number', 'number'], [x, y]);
             Module.ccall('wasm_mouse_move', null, ['number', 'number'], [x, y]);
             Module.ccall('wasm_mouse_click', null, ['number', 'number'], [0, 1]); 
+
+            // 🔥 TOUCH HOLD = KLIK KANAN (500ms tanpa gerak)
+            // Set timer, kalau user tahan 500ms tanpa gerak → simulasi klik kanan
+            if (touchHoldTimer) clearTimeout(touchHoldTimer);
+            touchHoldTimer = setTimeout(function() {
+                // Cek apakah user masih di posisi yang sama (tidak drag)
+                if (lastTouchX !== null && Math.abs(lastTouchX - touch.clientX) < 10) {
+                    // Simulasi klik kanan: kirim mouse down button=2
+                    Module.ccall('wasm_mouse_click', null, ['number', 'number'], [2, 1]);
+                    setTimeout(function() {
+                        Module.ccall('wasm_mouse_click', null, ['number', 'number'], [2, 0]);
+                    }, 50);
+                }
+            }, 500);
+
         } else if (e.touches.length === 2) {
             // DUAL TOUCH (Zoom / Pan - Lepas Klik Mouse)
             Module.ccall('wasm_mouse_click', null, ['number', 'number'], [0, 0]);
@@ -494,6 +502,10 @@ button:hover { background: #008ccb; }
     canvas.addEventListener('touchmove', function(e) {
         if (e.cancelable) e.preventDefault(); 
         if (!wasmInputReady()) return;  // 🛡️ skip kalau WASM belum siap
+        
+        // 🔥 Cancel touch hold timer (user mulai drag, bukan klik kanan)
+        if (touchHoldTimer) { clearTimeout(touchHoldTimer); touchHoldTimer = null; }
+        
         var rect = canvas.getBoundingClientRect(); var s = getScale();
 
         if (e.touches.length === 2 && lastPinchDist !== null) {
