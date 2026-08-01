@@ -409,7 +409,6 @@ button:hover { background: #008ccb; }
     var canvas = document.getElementById("canvas");
     var isTouching = false; 
     var lastTouchX = null, lastTouchY = null, lastPinchDist = null;
-    var touchHoldTimer = null; // 🔥 Timer untuk touch hold = klik kanan
 
     function getScale() {
         var rect = canvas.getBoundingClientRect();
@@ -473,24 +472,17 @@ button:hover { background: #008ccb; }
             lastTouchX = touch.clientX; lastTouchY = touch.clientY; lastPinchDist = null;
 
             // 🔥 FIX PAN LOMPAT (versi 3 — THE REAL FIX):
+            // Masalah: wasm_mouse_move teleport mouse → ImGui NewFrame hitung MouseDelta besar
+            //          → ImPlot pan X lompat di frame pertama.
+            //
+            // Solusi: 
+            //   1. Kirim wasm_notify_touch_start DULU → set g_touchJustStarted = true
+            //   2. Kirim wasm_mouse_move → C++ cek g_touchJustStarted, set MousePosPrev = MousePos
+            //      → NewFrame hitung MouseDelta = 0 → ImPlot tidak pan
+            //   3. Kirim wasm_mouse_click → mouse down
             Module.ccall('wasm_notify_touch_start', null, ['number', 'number'], [x, y]);
             Module.ccall('wasm_mouse_move', null, ['number', 'number'], [x, y]);
             Module.ccall('wasm_mouse_click', null, ['number', 'number'], [0, 1]); 
-
-            // 🔥 TOUCH HOLD = KLIK KANAN (500ms tanpa gerak)
-            // Set timer, kalau user tahan 500ms tanpa gerak → simulasi klik kanan
-            if (touchHoldTimer) clearTimeout(touchHoldTimer);
-            touchHoldTimer = setTimeout(function() {
-                // Cek apakah user masih di posisi yang sama (tidak drag)
-                if (lastTouchX !== null && Math.abs(lastTouchX - touch.clientX) < 10) {
-                    // Simulasi klik kanan: kirim mouse down button=2
-                    Module.ccall('wasm_mouse_click', null, ['number', 'number'], [2, 1]);
-                    setTimeout(function() {
-                        Module.ccall('wasm_mouse_click', null, ['number', 'number'], [2, 0]);
-                    }, 50);
-                }
-            }, 500);
-
         } else if (e.touches.length === 2) {
             // DUAL TOUCH (Zoom / Pan - Lepas Klik Mouse)
             Module.ccall('wasm_mouse_click', null, ['number', 'number'], [0, 0]);
@@ -502,10 +494,6 @@ button:hover { background: #008ccb; }
     canvas.addEventListener('touchmove', function(e) {
         if (e.cancelable) e.preventDefault(); 
         if (!wasmInputReady()) return;  // 🛡️ skip kalau WASM belum siap
-        
-        // 🔥 Cancel touch hold timer (user mulai drag, bukan klik kanan)
-        if (touchHoldTimer) { clearTimeout(touchHoldTimer); touchHoldTimer = null; }
-        
         var rect = canvas.getBoundingClientRect(); var s = getScale();
 
         if (e.touches.length === 2 && lastPinchDist !== null) {
@@ -745,6 +733,27 @@ button:hover { background: #008ccb; }
         checkLogoImage();
     }
 
+    // ====================================================================
+    // 🔔 ALERT NOTIFICATION — dipanggil dari C++ AlertManager via emscripten_run_script
+    // ====================================================================
+    window.showAlertNotif = function(symbol, message) {
+        // Browser Notification API
+        if ('Notification' in window) {
+            if (Notification.permission === 'granted') {
+                new Notification('🔔 ' + symbol, { body: message });
+            } else if (Notification.permission !== 'denied') {
+                Notification.requestPermission().then(function(p) {
+                    if (p === 'granted') {
+                        new Notification('🔔 ' + symbol, { body: message });
+                    }
+                });
+            }
+        }
+        // Console log
+        console.log('[ALERT] 🔔 ' + symbol + ': ' + message);
+        // TODO: tambah sound beep + visual toast overlay
+    };
+
 </script>
 
 <script src="web/config.js"></script>
@@ -756,8 +765,25 @@ button:hover { background: #008ccb; }
 <script src="dist/index.js"></script>
 <script src="web/jarvis_chat.js"></script>
 
-<!-- 🤖 JARVIS JS TOOLBAR OVERLAY — loads setelah WASM siap -->
-<script src="web/jarvis_toolbar.js"></script>
+<!-- 🤖 JARVIS JS TOOLBAR OVERLAY — MODULAR (v3) — loads setelah WASM siap -->
+<!-- Load order PENTING: config → state → bridge → utils → tools → ui → sync → index -->
+<!-- ?v=3 cache-busting: paksa browser load file baru, skip cache lama -->
+<script src="web/jarvis_toolbar/config.js?v=3"></script>
+<script src="web/jarvis_toolbar/state.js?v=3"></script>
+<script src="web/jarvis_toolbar/wasm-bridge.js?v=3"></script>
+<script src="web/jarvis_toolbar/utils.js?v=3"></script>
+<script src="web/jarvis_toolbar/tools/drawing-tools.js?v=3"></script>
+<script src="web/jarvis_toolbar/tools/right-bar-tools.js?v=3"></script>
+<script src="web/jarvis_toolbar/tools/nav-tools.js?v=3"></script>
+<script src="web/jarvis_toolbar/tools/replay-tools.js?v=3"></script>
+<script src="web/jarvis_toolbar/ui/html-builder.js?v=3"></script>
+<script src="web/jarvis_toolbar/ui/css-builder.js?v=3"></script>
+<script src="web/jarvis_toolbar/ui/tooltip.js?v=3"></script>
+<script src="web/jarvis_toolbar/ui/context-menu.js?v=3"></script>
+<script src="web/jarvis_toolbar/ui/scrollbar.js?v=3"></script>
+<script src="web/jarvis_toolbar/sync/position-sync.js?v=3"></script>
+<script src="web/jarvis_toolbar/sync/state-sync.js?v=3"></script>
+<script src="web/jarvis_toolbar/index.js?v=3"></script>
 
 <script src="web/my_dev_logic.js"></script>
 <script src="web/ob_tutorial.js"></script>
