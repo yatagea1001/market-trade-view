@@ -123,19 +123,20 @@ JT.StateSync = {
     /**
      * Sync Alert badge count.
      * ──────────────────────────────────────────────
-     * Alert badge di-manage PURE JS (bukan dari WASM).
-     * Code lain bisa panggil:
-     *   JT.NavTools.incrementAlertBadge(1)  — tambah notif
-     *   JT.NavTools.setAlertBadge(5)        — set count langsung
-     *   JT.NavTools.clearAlertBadge()       — reset ke 0
+     * Badge di-trigger langsung dari C++ via showAlertNotif()
+     * (di app.html), yang memanggil JT.NavTools.pushAlert().
      *
-     * Kenapa pure JS? Karena wasm_get_alert_count belum di-export
-     * dari C++ side, dan badge ini cukup di-handle di JS aja.
+     * Tidak perlu polling WASM — showAlertNotif() sudah real-time
+     * dan lebih reliable karena dipanggil langsung saat trigger.
+     *
+     * WASM exports yang tersedia (kalau nanti perlu):
+     *   wasm_alert_get_count_triggered()
+     *   wasm_alert_get_count_price()
+     *   wasm_alert_get_count_indicator()
      * ──────────────────────────────────────────────
      */
     syncAlertBadge() {
-        // No-op: badge state sudah di-manage oleh JT.NavTools.setAlertBadge()
-        // yang dipanggil dari kode lain (WebSocket, Jarvis, dll).
-        // Tidak perlu polling dari WASM.
+        // No-op: badge di-trigger langsung oleh showAlertNotif() di app.html
+        // yang memanggil JT.NavTools.pushAlert() → incrementAlertBadge()
     }
 };

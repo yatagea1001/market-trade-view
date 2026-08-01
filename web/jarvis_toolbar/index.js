@@ -70,6 +70,16 @@ JT.App = {
         JT.PositionSync.start();
         JT.StateSync.start();
 
+        // 7. Proses antrian alert yang datang sebelum overlay ready
+        //    (C++ bisa trigger showAlertNotif() sebelum init() selesai)
+        if (window._jtAlertQueue && window._jtAlertQueue.length > 0) {
+            console.log('[JT] Processing', window._jtAlertQueue.length, 'queued alerts');
+            window._jtAlertQueue.forEach(function(alertData) {
+                JT.NavTools.pushAlert(alertData);
+            });
+            window._jtAlertQueue = [];
+        }
+
         console.log('[JT] Toolbar overlay initialized (modular v3)');
     },
 
@@ -138,9 +148,11 @@ window.JarvisToolbar = {
     openPanel:  () => JT.WasmBridge.toggle('wasm_jt_toggle_panel'),
     openReplay: () => JT.WasmBridge.toggle('wasm_jt_toggle_replay'),
     openNav:    () => JT.WasmBridge.toggle('wasm_jt_toggle_nav'),
-    // Alert badge
+    // Alert badge (WA-style)
     setAlertBadge:   (count) => JT.NavTools.setAlertBadge(count),
     clearAlertBadge: () => JT.NavTools.clearAlertBadge(),
+    pushAlert:       (data) => JT.NavTools.pushAlert(data),
+    getAlerts:       (opts) => JT.NavTools.getAlerts(opts),
     // Force re-sync position
     resync:  () => JT.PositionSync.syncPosition(),
     // Destroy & re-init
@@ -148,4 +160,36 @@ window.JarvisToolbar = {
     reinit:  () => { JT.App.destroy(); JT.App.init(); },
     // Debug: akses internal state
     _internal: () => JT.State
+};
+
+// ── DEMO: Test Alert Badge dari Console ──────────────────────
+// Ketik di browser console:
+//   demoAlert()         → simulasi 3 notif masuk berturut-turut
+//   demoAlert(1)        → 1 notif
+//   demoAlert(10)       → 10 notif sekaligus
+//   demoAlert('clear')  → hapus semua badge
+window.demoAlert = function(count) {
+    if (count === 'clear') {
+        JT.NavTools.clearAlertBadge();
+        console.log('[demo] Badge cleared');
+        return;
+    }
+    const n = typeof count === 'number' ? count : 3;
+    const alerts = [
+        { title: 'Price Alert',   message: 'XAUUSD > $2,400',    type: 'price' },
+        { title: 'Order Filled',   message: 'Buy 0.1 LOT EURUSD', type: 'trade' },
+        { title: 'Margin Warning', message: 'Margin Level < 150%', type: 'risk' },
+        { title: 'News Alert',     message: 'NFP Release in 5min', type: 'news' },
+        { title: 'SL Triggered',   message: 'Sell 0.05 GBPUSD SL hit', type: 'trade' }
+    ];
+    let i = 0;
+    function pushNext() {
+        if (i >= n) return;
+        const alert = alerts[i % alerts.length];
+        JT.NavTools.pushAlert(alert);
+        console.log(`[demo] Push #${i+1}:`, alert.title, '-', alert.message);
+        i++;
+        setTimeout(pushNext, 600);  // 600ms jeda antar notif (kayak WA)
+    }
+    pushNext();
 };

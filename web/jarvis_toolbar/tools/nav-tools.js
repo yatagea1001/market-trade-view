@@ -98,8 +98,9 @@ JT.NavTools = {
     },
 
     // ── Alert Badge State ──
-    alertBadgeCount: 0,       // Jumlah notif (0 = sembunyikan badge)
+    alertBadgeCount: 0,       // Jumlah notif unread (0 = sembunyikan badge)
     alertBadgeVisible: false,  // Badge kelihatan?
+    _lastSeenTriggeredCount: null,  // Baseline triggered count dari C++ (WA-style: track unread)
 
     // ── Legacy TOOLS getter (backward compat) ──
     get TOOLS() {
@@ -176,9 +177,15 @@ JT.NavTools = {
         btn.dataset.active = (alertVisible === 1) ? 'true' : 'false';
         JT.Utils.flashButton(btn);
 
-        // Saat alert panel dibuka → reset badge count
+        // Saat alert panel dibuka → reset badge (kayak WA: klik chat → read semua)
         if (alertVisible === 1) {
-            this.setAlertBadge(0);
+            this.clearAlertBadge();
+            // Update baseline ke triggered count saat ini
+            // Supaya notif baru SETELAH ini terhitung lagi
+            const currentTriggered = JT.WasmBridge.getNumber('wasm_alert_get_count_triggered');
+            if (currentTriggered !== null) {
+                this._lastSeenTriggeredCount = currentTriggered;
+            }
         }
     },
 
@@ -203,17 +210,25 @@ JT.NavTools = {
         JT.State.alertBadgeVisible = count > 0;
 
         const overlay = JT.State.overlay;
-        if (!overlay) return;
+        if (!overlay) {
+            console.log('[JT.NavTools] setAlertBadge(' + count + ') — overlay NOT ready yet');
+            return;
+        }
 
         const badge = overlay.querySelector('#jt-alert-badge');
-        if (!badge) return;
+        if (!badge) {
+            console.log('[JT.NavTools] setAlertBadge(' + count + ') — badge element NOT found in DOM');
+            return;
+        }
 
         if (count > 0) {
             badge.textContent = count > 99 ? '99+' : count;
             badge.classList.add('jt-badge-visible');
+            console.log('[JT.NavTools] setAlertBadge(' + count + ') — badge VISIBLE ✅');
         } else {
             badge.classList.remove('jt-badge-visible');
             badge.classList.remove('jt-badge-pulse');
+            console.log('[JT.NavTools] setAlertBadge(0) — badge HIDDEN');
         }
     },
 
@@ -236,13 +251,12 @@ JT.NavTools = {
 
     /**
      * Push alert notification — API publik utama.
-     * Dipanggil dari WebSocket, Jarvis, atau code lain.
+     * Dipanggil dari showAlertNotif() di app.html, WebSocket, Jarvis, dll.
      * @param {Object} alertData — { title, message, type?, priority? }
-     * @example
-     *   JT.NavTools.pushAlert({ title: 'Price Alert', message: 'XAUUSD > 2400' })
-     *   JT.NavTools.pushAlert({ title: 'Order Filled', message: 'Buy 0.1 LOT EURUSD', type: 'trade' })
      */
     pushAlert(alertData) {
+        console.log('[JT.NavTools] pushAlert:', alertData.title, '-', alertData.message);
+
         // Increment badge
         this.incrementAlertBadge(1);
 

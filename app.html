@@ -751,7 +751,22 @@ button:hover { background: #008ccb; }
         }
         // Console log
         console.log('[ALERT] 🔔 ' + symbol + ': ' + message);
-        // TODO: tambah sound beep + visual toast overlay
+
+        // 🔴 WA-STYLE BADGE: increment badge di tombol Alert
+        // Setiap kali C++ trigger alert → badge merah muncul + bounce + pulse
+        if (window.JT && JT.NavTools) {
+            console.log('[ALERT-BADGE] ✅ JT.NavTools found, pushing alert...');
+            JT.NavTools.pushAlert({
+                title: 'Price Alert',
+                message: symbol + ': ' + message,
+                type: 'price'
+            });
+        } else {
+            // JT belum load — simpan ke antrian, nanti diproses saat init
+            console.log('[ALERT-BADGE] ⚠️ JT.NavTools NOT ready yet, queuing alert...');
+            window._jtAlertQueue = window._jtAlertQueue || [];
+            window._jtAlertQueue.push({ title: 'Price Alert', message: symbol + ': ' + message, type: 'price' });
+        }
     };
 
 </script>
@@ -767,23 +782,23 @@ button:hover { background: #008ccb; }
 
 <!-- 🤖 JARVIS JS TOOLBAR OVERLAY — MODULAR (v3) — loads setelah WASM siap -->
 <!-- Load order PENTING: config → state → bridge → utils → tools → ui → sync → index -->
-<!-- ?v=3 cache-busting: paksa browser load file baru, skip cache lama -->
-<script src="web/jarvis_toolbar/config.js?v=3"></script>
-<script src="web/jarvis_toolbar/state.js?v=3"></script>
-<script src="web/jarvis_toolbar/wasm-bridge.js?v=3"></script>
-<script src="web/jarvis_toolbar/utils.js?v=3"></script>
-<script src="web/jarvis_toolbar/tools/drawing-tools.js?v=3"></script>
-<script src="web/jarvis_toolbar/tools/right-bar-tools.js?v=3"></script>
-<script src="web/jarvis_toolbar/tools/nav-tools.js?v=3"></script>
-<script src="web/jarvis_toolbar/tools/replay-tools.js?v=3"></script>
-<script src="web/jarvis_toolbar/ui/html-builder.js?v=3"></script>
-<script src="web/jarvis_toolbar/ui/css-builder.js?v=3"></script>
-<script src="web/jarvis_toolbar/ui/tooltip.js?v=3"></script>
-<script src="web/jarvis_toolbar/ui/context-menu.js?v=3"></script>
-<script src="web/jarvis_toolbar/ui/scrollbar.js?v=3"></script>
-<script src="web/jarvis_toolbar/sync/position-sync.js?v=3"></script>
-<script src="web/jarvis_toolbar/sync/state-sync.js?v=3"></script>
-<script src="web/jarvis_toolbar/index.js?v=3"></script>
+<!-- ?v=7 cache-busting: debug logging + alert queue -->
+<script src="web/jarvis_toolbar/config.js?v=7"></script>
+<script src="web/jarvis_toolbar/state.js?v=7"></script>
+<script src="web/jarvis_toolbar/wasm-bridge.js?v=7"></script>
+<script src="web/jarvis_toolbar/utils.js?v=7"></script>
+<script src="web/jarvis_toolbar/tools/drawing-tools.js?v=7"></script>
+<script src="web/jarvis_toolbar/tools/right-bar-tools.js?v=7"></script>
+<script src="web/jarvis_toolbar/tools/nav-tools.js?v=7"></script>
+<script src="web/jarvis_toolbar/tools/replay-tools.js?v=7"></script>
+<script src="web/jarvis_toolbar/ui/html-builder.js?v=7"></script>
+<script src="web/jarvis_toolbar/ui/css-builder.js?v=7"></script>
+<script src="web/jarvis_toolbar/ui/tooltip.js?v=7"></script>
+<script src="web/jarvis_toolbar/ui/context-menu.js?v=7"></script>
+<script src="web/jarvis_toolbar/ui/scrollbar.js?v=7"></script>
+<script src="web/jarvis_toolbar/sync/position-sync.js?v=7"></script>
+<script src="web/jarvis_toolbar/sync/state-sync.js?v=7"></script>
+<script src="web/jarvis_toolbar/index.js?v=7"></script>
 
 <script src="web/my_dev_logic.js"></script>
 <script src="web/ob_tutorial.js"></script>

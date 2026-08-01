@@ -109,7 +109,8 @@ JT.HtmlBuilder = {
 
     /**
      * Build tombol Alert PINNED (selalu di kanan, + badge notif).
-     * Badge merah (seperti WhatsApp) muncul kalau ada notif.
+     * Hanya icon bell — tanpa tulisan, compact seperti WA.
+     * Badge merah muncul kalau ada notif.
      */
     buildAlertPinnedButton(tool) {
         const iconHTML = tool.icon
@@ -117,9 +118,8 @@ JT.HtmlBuilder = {
             : `<span class="jt-icon-svg">${tool.svg}</span>`;
 
         return `
-    <button class="jt-btn jt-nav-btn jt-alert-btn" data-tool-id="${tool.id}" data-seg-idx="${tool.segIdx}" data-tooltip="${tool.tooltip}" data-active="false">
+    <button class="jt-btn jt-alert-btn" data-tool-id="${tool.id}" data-seg-idx="${tool.segIdx}" data-tooltip="${tool.tooltip}" data-active="false">
         ${iconHTML}
-        <span class="jt-nav-label" data-nav-label="${tool.id}">${tool.label}</span>
         <!-- Notification Badge (seperti WA) -->
         <span id="jt-alert-badge" class="jt-badge">0</span>
     </button>

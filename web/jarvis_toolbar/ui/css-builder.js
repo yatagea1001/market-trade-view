@@ -299,10 +299,20 @@ JT.CssBuilder = {
         background: rgba(10, 10, 18, 0.3);  /* sedikit bg biar kelihatan beda */
     }
 
-    /* ── Alert Button (pinned) ── */
+    /* ── Alert Button (pinned, icon only — tanpa tulisan) ── */
     .jt-alert-btn {
-        min-width: ${C.NAV_BTN_MIN_WIDTH}px;
-        /* Sedikit lebih compact supaya tidak makan banyak space */
+        width: 36px !important;
+        height: 36px !important;
+        min-width: 36px !important;
+        max-width: 36px !important;
+        padding: 4px !important;
+        border-radius: 8px;
+        position: relative;
+        /* Icon only — compact seperti WA notification bell */
+    }
+    .jt-alert-btn .jt-icon-svg {
+        width: 20px;
+        height: 20px;
     }
     .jt-alert-btn:hover {
         background: rgba(${R}, 0.15);
@@ -318,46 +328,63 @@ JT.CssBuilder = {
        ════════════════════════════════════════════════════════
        - Lingkaran merah kecil di pojok kanan-atas tombol
        - Angka di dalam (1-99, atau "99+")
-       - Animasi bounce saat muncul
+       - Animasi bounce saat muncul (seperti WA)
+       - Pulse glow saat ada notif baru masuk
        - Hilang saat user klik Alert (buka panel) */
     .jt-badge {
         position: absolute;
-        top: -4px;
-        right: -4px;
-        min-width: 16px;
-        height: 16px;
-        padding: 0 4px;
-        border-radius: 8px;
-        background: #ef4444;          /* Red 500 */
+        top: -6px;
+        right: -6px;
+        min-width: 18px;
+        height: 18px;
+        padding: 0 5px;
+        border-radius: 9px;
+        background: #ef4444;          /* Red 500 — sama kayak WA */
         color: white;
-        font-size: 9px;
+        font-size: 10px;
         font-weight: 700;
-        line-height: 16px;
+        line-height: 18px;
         text-align: center;
         pointer-events: none;
         display: none;                /* Default: sembunyi */
         z-index: 20;
-        box-shadow: 0 0 6px rgba(239, 68, 68, 0.6), 0 1px 3px rgba(0,0,0,0.4);
+        box-shadow: 0 0 0 2px rgba(10, 10, 18, 0.8),   /* border gelap di luar lingkaran */
+                    0 0 8px rgba(239, 68, 68, 0.5),     /* red glow */
+                    0 1px 3px rgba(0,0,0,0.5);
         letter-spacing: -0.5px;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        transform: scale(0);          /* Start dari scale 0 untuk animasi */
+        transition: transform 0.2s ease;
     }
+
+    /* Badge VISIBLE — muncul dengan bounce animasi kayak WA */
     .jt-badge.jt-badge-visible {
         display: block;
-        animation: jtBadgeBounce 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+        transform: scale(1);
+        animation: jtBadgePop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
     }
-    @keyframes jtBadgeBounce {
+    @keyframes jtBadgePop {
         0%   { transform: scale(0); }
-        60%  { transform: scale(1.3); }
+        50%  { transform: scale(1.25); }
+        70%  { transform: scale(0.9); }
         100% { transform: scale(1); }
     }
 
-    /* Badge pulse saat ada notif baru (red glow blink) */
-    .jt-badge.jt-badge-pulse {
-        animation: jtBadgePulse 1.5s ease-in-out infinite;
+    /* Badge PULSE — glow berkedip kayak WA pas notif baru masuk
+       Dipasang BERSAMAAN dengan jt-badge-visible.
+       Pakai box-shadow animation (BUKAN transform) supaya gak konflik. */
+    .jt-badge.jt-badge-visible.jt-badge-pulse {
+        animation: jtBadgePop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1),
+                  jtBadgeGlow 1.5s ease-in-out 0.4s infinite;
     }
-    @keyframes jtBadgePulse {
-        0%, 100% { box-shadow: 0 0 6px rgba(239, 68, 68, 0.6), 0 1px 3px rgba(0,0,0,0.4); }
-        50%      { box-shadow: 0 0 14px rgba(239, 68, 68, 0.9), 0 1px 3px rgba(0,0,0,0.4); }
+    @keyframes jtBadgeGlow {
+        0%, 100% { box-shadow: 0 0 0 2px rgba(10, 10, 18, 0.8),
+                              0 0 6px rgba(239, 68, 68, 0.4),
+                              0 1px 3px rgba(0,0,0,0.5); }
+        50%      { box-shadow: 0 0 0 2px rgba(10, 10, 18, 0.8),
+                              0 0 16px rgba(239, 68, 68, 0.9),
+                              0 0 24px rgba(239, 68, 68, 0.3),
+                              0 1px 3px rgba(0,0,0,0.5); }
     }
 
     /* ── Mobile: Alert pinned tetap kelihatan ── */
