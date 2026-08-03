@@ -138,9 +138,11 @@ const PLATFORM = {
         "MANAUSDT": { provider: "hyperliquid", coin: "MANA",  decimals: 5 },
         "AXSUSDT":  { provider: "hyperliquid", coin: "AXS",   decimals: 3 },
         "GALAUSDT": { provider: "hyperliquid", coin: "GALA",  decimals: 5 },
+        "IMXUSDT2": { provider: "hyperliquid", coin: "IMX",   decimals: 4 },  // duplikat resolve
     },
 
     // ── Binance-only symbols (tidak ada di HL) ─────────────
+    // Symbol tambahan yang hanya ada di Binance Futures
     BN_ONLY_SYMBOLS: [
         "XAUUSDT", "EURUSDT", "GBPUSDT", "USDJPY",
         "AUDUSDT", "NZDUSDT", "USDCAD", "USDCNY",

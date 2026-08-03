@@ -1061,12 +1061,12 @@ function handleFinnhubTrade(trade) {
 /**
  * Connect ke Binance Futures WebSocket — Combined Stream
  * - Subscribe semua BN_SYMBOLS sekaligus via combined stream
- * - Format: wss://fstream.binance.com/stream?streams=xauusdt@kline_1m/eurusdt@kline_1m/...
+ * - Format: wss://fstream.binance.com/stream?streams=xauusdt@kline_1m/xauusdt@bookTicker/...
  * - TIDAK BUTUH API KEY
  *
  * Data yang diterima:
- *   - kline_1m → live candle forming + bar close → push ke WASM + IDB
- *   - otomatis update Market Watch via sendTickToWasm
+ *   - @kline_1m   → live candle forming + bar close → push ke WASM + IDB
+ *   - @bookTicker → best bid/ask tick-by-tick → Market Watch live price
  */
 function connectBinanceWebSocket() {
     if (bnWS && (bnWS.readyState === WebSocket.OPEN || bnWS.readyState === WebSocket.CONNECTING)) {
@@ -1081,20 +1081,25 @@ function connectBinanceWebSocket() {
         return;
     }
 
-    // Build combined stream URL
-    const streams = bnSymbols.map(ui => {
+    // Build combined stream URL — DUA stream per symbol:
+    //   1. @kline_1m   → untuk candle chart (update per trade, bar close ke IDB)
+    //   2. @bookTicker → untuk live price tick-by-tick di Market Watch
+    const streams = [];
+    bnSymbols.forEach(ui => {
         const coin = (typeof getBinanceCoin === 'function') ? getBinanceCoin(ui) : (PLATFORM.SYMBOL_MAP[ui]?.coin || ui + "USDT");
-        return `${coin.toLowerCase()}@kline_1m`;
+        const sym = coin.toLowerCase();
+        streams.push(`${sym}@kline_1m`);    // candle stream
+        streams.push(`${sym}@bookTicker`);   // tick-by-tick live price
     });
 
     const streamUrl = `wss://fstream.binance.com/stream?streams=${streams.join("/")}`;
 
     logInfo('[BN-WS] Connecting to Binance Futures...');
-    logInfo(`[BN-WS] Streams: ${streams.join(", ")}`);
+    logInfo(`[BN-WS] ${bnSymbols.length} symbols × 2 streams = ${streams.length} total`);
     bnWS = new WebSocket(streamUrl);
 
     bnWS.onopen = () => {
-        logGood('[BN-WS] ✅ Connected!');
+        logGood('[BN-WS] ✅ Connected! (kline + bookTicker)');
         bnSubscribedStreams = new Set(streams);
     };
 
@@ -1122,7 +1127,8 @@ function connectBinanceWebSocket() {
 /**
  * Handle pesan dari Binance Combined WebSocket
  * Format combined stream:
- *   { stream: "xauusdt@kline_1m", data: { e: "kline", E: 123, k: { ... } } }
+ *   { stream: "xauusdt@kline_1m",   data: { e: "kline", ... } }
+ *   { stream: "xauusdt@bookTicker", data: { e: "bookTicker", ... } }
  */
 function handleBinanceMessage(msg) {
     // Combined stream format
@@ -1130,7 +1136,36 @@ function handleBinanceMessage(msg) {
 
     if (msg.stream.includes("@kline_")) {
         handleBinanceCandle(msg.data);
+    } else if (msg.stream.includes("@bookTicker")) {
+        handleBinanceBookTicker(msg.data);
     }
+}
+
+/**
+ * Handle bookTicker dari Binance WS — TICK-BY-TICK live price
+ * Format:
+ *   { e: "bookTicker", u: updateId, E: eventTime,
+ *     s: "XAUUSDT", b: "2650.50", B: "12.5", a: "2650.60", A: "8.3" }
+ *   b = best bid price, B = best bid qty
+ *   a = best ask price, A = best ask qty
+ *
+ * Ini yang bikin Market Watch XAUUSD/GBPUSD berkedip real-time!
+ */
+function handleBinanceBookTicker(data) {
+    if (!data || !data.s) return;
+
+    const bnSymbol = data.s;                    // "XAUUSDT"
+    const uiSymbol = getUISymbol(bnSymbol);      // "XAUUSD"
+    if (!uiSymbol) return;
+
+    // Mid price = (best bid + best ask) / 2
+    const bestBid = parseFloat(data.b);
+    const bestAsk = parseFloat(data.a);
+    const midPrice = (bestBid + bestAsk) / 2;
+    const timeSec = Math.floor(Date.now() / 1000);
+
+    // Push ke Market Watch — ini yang bikin harga berkedip!
+    sendTickToWasm(uiSymbol, midPrice, 0, timeSec);
 }
 
 // Track last candle time per BN symbol (untuk deteksi bar close)
@@ -1158,9 +1193,6 @@ function handleBinanceCandle(data) {
     const v = parseFloat(k.v) || 1;
     const isBarClosed = k.x === true;
 
-    // Update Market Watch (harga berkedip)
-    sendTickToWasm(uiSymbol, c, v, openTime);
-
     // Deteksi BAR CLOSE
     const prevTime = bnLastCandleTime[bnSymbol];
     const isNewBar = (prevTime !== undefined && openTime !== prevTime);
@@ -1178,7 +1210,7 @@ function handleBinanceCandle(data) {
         }
     }
 
-    // Push ke chart utama (WASM)
+    // Push ke chart utama (WASM) — candle forming / bar close
     if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
         notifyWASM_candle(o, h, l, c, openTime, v);
         if (openTime > lastWasmTime) lastWasmTime = openTime;
