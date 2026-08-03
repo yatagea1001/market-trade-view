@@ -1,33 +1,31 @@
-console.log("%c[JS] V18 — SERVERLESS (Direct Hyperliquid API)", "color: #00FFAA; font-weight:bold; background: #0B0E11; padding: 4px;");
+console.log("%c[JS] V19 — MULTI-PROVIDER (Hyperliquid + Binance Futures)", "color: #00FFAA; font-weight:bold; background: #0B0E11; padding: 4px;");
 
 // ═══════════════════════════════════════════════════════════════
-// websocket.js V18 — 100% SERVERLESS (GitHub Pages Compatible)
+// websocket.js V19 — MULTI-PROVIDER (GitHub Pages Compatible)
 //
 // ARSITEKTUR:
 //   - TIDAK ADA server localhost
-//   - Data candle langsung dari Hyperliquid REST + WebSocket
+//   - Data candle dari MULTI-PROVIDER:
+//       • Crypto  → Hyperliquid REST + WebSocket
+//       • Forex/Gold → Binance Futures REST + WebSocket
 //   - Cache di IndexedDB browser per user
 //   - Bisa jalan 100% di GitHub Pages
 //
 // DATA FLOW:
-//   Startup   → cek IDB → gap fill dari HL REST → render chart
-//   Fresh     → fetch 5000 bar dari HL REST → simpan IDB → render
-//   Live      → HL WebSocket candle stream → push WASM + simpan IDB
-//   Lazy Load → scroll kiri → fetch older dari HL REST → simpan IDB
-//   MarketWatch → HL WebSocket allMids → update harga semua pair
+//   Startup   → cek IDB → gap fill dari REST → render chart
+//   Fresh     → fetch bar dari REST (HL atau BN) → simpan IDB → render
+//   Live      → WebSocket candle stream (HL atau BN) → push WASM + simpan IDB
+//   Lazy Load → scroll kiri → fetch older dari REST → simpan IDB
+//   MarketWatch → HL WS allMids + BN WS kline → update harga semua pair
 //
-// CHANGELOG V18 (dari V17):
-//   1. HAPUS semua koneksi ke ws://127.0.0.1:8765
-//   2. HAPUS wsSend(), connectWS(), semua server message handlers
-//   3. TAMBAH fetchCandlesFromHL() — REST API historical candles
-//   4. TAMBAH connectHLWebSocket() — live candle + allMids stream
-//   5. SetActiveSymbol → pakai fetch() langsung (bukan wsSend)
-//   6. onNearLeftEdge → pakai fetch() langsung (bukan wsSend)
-//   7. Gap fill → pakai fetch() langsung (synchronous await)
-//   8. HAPUS semua async request/response tracking:
-//      g_prefillResolve, g_tabPrefillResolvers, g_pendingTabGap,
-//      g_pendingTabLazy, g_tabDownloadBuf, g_wsSendQueue
-//   9. Symbol mapping via PLATFORM.SYMBOL_MAP (config.js)
+// CHANGELOG V19 (dari V18):
+//   1. TAMBAH Binance Futures sebagai provider untuk Forex/Gold
+//   2. TAMBAH connectBinanceWebSocket() — live candle stream combined
+//   3. TAMBAH handleBinanceMessage() + handleBinanceCandle()
+//   4. UPDATE fetchCandlesFromHL() → routing ke provider yang benar
+//   5. UPDATE subscribeCandleStream() → skip HL untuk Binance symbols
+//   6. UPDATE fetchHistoryPaginated() → routing ke provider yang benar
+//   7. Symbol mapping via PLATFORM.SYMBOL_MAP (config.js) — multi-provider
 // ═══════════════════════════════════════════════════════════════
 
 // =========================================================
@@ -65,6 +63,10 @@ let hlLastCandleTime = {};   // coin → last candle open time (untuk deteksi ba
 // 💹 Finnhub WebSocket reference
 let fhWS = null;
 let fhSubscribedCoin = null;
+
+// 🔥 Binance WebSocket reference
+let bnWS = null;
+let bnSubscribedStreams = new Set();
 
 function logInfo(m) { console.log ("%c" + m, "color:#0af"); }
 function logGood(m) { console.log ("%c" + m, "color:#0f0;font-weight:bold"); }
@@ -508,11 +510,23 @@ async function fetchFinnhubCandles(uiSymbol, startMs, endMs) {
  */
 async function fetchCandlesFromHL(uiSymbol, startMs, endMs) {
     const provider = PLATFORM.SYMBOL_MAP[uiSymbol] ? PLATFORM.SYMBOL_MAP[uiSymbol].provider : "hyperliquid";
-    
+
+    // ── Route ke Binance ─────────────────────────────────────
+    if (provider === "binance") {
+        // Kalau fetchBinanceCandles ada di config.js, pakai itu
+        if (typeof fetchBinanceCandles === "function") {
+            return await fetchBinanceCandles(uiSymbol, startMs, endMs);
+        }
+        // Fallback: inline fetch (kalau config.js belum loaded)
+        return await _fetchBinanceCandlesInline(uiSymbol, startMs, endMs);
+    }
+
+    // ── Route ke Finnhub ─────────────────────────────────────
     if (provider === "finnhub") {
         return await fetchFinnhubCandles(uiSymbol, startMs, endMs);
     }
 
+    // ── Default: Hyperliquid ─────────────────────────────────
     const coin = getHLCoin(uiSymbol);
     logInfo(`[HL-REST] Fetching ${coin} (${uiSymbol}) candles: ${new Date(startMs).toISOString().slice(0,16)} → ${new Date(endMs).toISOString().slice(0,16)}`);
 
@@ -556,6 +570,53 @@ async function fetchCandlesFromHL(uiSymbol, startMs, endMs) {
 
     } catch (e) {
         logErr(`[HL-REST] Fetch error for ${coin}: ${e.message}`);
+        return [];
+    }
+}
+
+/**
+ * Inline Binance candle fetch (fallback kalau config.js fetchBinanceCandles belum loaded)
+ */
+async function _fetchBinanceCandlesInline(uiSymbol, startMs, endMs) {
+    const entry = PLATFORM.SYMBOL_MAP[uiSymbol];
+    const coin = entry ? entry.coin : uiSymbol + "USDT";
+    const interval = "1m";
+    const limit = 1500;
+    let allCandles = [];
+    let currentEnd = endMs;
+
+    logInfo(`[BN-REST] Fetching ${coin} (${uiSymbol})...`);
+
+    try {
+        while (true) {
+            const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${coin}&interval=${interval}&endTime=${currentEnd}&limit=${limit}`;
+            const resp = await fetch(url);
+            if (!resp.ok) { logErr(`[BN-REST] HTTP ${resp.status} for ${coin}`); break; }
+
+            const data = await resp.json();
+            if (!Array.isArray(data) || data.length === 0) break;
+
+            const batch = data.map(c => ({
+                time: Math.floor(c[0] / 1000),
+                o: parseFloat(c[1]), h: parseFloat(c[2]), l: parseFloat(c[3]),
+                c: parseFloat(c[4]), v: parseFloat(c[5]) || 1
+            }));
+
+            allCandles = [...batch, ...allCandles];
+            if (batch[0].time * 1000 <= startMs) break;
+            currentEnd = batch[0].time * 1000 - 1;
+            await new Promise(r => setTimeout(r, 80));
+        }
+
+        allCandles = allCandles.filter(c => c.time * 1000 >= startMs && c.time * 1000 <= endMs);
+        const seen = new Set();
+        allCandles = allCandles.filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; });
+        allCandles.sort((a, b) => a.time - b.time);
+
+        logGood(`[BN-REST] ✅ ${coin}: ${allCandles.length} candles`);
+        return allCandles;
+    } catch (e) {
+        logErr(`[BN-REST] Error: ${e.message}`);
         return [];
     }
 }
@@ -809,6 +870,14 @@ function connectHLWebSocket() {
 function subscribeCandleStream(uiSymbol) {
     const provider = PLATFORM.SYMBOL_MAP[uiSymbol] ? PLATFORM.SYMBOL_MAP[uiSymbol].provider : "hyperliquid";
 
+    // ── Binance: Combined stream sudah subscribe semua BN_SYMBOLS ──
+    // Tidak perlu subscribe individual, live data sudah mengalir
+    if (provider === "binance") {
+        logInfo(`[BN-WS] ${uiSymbol} live via combined stream (already subscribed)`);
+        return;
+    }
+
+    // ── Finnhub ──────────────────────────────────────────────────────
     if (provider === "finnhub") {
         if (!fhWS || fhWS.readyState !== WebSocket.OPEN) return;
         
@@ -826,7 +895,7 @@ function subscribeCandleStream(uiSymbol) {
         return;
     }
 
-    // Default: Hyperliquid
+    // ── Default: Hyperliquid ─────────────────────────────────────────
     if (!hlWS || hlWS.readyState !== WebSocket.OPEN) return;
 
     const coin = getHLCoin(uiSymbol);
@@ -983,6 +1052,137 @@ function handleFinnhubTrade(trade) {
     // Gambar ke Chart WASM
     const c = fhCurrentCandle[uiSymbol];
     notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v);
+}
+
+// =========================================================
+// 9. BINANCE FUTURES WEBSOCKET (FOREX / GOLD)
+// =========================================================
+
+/**
+ * Connect ke Binance Futures WebSocket — Combined Stream
+ * - Subscribe semua BN_SYMBOLS sekaligus via combined stream
+ * - Format: wss://fstream.binance.com/stream?streams=xauusdt@kline_1m/eurusdt@kline_1m/...
+ * - TIDAK BUTUH API KEY
+ *
+ * Data yang diterima:
+ *   - kline_1m → live candle forming + bar close → push ke WASM + IDB
+ *   - otomatis update Market Watch via sendTickToWasm
+ */
+function connectBinanceWebSocket() {
+    if (bnWS && (bnWS.readyState === WebSocket.OPEN || bnWS.readyState === WebSocket.CONNECTING)) {
+        logWarn('[BN-WS] Already connected / connecting');
+        return;
+    }
+
+    // Daftar symbol Binance dari config
+    const bnSymbols = (typeof BN_SYMBOLS !== 'undefined') ? BN_SYMBOLS : [];
+    if (bnSymbols.length === 0) {
+        logInfo('[BN-WS] No Binance symbols configured, skipping');
+        return;
+    }
+
+    // Build combined stream URL
+    const streams = bnSymbols.map(ui => {
+        const coin = (typeof getBinanceCoin === 'function') ? getBinanceCoin(ui) : (PLATFORM.SYMBOL_MAP[ui]?.coin || ui + "USDT");
+        return `${coin.toLowerCase()}@kline_1m`;
+    });
+
+    const streamUrl = `wss://fstream.binance.com/stream?streams=${streams.join("/")}`;
+
+    logInfo('[BN-WS] Connecting to Binance Futures...');
+    logInfo(`[BN-WS] Streams: ${streams.join(", ")}`);
+    bnWS = new WebSocket(streamUrl);
+
+    bnWS.onopen = () => {
+        logGood('[BN-WS] ✅ Connected!');
+        bnSubscribedStreams = new Set(streams);
+    };
+
+    bnWS.onmessage = (evt) => {
+        try {
+            const msg = JSON.parse(evt.data);
+            handleBinanceMessage(msg);
+        } catch (e) {
+            // Ignore parse errors
+        }
+    };
+
+    bnWS.onerror = (e) => {
+        logErr('[BN-WS] Error');
+    };
+
+    bnWS.onclose = (e) => {
+        logWarn(`[BN-WS] Disconnected (${e.code}) → reconnect 3s`);
+        bnWS = null;
+        bnSubscribedStreams.clear();
+        setTimeout(connectBinanceWebSocket, 3000);
+    };
+}
+
+/**
+ * Handle pesan dari Binance Combined WebSocket
+ * Format combined stream:
+ *   { stream: "xauusdt@kline_1m", data: { e: "kline", E: 123, k: { ... } } }
+ */
+function handleBinanceMessage(msg) {
+    // Combined stream format
+    if (!msg.stream || !msg.data) return;
+
+    if (msg.stream.includes("@kline_")) {
+        handleBinanceCandle(msg.data);
+    }
+}
+
+// Track last candle time per BN symbol (untuk deteksi bar close)
+let bnLastCandleTime = {};
+
+/**
+ * Handle candle update dari Binance WS
+ * Format kline data:
+ *   { e: "kline", E: eventTime, s: "XAUUSDT", k: { t, T, s, i, o, h, l, c, v, x... } }
+ *   k.x = is this kline closed? (boolean)
+ */
+function handleBinanceCandle(data) {
+    if (!data || !data.k) return;
+
+    const k = data.k;
+    const bnSymbol = k.s;                    // "XAUUSDT"
+    const uiSymbol = getUISymbol(bnSymbol);   // "XAUUSD"
+    if (!uiSymbol) return;
+
+    const openTime = Math.floor(k.t / 1000);  // ms → seconds
+    const o = parseFloat(k.o);
+    const h = parseFloat(k.h);
+    const l = parseFloat(k.l);
+    const c = parseFloat(k.c);
+    const v = parseFloat(k.v) || 1;
+    const isBarClosed = k.x === true;
+
+    // Update Market Watch (harga berkedip)
+    sendTickToWasm(uiSymbol, c, v, openTime);
+
+    // Deteksi BAR CLOSE
+    const prevTime = bnLastCandleTime[bnSymbol];
+    const isNewBar = (prevTime !== undefined && openTime !== prevTime);
+
+    if (isNewBar && prevTime) {
+        // Bar sebelumnya sudah close — flush buffer ke IDB
+        flushBuffer();
+    }
+    bnLastCandleTime[bnSymbol] = openTime;
+
+    // Buffer ke IDB (simpan candle yang sudah close)
+    if (downloadedSymbols.has(uiSymbol)) {
+        if (isBarClosed) {
+            addToBuffer(uiSymbol, [{ time: openTime, o, h, l, c, v }]);
+        }
+    }
+
+    // Push ke chart utama (WASM)
+    if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
+        notifyWASM_candle(o, h, l, c, openTime, v);
+        if (openTime > lastWasmTime) lastWasmTime = openTime;
+    }
 }
 
 /**
@@ -1572,10 +1772,13 @@ Module.onRuntimeInitialized = async function() {
         }
     }
 
-    // Connect ke Hyperliquid WebSocket (untuk live data Kripto)
+    // Connect ke Hyperliquid WebSocket (untuk live data Crypto)
     connectHLWebSocket();
     
-    // Connect ke Finnhub WebSocket (untuk live data Forex)
+    // Connect ke Binance WebSocket (untuk live data Forex/Gold)
+    connectBinanceWebSocket();
+    
+    // Connect ke Finnhub WebSocket (untuk live data Forex — legacy, kalau ada API key)
     connectFinnhubWebSocket();
 
     // ─────────────────────────────────────────────────────────────────
