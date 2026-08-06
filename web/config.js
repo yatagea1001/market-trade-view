@@ -6,7 +6,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const PLATFORM = {
-    VERSION: "25.3.0",
+    VERSION: "25.3.1",
     MODE: "serverless",              // "serverless" = GitHub Pages, "server" = dengan backend
 
     // ── Data Provider ─────────────────────────────────────────
@@ -45,18 +45,20 @@ const PLATFORM = {
     //   Crypto  → Hyperliquid (gratis, no API key, data lengkap)
     //   Forex/Gold → Binance Futures (gratis, no API key, candle akurat)
     SYMBOL_MAP: {
-        // ── Forex / Gold → Binance Futures ────────────────────
-        // Binance Futures punya XAUUSDT, EURUSDT, GBPUSDT, dll
-        // Data candle & live tick gratis tanpa API key
+        // ── Gold → Binance Futures (VALID — XAUUSDT ada di Binance) ──
         "XAUUSD":  { provider: "binance",  coin: "XAUUSDT", decimals: 2 },
-        "EURUSD":  { provider: "binance",  coin: "EURUSDT", decimals: 5 },
-        "GBPUSD":  { provider: "binance",  coin: "GBPUSDT", decimals: 5 },
-        "JPYUSD":  { provider: "binance",  coin: "USDJPY",  decimals: 3 },  // JPY inverted
-        "AUDUSD":  { provider: "binance",  coin: "AUDUSDT", decimals: 5 },
-        "NZDUSD":  { provider: "binance",  coin: "NZDUSDT", decimals: 5 },
-        "USDCAD":  { provider: "binance",  coin: "USDCAD",  decimals: 5 },
-        "USDCNY":  { provider: "binance",  coin: "USDCNY",  decimals: 5 },
-        "USDEUR":  { provider: "binance",  coin: "EURUSDT", decimals: 5 },  // reverse EUR
+        // ── Forex → forex-poll (EURUSDT/GBPUSDT TIDAK ADA di Binance Futures)
+        //   Binance adalah crypto exchange — tidak punya forex pairs
+        //   Harga di-update via polling dari Frankfurter API (ECB rates)
+        //   Untuk tick-by-tick real-time, perlu provider berbayar (Twelve Data / Finnhub)
+        "EURUSD":  { provider: "forex-poll", coin: "EURUSD", decimals: 5 },
+        "GBPUSD":  { provider: "forex-poll", coin: "GBPUSD", decimals: 5 },
+        "JPYUSD":  { provider: "forex-poll", coin: "JPYUSD", decimals: 3 },
+        "AUDUSD":  { provider: "forex-poll", coin: "AUDUSD", decimals: 5 },
+        "NZDUSD":  { provider: "forex-poll", coin: "NZDUSD", decimals: 5 },
+        "USDCAD":  { provider: "forex-poll", coin: "USDCAD", decimals: 5 },
+        "USDCNY":  { provider: "forex-poll", coin: "USDCNY", decimals: 5 },
+        "USDEUR":  { provider: "forex-poll", coin: "EURUSD", decimals: 5 },
 
         // ── Major Crypto → Hyperliquid ───────────────────────
         "BTCUSDT":  { provider: "hyperliquid", coin: "BTC",   decimals: 1 },
@@ -143,9 +145,9 @@ const PLATFORM = {
 
     // ── Binance-only symbols (tidak ada di HL) ─────────────
     // Symbol tambahan yang hanya ada di Binance Futures
+    // ⚠️ Hanya XAUUSDT yang VALID — forex pairs TIDAK ADA di Binance
     BN_ONLY_SYMBOLS: [
-        "XAUUSDT", "EURUSDT", "GBPUSDT", "USDJPY",
-        "AUDUSDT", "NZDUSDT", "USDCAD", "USDCNY",
+        "XAUUSDT",
     ],
 
     // ── Symbol Alias (UI Label → UI Symbol) ───────────────────
@@ -252,7 +254,18 @@ const PLATFORM = {
             maxBarsPerRequest: 1500,
             interval: "1m",
             needsApiKey: false,
-            supports: ["crypto", "forex", "gold", "perps"],
+            supports: ["crypto", "gold", "perps"],
+        },
+        "forex-poll": {
+            name: "Forex Polling (ECB Rates)",
+            restUrl: "https://api.frankfurter.app",
+            wsUrl:   null,   // No WebSocket — polling only
+            maxBarsPerRequest: 0,
+            interval: "1m",
+            needsApiKey: false,
+            pollIntervalMs: 10000,
+            supports: ["forex"],
+            note: "ECB rates update ~daily. For real-time, use Twelve Data or Finnhub with API key.",
         },
         finnhub: {
             name: "Finnhub",
@@ -481,6 +494,12 @@ async function fetchCandles(uiSymbol, startMs, endMs) {
         case "binance":
             return await fetchBinanceCandles(uiSymbol, startMs, endMs);
 
+        case "forex-poll":
+            // Forex-poll tidak punya candle history — hanya live price
+            // Return empty array, chart akan kosong tapi Market Watch tetap update
+            console.warn(`[FETCH-CANDLES] ${uiSymbol} is forex-poll — no candle history available`);
+            return [];
+
         case "finnhub":
             // Kalau ada fetchFinnhubCandles, pakai itu
             if (typeof fetchFinnhubCandles === "function") {
@@ -508,5 +527,5 @@ console.log(`%c[CONFIG] Market Trade View v${PLATFORM.VERSION} | Mode: ${PLATFOR
     "color:#0af;font-weight:bold;background:#0B0E11;padding:4px;");
 console.log(`%c[CONFIG] ${ALL_SYMBOLS.length} symbols mapped | HL: ${HL_SYMBOLS.length} | BN: ${BN_SYMBOLS.length} | SYMBOL_MAPPING & REVERSE_MAPPING ready`,
     "color:#0f0;font-weight:bold;background:#0B0E11;padding:4px;");
-console.log(`%c[CONFIG] Forex/Gold → Binance | Crypto → Hyperliquid | fetchCandles() auto-routes`,
+console.log(`%c[CONFIG] Gold→Binance | Forex→Poll (ECB) | Crypto→Hyperliquid | fetchCandles() auto-routes`,
     "color:#ff0;font-weight:bold;background:#0B0E11;padding:4px;");

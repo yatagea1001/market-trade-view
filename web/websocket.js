@@ -1,7 +1,7 @@
-console.log("%c[JS] V19 — MULTI-PROVIDER (Hyperliquid + Binance Futures)", "color: #00FFAA; font-weight:bold; background: #0B0E11; padding: 4px;");
+console.log("%c[JS] V20 — MULTI-PROVIDER (Hyperliquid + Binance Futures + Forex Poll)", "color: #00FFAA; font-weight:bold; background: #0B0E11; padding: 4px;");
 
 // ═══════════════════════════════════════════════════════════════
-// websocket.js V19 — MULTI-PROVIDER (GitHub Pages Compatible)
+// websocket.js V20 — MULTI-PROVIDER (GitHub Pages Compatible)
 //
 // ARSITEKTUR:
 //   - TIDAK ADA server localhost
@@ -18,14 +18,13 @@ console.log("%c[JS] V19 — MULTI-PROVIDER (Hyperliquid + Binance Futures)", "co
 //   Lazy Load → scroll kiri → fetch older dari REST → simpan IDB
 //   MarketWatch → HL WS allMids + BN WS kline → update harga semua pair
 //
-// CHANGELOG V19 (dari V18):
-//   1. TAMBAH Binance Futures sebagai provider untuk Forex/Gold
-//   2. TAMBAH connectBinanceWebSocket() — live candle stream combined
-//   3. TAMBAH handleBinanceMessage() + handleBinanceCandle()
-//   4. UPDATE fetchCandlesFromHL() → routing ke provider yang benar
-//   5. UPDATE subscribeCandleStream() → skip HL untuk Binance symbols
-//   6. UPDATE fetchHistoryPaginated() → routing ke provider yang benar
-//   7. Symbol mapping via PLATFORM.SYMBOL_MAP (config.js) — multi-provider
+// CHANGELOG V20 (dari V19):
+//   1. FIX kline=0 bug — Binance exchangeInfo validation, hanya subscribe valid symbols
+//   2. FIX EURUSD/GBPUSD — tidak ada di Binance Futures → route ke forex-poll provider
+//   3. TAMBAH fetchValidBinanceSymbols() — cek exchangeInfo sebelum subscribe
+//   4. TAMBAH startForexPolling() — polling EURUSD/GBPUSD dari free API
+//   5. TAMBAH raw message debug logging untuk Binance WS
+//   6. UPDATE connectBinanceWebSocket() — filter invalid symbols, better logging
 // ═══════════════════════════════════════════════════════════════
 
 // =========================================================
@@ -67,6 +66,13 @@ let fhSubscribedCoin = null;
 // 🔥 Binance WebSocket reference
 let bnWS = null;
 let bnSubscribedStreams = new Set();
+let bnValidSymbols = null;       // Set of valid Binance Futures symbols (from exchangeInfo)
+let bnValidUISymbols = [];       // UI symbols yang valid di Binance (filtered BN_SYMBOLS)
+let bnInvalidUISymbols = [];     // UI symbols yang TIDAK valid di Binance (untuk forex-poll)
+
+// 💱 Forex Polling state (untuk EURUSD/GBPUSD yang tidak ada di Binance)
+let forexPollInterval = null;
+let forexPollSymbols = [];       // symbols yang di-poll dari free API
 
 function logInfo(m) { console.log ("%c" + m, "color:#0af"); }
 function logGood(m) { console.log ("%c" + m, "color:#0f0;font-weight:bold"); }
@@ -521,6 +527,13 @@ async function fetchCandlesFromHL(uiSymbol, startMs, endMs) {
         return await _fetchBinanceCandlesInline(uiSymbol, startMs, endMs);
     }
 
+    // ── Route ke Forex-Poll ─────────────────────────────────
+    if (provider === "forex-poll") {
+        // Forex-poll tidak punya candle history — hanya live price via polling
+        logWarn(`[FOREX-POLL] ${uiSymbol} — no candle history (polling-only provider)`);
+        return [];
+    }
+
     // ── Route ke Finnhub ─────────────────────────────────────
     if (provider === "finnhub") {
         return await fetchFinnhubCandles(uiSymbol, startMs, endMs);
@@ -870,6 +883,12 @@ function connectHLWebSocket() {
 function subscribeCandleStream(uiSymbol) {
     const provider = PLATFORM.SYMBOL_MAP[uiSymbol] ? PLATFORM.SYMBOL_MAP[uiSymbol].provider : "hyperliquid";
 
+    // ── Forex-Poll: tidak ada WebSocket, harga dari polling ──
+    if (provider === "forex-poll") {
+        logInfo(`[FOREX-POLL] ${uiSymbol} live via polling (no WebSocket available)`);
+        return;
+    }
+
     // ── Binance: Combined stream sudah subscribe semua BN_SYMBOLS ──
     // Tidak perlu subscribe individual, live data sudah mengalir
     if (provider === "binance") {
@@ -1058,54 +1077,258 @@ function handleFinnhubTrade(trade) {
 // 9. BINANCE FUTURES WEBSOCKET (FOREX / GOLD)
 // =========================================================
 
+// Debug counters — throttled log biar console tidak spam
+let _bnKlineCount = 0, _bnBookCount = 0, _bnTradeCount = 0;
+let _bnLastLogSec = 0;
+let _bnFirstMsgLogged = false;
+// Raw stream type tracking — untuk debug kline=0
+let _bnStreamTypes = {};  // streamType → count
+
+function _bnDebugLog() {
+    const now = Math.floor(Date.now() / 1000);
+    if (now - _bnLastLogSec >= 5) {  // log setiap 5 detik
+        if (_bnKlineCount + _bnBookCount + _bnTradeCount > 0) {
+            logInfo(`[BN-WS] 📊 5s stats: kline=${_bnKlineCount} bookTicker=${_bnBookCount} aggTrade=${_bnTradeCount}`);
+        }
+        // Log raw stream types jika ada mismatch
+        const types = Object.keys(_bnStreamTypes);
+        if (types.length > 0) {
+            const summary = types.map(t => `${t}=${_bnStreamTypes[t]}`).join(' ');
+            logInfo(`[BN-WS] 📡 raw streams: ${summary}`);
+        }
+        _bnKlineCount = 0; _bnBookCount = 0; _bnTradeCount = 0;
+        _bnStreamTypes = {};
+        _bnLastLogSec = now;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Binance ExchangeInfo — Validasi Symbol
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Fetch Binance Futures exchangeInfo untuk validasi symbol
+ * Hanya symbol yang ADA di Binance Futures yang bisa di-subscribe
+ * Symbol yang TIDAK ADA (EURUSDT, GBPUSDT) → route ke forex-poll
+ *
+ * @returns {Set} Set of valid symbol names (e.g., "XAUUSDT", "BTCUSDT")
+ */
+async function fetchValidBinanceSymbols() {
+    try {
+        const restUrl = (typeof PLATFORM !== 'undefined' && PLATFORM.BN_REST_URL)
+            ? PLATFORM.BN_REST_URL : "https://fapi.binance.com/fapi/v1";
+        const resp = await fetch(`${restUrl}/exchangeInfo`);
+        if (!resp.ok) {
+            logWarn(`[BN] exchangeInfo HTTP ${resp.status}, fallback: assume all valid`);
+            return null;  // null = don't know, assume all valid
+        }
+        const data = await resp.json();
+        const validSet = new Set(data.symbols.map(s => s.symbol));
+        logGood(`[BN] exchangeInfo: ${validSet.size} symbols available`);
+        return validSet;
+    } catch (e) {
+        logWarn(`[BN] exchangeInfo fetch failed: ${e.message}, fallback: assume all valid`);
+        return null;
+    }
+}
+
+/**
+ * Filter BN_SYMBOLS berdasarkan exchangeInfo
+ * Pisahkan mana yang valid di Binance, mana yang tidak
+ * Symbol yang tidak valid → route ke forex-poll
+ */
+async function validateBinanceSymbols() {
+    const bnSymbols = (typeof BN_SYMBOLS !== 'undefined') ? BN_SYMBOLS : [];
+    if (bnSymbols.length === 0) {
+        bnValidUISymbols = [];
+        bnInvalidUISymbols = [];
+        forexPollSymbols = [];
+        return;
+    }
+
+    const validSet = await fetchValidBinanceSymbols();
+
+    if (!validSet) {
+        // Tidak bisa fetch exchangeInfo → assume semua valid
+        bnValidUISymbols = [...bnSymbols];
+        bnInvalidUISymbols = [];
+        forexPollSymbols = [];
+        return;
+    }
+
+    bnValidSymbols = validSet;
+    bnValidUISymbols = [];
+    bnInvalidUISymbols = [];
+
+    bnSymbols.forEach(ui => {
+        const coin = (typeof getBinanceCoin === 'function')
+            ? getBinanceCoin(ui)
+            : (PLATFORM.SYMBOL_MAP[ui]?.coin || ui + "USDT");
+
+        if (validSet.has(coin)) {
+            bnValidUISymbols.push(ui);
+        } else {
+            bnInvalidUISymbols.push(ui);
+            logWarn(`[BN] ⚠️ ${ui} (${coin}) NOT found on Binance Futures → forex-poll`);
+        }
+    });
+
+    logGood(`[BN] Valid: ${bnValidUISymbols.join(', ') || 'none'}`);
+    if (bnInvalidUISymbols.length > 0) {
+        logWarn(`[BN] Invalid (will poll): ${bnInvalidUISymbols.join(', ')}`);
+        forexPollSymbols = [...bnInvalidUISymbols];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Forex Polling — EURUSD/GBPUSD live price dari free API
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Poll harga forex dari free API
+ * API yang digunakan:
+ *   - Frankfurter (ECB rates): https://api.frankfurter.app/latest?from=USD&to=EUR,GBP
+ *   - Gratis, tanpa API key, update ~daily (ECB)
+ *   - Untuk tick-by-tick yang lebih cepat, perlu provider berbayar
+ *
+ * Alternatif yang lebih real-time (butuh API key):
+ *   - Twelve Data: https://twelvedata.com (WebSocket forex, free tier 8 hits/min)
+ *   - Finnhub: https://finnhub.io (WebSocket forex, free tier)
+ */
+async function pollForexPrices() {
+    if (forexPollSymbols.length === 0) return;
+
+    try {
+        // Frankfurter API — gratis, tanpa API key
+        // Returns: { rates: { EUR: 0.9234, GBP: 0.7891 }, base: "USD" }
+        const currencies = forexPollSymbols.map(ui => {
+            // EURUSD → EUR, GBPUSD → GBP, XAUUSD → XAU (tidak supported)
+            if (ui === "EURUSD") return "EUR";
+            if (ui === "GBPUSD") return "GBP";
+            if (ui === "JPYUSD") return "JPY";
+            if (ui === "AUDUSD") return "AUD";
+            if (ui === "NZDUSD") return "NZZ";
+            if (ui === "USDCAD") return "CAD";
+            if (ui === "USDCNY") return "CNY";
+            return null;
+        }).filter(Boolean);
+
+        if (currencies.length === 0) return;
+
+        const resp = await fetch(`https://api.frankfurter.app/latest?from=USD&to=${currencies.join(',')}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const timeSec = Math.floor(Date.now() / 1000);
+
+        // Map rates ke UI symbols
+        forexPollSymbols.forEach(ui => {
+            let rate = null;
+            if (ui === "EURUSD" && data.rates.EUR) rate = data.rates.EUR;
+            else if (ui === "GBPUSD" && data.rates.GBP) rate = data.rates.GBP;
+            else if (ui === "JPYUSD" && data.rates.JPY) rate = 1 / data.rates.JPY; // inverted
+            else if (ui === "AUDUSD" && data.rates.AUD) rate = 1 / data.rates.AUD;
+            else if (ui === "NZDUSD" && data.rates.NZD) rate = 1 / data.rates.NZD;
+            else if (ui === "USDCAD" && data.rates.CAD) rate = data.rates.CAD;
+            else if (ui === "USDCNY" && data.rates.CNY) rate = data.rates.CNY;
+
+            if (rate && rate > 0) {
+                // Push ke Market Watch
+                sendTickToWasm(ui, rate, 0, timeSec);
+            }
+        });
+
+    } catch (e) {
+        // Silent fail — polling, akan coba lagi next interval
+    }
+}
+
+/**
+ * Start forex polling interval
+ * @param {number} intervalMs — polling interval (default 10000 = 10 detik)
+ */
+function startForexPolling(intervalMs = 10000) {
+    if (forexPollInterval) clearInterval(forexPollInterval);
+    if (forexPollSymbols.length === 0) return;
+
+    logInfo(`[FOREX-POLL] Starting poll for: ${forexPollSymbols.join(', ')} every ${intervalMs/1000}s`);
+
+    // Poll pertama langsung
+    pollForexPrices();
+
+    // Lalu interval
+    forexPollInterval = setInterval(pollForexPrices, intervalMs);
+}
+
 /**
  * Connect ke Binance Futures WebSocket — Combined Stream
- * - Subscribe semua BN_SYMBOLS sekaligus via combined stream
+ * - Hanya subscribe symbol yang VALID (dari exchangeInfo)
+ * - Symbol yang tidak valid → sudah di-route ke forex-poll
  * - Format: wss://fstream.binance.com/stream?streams=xauusdt@kline_1m/xauusdt@bookTicker/...
  * - TIDAK BUTUH API KEY
  *
  * Data yang diterima:
- *   - @kline_1m   → live candle forming + bar close → push ke WASM + IDB
+ *   - @kline_1m   → live candle forming + bar close → push ke WASM chart + IDB
  *   - @bookTicker → best bid/ask tick-by-tick → Market Watch live price
+ *   - @aggTrade   → individual trades → footprint + candle tick update
  */
-function connectBinanceWebSocket() {
+async function connectBinanceWebSocket() {
     if (bnWS && (bnWS.readyState === WebSocket.OPEN || bnWS.readyState === WebSocket.CONNECTING)) {
         logWarn('[BN-WS] Already connected / connecting');
         return;
     }
 
-    // Daftar symbol Binance dari config
-    const bnSymbols = (typeof BN_SYMBOLS !== 'undefined') ? BN_SYMBOLS : [];
-    if (bnSymbols.length === 0) {
-        logInfo('[BN-WS] No Binance symbols configured, skipping');
+    // ── VALIDASI SYMBOL DULU ──────────────────────────────────
+    // Cek exchangeInfo untuk filter symbol yang benar-benar ada
+    await validateBinanceSymbols();
+
+    // Hanya subscribe symbol yang valid di Binance Futures
+    const symbolsToSubscribe = bnValidUISymbols;
+    if (symbolsToSubscribe.length === 0) {
+        logWarn('[BN-WS] No valid Binance symbols found — skipping Binance WS');
+        // Tapi tetap start forex polling untuk invalid symbols
+        startForexPolling();
         return;
     }
 
-    // Build combined stream URL — DUA stream per symbol:
-    //   1. @kline_1m   → untuk candle chart (update per trade, bar close ke IDB)
+    // Build combined stream URL — TIGA stream per symbol:
+    //   1. @kline_1m   → untuk candle chart (update ~100ms, bar close ke IDB)
     //   2. @bookTicker → untuk live price tick-by-tick di Market Watch
+    //   3. @aggTrade   → individual trades untuk footprint + candle tick
     const streams = [];
-    bnSymbols.forEach(ui => {
+    symbolsToSubscribe.forEach(ui => {
         const coin = (typeof getBinanceCoin === 'function') ? getBinanceCoin(ui) : (PLATFORM.SYMBOL_MAP[ui]?.coin || ui + "USDT");
         const sym = coin.toLowerCase();
         streams.push(`${sym}@kline_1m`);    // candle stream
-        streams.push(`${sym}@bookTicker`);   // tick-by-tick live price
+        streams.push(`${sym}@bookTicker`);   // tick-by-tick live price (Market Watch)
+        streams.push(`${sym}@aggTrade`);     // individual trades (footprint + candle tick)
     });
 
     const streamUrl = `wss://fstream.binance.com/stream?streams=${streams.join("/")}`;
 
-    logInfo('[BN-WS] Connecting to Binance Futures...');
-    logInfo(`[BN-WS] ${bnSymbols.length} symbols × 2 streams = ${streams.length} total`);
+    logInfo(`[BN-WS] Connecting to Binance Futures...`);
+    logInfo(`[BN-WS] ${symbolsToSubscribe.length} valid symbols × 3 streams = ${streams.length} total`);
+    logInfo(`[BN-WS] Subscribing: ${symbolsToSubscribe.map(ui => getBinanceCoin(ui)).join(', ')}`);
     bnWS = new WebSocket(streamUrl);
 
     bnWS.onopen = () => {
-        logGood('[BN-WS] ✅ Connected! (kline + bookTicker)');
+        logGood(`[BN-WS] ✅ Connected! Streams: ${streams.length} (kline + bookTicker + aggTrade)`);
+        logGood(`[BN-WS] Symbols: ${symbolsToSubscribe.join(', ')}`);
         bnSubscribedStreams = new Set(streams);
     };
 
     bnWS.onmessage = (evt) => {
         try {
             const msg = JSON.parse(evt.data);
+            // ── RAW DEBUG: Track semua stream types ──
+            if (msg.stream) {
+                const streamType = msg.stream.split('@')[1] || 'unknown';
+                _bnStreamTypes[streamType] = (_bnStreamTypes[streamType] || 0) + 1;
+            }
+            // ── FIRST MESSAGE DEBUG ──
+            if (!_bnFirstMsgLogged) {
+                _bnFirstMsgLogged = true;
+                logInfo(`[BN-WS] 📨 First message: stream="${msg.stream || 'N/A'}" hasData=${!!msg.data} keys=${Object.keys(msg).join(',')}`);
+            }
             handleBinanceMessage(msg);
         } catch (e) {
             // Ignore parse errors
@@ -1122,6 +1345,9 @@ function connectBinanceWebSocket() {
         bnSubscribedStreams.clear();
         setTimeout(connectBinanceWebSocket, 3000);
     };
+
+    // ── START FOREX POLLING untuk symbol yang tidak ada di Binance ──
+    startForexPolling();
 }
 
 /**
@@ -1129,16 +1355,30 @@ function connectBinanceWebSocket() {
  * Format combined stream:
  *   { stream: "xauusdt@kline_1m",   data: { e: "kline", ... } }
  *   { stream: "xauusdt@bookTicker", data: { e: "bookTicker", ... } }
+ *   { stream: "xauusdt@aggTrade",   data: { e: "aggTrade", ... } }
  */
 function handleBinanceMessage(msg) {
     // Combined stream format
-    if (!msg.stream || !msg.data) return;
+    if (!msg.stream || !msg.data) {
+        // Bisa jadi connection result atau error — log sekali untuk debug
+        if (msg.error) {
+            logErr(`[BN-WS] Binance error: ${JSON.stringify(msg.error)}`);
+        }
+        return;
+    }
 
+    // Route berdasarkan stream type
     if (msg.stream.includes("@kline_")) {
+        _bnKlineCount++;
         handleBinanceCandle(msg.data);
     } else if (msg.stream.includes("@bookTicker")) {
+        _bnBookCount++;
         handleBinanceBookTicker(msg.data);
+    } else if (msg.stream.includes("@aggTrade")) {
+        _bnTradeCount++;
+        handleBinanceAggTrade(msg.data);
     }
+    _bnDebugLog();
 }
 
 /**
@@ -1168,6 +1408,42 @@ function handleBinanceBookTicker(data) {
     sendTickToWasm(uiSymbol, midPrice, 0, timeSec);
 }
 
+/**
+ * Handle aggTrade dari Binance WS — INDIVIDUAL TRADES
+ * Format:
+ *   { e: "aggTrade", E: eventTime, s: "XAUUSDT",
+ *     p: "2650.55", q: "0.5", T: tradeTime, m: isBuyerMaker }
+ *   p = price, q = quantity, m = true if seller is maker
+ *
+ * Dipakai untuk:
+ *   1. Push footprint ke WASM (buy/sell volume per price level)
+ *   2. Update candle tick-by-tick (lebih responsif dari kline 100ms)
+ *   3. Market Watch live price (backup bookTicker)
+ */
+function handleBinanceAggTrade(data) {
+    if (!data || !data.s) return;
+
+    const bnSymbol = data.s;                    // "XAUUSDT"
+    const uiSymbol = getUISymbol(bnSymbol);      // "XAUUSD"
+    if (!uiSymbol) return;
+
+    const price = parseFloat(data.p);
+    const qty = parseFloat(data.q);
+    const timeMs = data.T;
+    const timeSec = Math.floor(timeMs / 1000);
+    const isSell = data.m === true;   // isBuyerMaker = true → sell trade
+
+    // ── 1. Push footprint ke WASM (buy_vol, sell_vol per price) ──
+    if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
+        const buyVol  = isSell ? 0 : qty;
+        const sellVol = isSell ? qty : 0;
+        notifyWASM_footprint(uiSymbol, timeSec, price, buyVol, sellVol, 0);
+    }
+
+    // ── 2. Push tick ke Market Watch ──
+    sendTickToWasm(uiSymbol, price, qty, timeSec);
+}
+
 // Track last candle time per BN symbol (untuk deteksi bar close)
 let bnLastCandleTime = {};
 
@@ -1176,6 +1452,9 @@ let bnLastCandleTime = {};
  * Format kline data:
  *   { e: "kline", E: eventTime, s: "XAUUSDT", k: { t, T, s, i, o, h, l, c, v, x... } }
  *   k.x = is this kline closed? (boolean)
+ *
+ * Binance @kline_1m update setiap ~100ms (jauh lebih sering dari HL)
+ * → candle chart XAUUSD update real-time sama kayak BTC!
  */
 function handleBinanceCandle(data) {
     if (!data || !data.k) return;
@@ -1210,7 +1489,8 @@ function handleBinanceCandle(data) {
         }
     }
 
-    // Push ke chart utama (WASM) — candle forming / bar close
+    // Push ke chart utama (WASM) — candle forming tick-by-tick + bar close
+    // Binance @kline_1m update ~100ms → candle XAUUSD bergerak real-time!
     if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
         notifyWASM_candle(o, h, l, c, openTime, v);
         if (openTime > lastWasmTime) lastWasmTime = openTime;
