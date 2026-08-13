@@ -2451,6 +2451,14 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 //  V2: Incremental scan + Dual Validation + Evolution
 // ==========================================================
 #include "SMC_Indicator.h"
+
+// ==========================================================
+// SNIPER PRO — Composite Indicator
+//  EMA crossover + VWAP + Smart Filter (6/7)
+//  BUY/SELL arrows + Entry/SL/TP1-5 levels
+//  Port dari Sniper Pro by Hammad Dilber V.05 (MQL5)
+// ==========================================================
+#include "SniperPro_Indicator.h"
 // ============================================================
 // JarvisBridge.h — Bridge antara Jarvis AI dan Chart Engine
 // Phase 6: Swing + Key Levels + Auto-Context + DRAW TOOLS
