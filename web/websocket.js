@@ -225,6 +225,42 @@ async function getAllCandlesFromDB(symbol) {
     });
 }
 
+/**
+ * 🔥 OPTIMASI: Query cepat — cuma ambil timestamp candle TERAKHIR dari IDB.
+ * Tidak load semua data, cuma reverse cursor → first hit = last entry.
+ * Dipakai untuk gap-first strategy: tahu gap sebelum load full IDB.
+ */
+async function getLastCandleTimeFromDB(symbol) {
+    if (!db) return 0;
+    return new Promise(res => {
+        const t = db.transaction([STORE], 'readonly');
+        const s = t.objectStore(STORE);
+        const range = IDBKeyRange.bound([symbol, 0], [symbol, 0x7FFFFFFF]);
+        const req = s.openCursor(range, 'prev'); // reverse = last entry first
+        req.onsuccess = (e) => {
+            const cursor = e.target.result;
+            res(cursor ? (cursor.value.time || 0) : 0);
+        };
+        req.onerror = () => res(0);
+    });
+}
+
+/**
+ * 🔥 OPTIMASI: Query cepat — hitung jumlah candle di IDB tanpa load data.
+ * Dipakai untuk cek apakah IDB punya cukup data (>= MIN) sebelum full read.
+ */
+async function getCandleCountFromDB(symbol) {
+    if (!db) return 0;
+    return new Promise(res => {
+        const t = db.transaction([STORE], 'readonly');
+        const s = t.objectStore(STORE);
+        const range = IDBKeyRange.bound([symbol, 0], [symbol, 0x7FFFFFFF]);
+        const req = s.count(range);
+        req.onsuccess = () => res(req.result || 0);
+        req.onerror = () => res(0);
+    });
+}
+
 async function getAllSymbolsInDB() {
     if (!db) return [];
     return new Promise(res => {
@@ -382,6 +418,117 @@ async function rebuildTabFromDB(tabId, symbol) {
     if (Module._wasm_rebuild_htfs_for_tab)
         Module.ccall('wasm_rebuild_htfs_for_tab', null, ['number'], [tabId]);
     logGood(`[REBUILD TAB${tabId}] ✅ ${symbol}: ${candles.length} bars OK`);
+}
+
+/**
+ * 🔥 FIX: Push gap candles ke WASM dengan g_primaryBulkLoading=true.
+ *
+ * KENAPA PERLU:
+ *   subscribeCandleStream() dipanggil SEBELUM gap fill → live candle bisa datang duluan.
+ *   Kalau g_primaryBulkLoading=false saat gap candle di-push:
+ *     - Gap candle (time < live candle terakhir) → KASUS 3B (bar-close search)
+ *     - Candle TIDAK ditambahkan sebagai entry baru → GAP TIDAK RENDER!
+ *   Dengan g_primaryBulkLoading=true:
+ *     - Gap candle → KASUS 3A (historical push_back) → candle masuk dengan benar
+ */
+function pushGapCandlesToWASM(symbol, gapCandles) {
+    if (!isWasmReady || !gapCandles.length) return;
+
+    gapCandles.sort((a, b) => a.time - b.time);
+    logGood(`[GAP-PUSH] +${gapCandles.length} gap candles → WASM (primaryLoading=true)`);
+
+    // 🔥 FIX: Set g_primaryBulkLoading=true → KASUS 3A (historical push_back)
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+
+    for (const c of gapCandles) {
+        notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v || 1);
+        if (c.time > lastWasmTime) lastWasmTime = c.time;
+    }
+
+    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+
+    // 🔥 Set kembali false → live candles boleh masuk normal lagi
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+
+    logGood(`[GAP-PUSH] ✅ ${gapCandles.length} gap candles rendered!`);
+}
+
+/**
+ * 🔥 OPTIMASI: Prepend IDB history candles ke chart yang sudah ada gap/recent data.
+ * Pakai wasm_begin_prepend/wasm_prepend_candle/wasm_end_prepend (lazy load system).
+ * Menambahkan candle LAMA di awal vector tanpa mengganggu view position.
+ *
+ * FLOW: gap-first → chart muncul → prepend IDB history di background
+ */
+function prependHistoryToWASM(candles) {
+    if (!isWasmReady || !candles.length) return;
+    if (!Module._wasm_begin_prepend) {
+        logWarn('[PREPEND] wasm_begin_prepend not available — fallback to pushCandlesToWASMDirect');
+        // Fallback: push semua (akan ada out-of-order tapi rebuild fixes HTF)
+        pushCandlesToWASMDirect(CURRENT_SYMBOL, candles);
+        return;
+    }
+
+    candles.sort((a, b) => a.time - b.time);
+    logInfo(`[PREPEND] ${candles.length} history candles → prepend ke depan M1...`);
+
+    Module._wasm_begin_prepend();
+    for (const c of candles) {
+        Module.ccall('wasm_prepend_candle', null,
+            ['number','number','number','number','number','number'],
+            [c.o, c.h, c.l, c.c, c.time, c.v || 1]);
+    }
+    Module._wasm_end_prepend();
+
+    // Rebuild HTF setelah prepend (offset viewCenterIndex sudah di-handle C++)
+    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+
+    logGood(`[PREPEND] ✅ ${candles.length} history candles prepended → chart lengkap!`);
+}
+
+/**
+ * 🔥 OPTIMASI: Push candles langsung ke WASM tanpa baca IDB ulang.
+ * Dipakai saat data sudah ada di memori (dari getAllCandlesFromDB sebelumnya).
+ * Menghindari double IDB read yang memakan 50-300ms extra.
+ */
+function pushCandlesToWASMDirect(symbol, candles) {
+    if (!isWasmReady || !candles.length) return;
+
+    // IDB Sanitizer (sama kayak rebuildFullFromDB)
+    if (candles.length > 10) {
+        const recent = candles.slice(-Math.max(100, Math.floor(candles.length * 0.5)));
+        const closes = recent.map(c => c.c).sort((a, b) => a - b);
+        const median = closes[Math.floor(closes.length / 2)];
+        if (median > 0) {
+            const hiLim = median * 5.0;
+            const loLim = median * 0.2;
+            const before = candles.length;
+            candles = candles.filter(c =>
+                c.c >= loLim && c.c <= hiLim &&
+                c.h > 0 && c.l > 0
+            );
+            if (candles.length < before) {
+                logWarn(`[DIRECT-PUSH] Sanitizer: removed ${before - candles.length} corrupt candles`);
+            }
+        }
+    }
+
+    candles.sort((a, b) => a.time - b.time);
+
+    logGood(`[DIRECT-PUSH] ${candles.length} bars → push ke WASM (tanpa IDB read ulang)...`);
+    isRendering = true;
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+
+    for (const c of candles) {
+        notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v || c.volume || 1);
+        if (c.time > lastWasmTime) lastWasmTime = c.time;
+    }
+
+    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+    isRendering = false;
+    downloadedSymbols.add(symbol);
+    logGood(`[DIRECT-PUSH] ✅ ${symbol}: ${candles.length} bars OK`);
 }
 
 async function rebuildFullFromDB(symbol) {
@@ -1598,7 +1745,21 @@ function handleHLTrades(dataArray) {
 }
 
 // =========================================================
-// 8. SWITCH PAIR (SetActiveSymbol)
+// 8. SWITCH PAIR (SetActiveSymbol) — OPTIMIZED 3 SKENARIO
+// =========================================================
+//   🔥 V2 — GAP-FIRST STRATEGY (optimasi percepatan loading)
+//
+//   SKENARIO 1 (No IDB):   history.bin → push → gap(fixed) → live
+//   SKENARIO 2 (IDB+Gap):  check lastTime → gap FIRST → chart muncul → IDB history prepend(BG)
+//   SKENARIO 3 (IDB+Fresh): IDB data masih fresh → push langsung (no gap)
+//
+//   FIX UTAMA: Gap gak render karena g_primaryBulkLoading=false
+//     → live candle datang duluan → gap candle masuk KASUS 3B (bar-close) → skip!
+//     → FIX: pushGapCandlesToWASM() set g_primaryBulkLoading=true → KASUS 3A
+//
+//   STRUKTUR OPTIMAL:
+//     No IDB:  history.bin → push(CHART) → gap(pushGapCandlesToWASM) → live
+//     IDB:     checkLast → gap(pushGapCandlesToWASM, CHART) → live → history(prepend BG)
 // =========================================================
 window.SetActiveSymbol = async function(newSym) {
     if (isDownloading) {
@@ -1633,47 +1794,106 @@ window.SetActiveSymbol = async function(newSym) {
         logInfo(`[CHART] GPU + candles cleared for ${oldSym} → ${newSym}`);
     }
 
-    await new Promise(r => setTimeout(r, 16));
-
-    // Subscribe ke HL WS untuk symbol baru
+    // 🔥 Subscribe LIVE SEGERA — jangan tunggu data siap
     subscribeCandleStream(newSym);
 
-    // Cek IDB cache
-    const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
+    // ════════════════════════════════════════════════════════════════
+    // 🔥 V2: Quick IDB check — cuma ambil count + lastTime (cepat!)
+    //   Tidak load semua data dulu → hemat waktu
+    // ════════════════════════════════════════════════════════════════
+    const [idbCount, lastTime] = await Promise.all([
+        getCandleCountFromDB(CURRENT_SYMBOL),
+        getLastCandleTimeFromDB(CURRENT_SYMBOL)
+    ]);
     const MIN = 500;
+    const nowEpoch   = Math.floor(Date.now() / 1000);
+    const gapSeconds = lastTime > 0 ? (nowEpoch - lastTime) : 0;
+    const gapMinutes = Math.floor(gapSeconds / 60);
 
-    if (existing.length >= MIN) {
-        logGood(`[CACHE HIT] ${CURRENT_SYMBOL}: ${existing.length} bars`);
-
-        // Gap fill langsung via fetch (bukan wsSend!)
-        const latestTime = existing.reduce((max, c) => c.time > max ? c.time : max, 0);
-        const nowEpoch   = Math.floor(Date.now() / 1000);
-        const gapSeconds = nowEpoch - latestTime;
-        const gapMinutes = Math.floor(gapSeconds / 60);
+    if (idbCount >= MIN && lastTime > 0) {
+        // ════════════════════════════════════════════════════════════
+        // 🔥 SKENARIO 2: IDB CACHE HIT
+        //   Two sub-scenarios:
+        //   A) IDB + GAP: gap-first → chart muncul dari gap → IDB history prepend(BG)
+        //   B) IDB + FRESH: IDB data fresh → push langsung (no gap)
+        // ════════════════════════════════════════════════════════════
 
         if (gapSeconds > 30) {
-            logWarn(`[GAP] ${gapMinutes}m gap → fetch dari HL REST`);
-            showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (${gapMinutes}m gap)...`, 0);
+            // ═══════════════════════════════════════════════════════
+            // 🔥 SKENARIO 2A: GAP-FIRST — User lihat data TERBARU dulu!
+            //
+            //   Flow: check lastTime → fetch gap → push gap (CHART MUNCUL)
+            //         → IDB history prepend di background
+            //
+            //   Kenapa gap duluan?
+            //   - Gap = data TERBARU yg user belum lihat (paling penting!)
+            //   - IDB history = data lama (cuma konteks)
+            //   - Dengan gap-first, chart muncul CEPAT dengan data terbaru
+            //   - History IDB nambah di belakang via prepend (no flicker)
+            // ═══════════════════════════════════════════════════════
+            logGood(`[GAP-FIRST] ${CURRENT_SYMBOL}: ${idbCount} cached, ${gapMinutes}m gap → fetch gap first!`);
+            showLoadingOverlay(`Loading ${CURRENT_SYMBOL} recent data...`, 30);
 
-            const gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestTime);
-            if (gapCandles.length > 0) {
-                addToBuffer(CURRENT_SYMBOL, gapCandles);
-                await flushBuffer();
-                logGood(`[GAP] ✅ +${gapCandles.length} candles saved to IDB`);
+            try {
+                const gapCandles = await fetchGapCandles(CURRENT_SYMBOL, lastTime);
+                if (gapCandles.length > 0) {
+                    // 🔥 Push gap candles dengan g_primaryBulkLoading=true (FIX KASUS 3A)
+                    pushGapCandlesToWASM(CURRENT_SYMBOL, gapCandles);
+                    logGood(`[GAP-FIRST] ✅ Chart muncul dengan ${gapCandles.length} gap candles (latest data)!`);
+
+                    // Save gap ke IDB
+                    addToBuffer(CURRENT_SYMBOL, gapCandles);
+                    await flushBuffer();
+                } else {
+                    logInfo(`[GAP-FIRST] Gap fetch returned 0 candles → fallback ke IDB push`);
+                }
+            } catch(e) {
+                logWarn(`[GAP-FIRST] Gap fetch error: ${e.message}`);
             }
+
+            hideLoadingOverlay();
+            g_initialLoadDone = true;
+            logInfo(`[INIT] Initial load selesai — lazy diizinkan`);
+
+            // ═══════════════════════════════════════════════════════
+            // 🔥 PREPEND IDB HISTORY DI BACKGROUND
+            //   Chart sudah muncul dengan gap data. Sekarang tambah
+            //   IDB history (candle lama) di depan via prepend system.
+            //   Prepend = insert di awal vector, tanpa ganggu view.
+            // ═══════════════════════════════════════════════════════
+            (async () => {
+                try {
+                    const idbCandles = await getAllCandlesFromDB(CURRENT_SYMBOL);
+                    if (idbCandles.length > 0) {
+                        prependHistoryToWASM(idbCandles);
+                        logGood(`[HISTORY-BG] ✅ ${idbCandles.length} IDB candles prepended → chart lengkap!`);
+                    }
+                } catch(e) {
+                    logWarn(`[HISTORY-BG] Prepend error: ${e.message}`);
+                }
+            })();
+
         } else {
-            logInfo(`[GAP] IDB fresh (gap ${gapSeconds}s) → langsung render`);
+            // ═══════════════════════════════════════════════════════
+            // 🔥 SKENARIO 2B: IDB FRESH — tidak ada gap signifikan
+            //   Push IDB data langsung (sama kayak sebelumnya)
+            // ═══════════════════════════════════════════════════════
+            logGood(`[IDB-FRESH] ${CURRENT_SYMBOL}: ${idbCount} bars, gap ${gapSeconds}s (fresh)`);
+            showLoadingOverlay(`Loading ${CURRENT_SYMBOL} from cache`, 50);
+
+            const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
+            pushCandlesToWASMDirect(CURRENT_SYMBOL, existing);
+            hideLoadingOverlay();
+            g_initialLoadDone = true;
+            logInfo(`[INIT] Initial load selesai — lazy diizinkan`);
         }
 
-        showLoadingOverlay(`Loading ${CURRENT_SYMBOL} from cache`, 0);
-        await rebuildFullFromDB(CURRENT_SYMBOL);
-        hideLoadingOverlay();
-
-        g_initialLoadDone = true;
-        logInfo(`[INIT] Initial load selesai — lazy diizinkan`);
-
     } else {
-        // CACHE MISS → coba download binary dulu, fallback HL REST
+        // ════════════════════════════════════════════════════════════
+        // 🔥 SKENARIO 1: CACHE MISS (No IDB) — First time load
+        //   Flow: history.bin → push (CHART) → gap (pushGapCandlesToWASM) → live
+        //   FIX: gap push pakai g_primaryBulkLoading=true → KASUS 3A
+        // ════════════════════════════════════════════════════════════
         logWarn(`[CACHE MISS] ${CURRENT_SYMBOL} → sync...`);
         showLoadingOverlay(`Synchronizing ${CURRENT_SYMBOL}...`, 0);
         isDownloading = true;
@@ -1683,75 +1903,80 @@ window.SetActiveSymbol = async function(newSym) {
         // ═══════════════════════════════════════════════════════════
         let candles = await downloadBinaryHistory(CURRENT_SYMBOL);
         let usedBinary = false;
-        let allCandles = [];  // semua candle (binary + gap) untuk IDB save
+        let allCandles = [];
 
         if (candles && candles.length > 0) {
             usedBinary = true;
             allCandles = [...candles];
 
             // ═══════════════════════════════════════════════════════
-            // TAHAP 2: Gap fill — binary mungkin sudah lama,
-            //   ambil candle terbaru dari Hyperliquid REST
-            // ═══════════════════════════════════════════════════════
-            const latestBinTime = candles[candles.length - 1].time;
-            const nowEpoch = Math.floor(Date.now() / 1000);
-            const gapSec = nowEpoch - latestBinTime;
-            const gapMin = Math.floor(gapSec / 60);
-
-            if (gapSec > 60) {
-                logInfo(`[BIN-GAP] ${gapMin}m gap → fill dari HL REST`);
-                showLoadingOverlay(`Synchronizing ${CURRENT_SYMBOL}`, 60);
-
-                let gapCandles;
-                if (gapMin > 4500) {
-                    gapCandles = await fetchHistoryPaginated(CURRENT_SYMBOL, gapMin);
-                } else {
-                    gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestBinTime);
-                }
-
-                if (gapCandles && gapCandles.length > 0) {
-                    allCandles = [...candles, ...gapCandles];
-                    logGood(`[BIN-GAP] ✅ +${gapCandles.length.toLocaleString()} candles terbaru dari HL`);
-                }
-            }
-
-            // ═══════════════════════════════════════════════════════
             // TURBO: Push LANGSUNG ke WASM → chart muncul INSTAN!
-            //   Tidak perlu simpan ke IDB dulu!
             // ═══════════════════════════════════════════════════════
-            showLoadingOverlay(`Completing Sync...`, 80);
+            showLoadingOverlay(`Rendering ${CURRENT_SYMBOL}...`, 60);
             pushCandlesDirectToWASM(CURRENT_SYMBOL, allCandles);
             hideLoadingOverlay();
 
-            // Chart sudah muncul! ✅ Sekarang simpan ke IDB di background
-            // User sudah bisa scroll/zoom chart sementara IDB menyimpan
             logInfo(`[TURBO] Chart sudah tampil! Menyimpan ke IDB di background...`);
             saveToIDBBackground(CURRENT_SYMBOL, allCandles).then(() => {
                 logGood(`[TURBO] ✅ IDB background save selesai — lazy load siap!`);
             });
 
+            // ═══════════════════════════════════════════════════════
+            // 🔥 FIX: Gap fill pakai pushGapCandlesToWASM
+            //   (g_primaryBulkLoading=true → KASUS 3A → gap RENDER!)
+            // ═══════════════════════════════════════════════════════
+            const latestBinTime = candles[candles.length - 1].time;
+            const nowEp = Math.floor(Date.now() / 1000);
+            const gapSec = nowEp - latestBinTime;
+            const gapMin = Math.floor(gapSec / 60);
+
+            if (gapSec > 60) {
+                logInfo(`[BIN-GAP] ${gapMin}m gap → background fill + pushGapCandlesToWASM`);
+                (async () => {
+                    try {
+                        let gapCandles;
+                        if (gapMin > 4500) {
+                            gapCandles = await fetchHistoryPaginated(CURRENT_SYMBOL, gapMin);
+                        } else {
+                            gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestBinTime);
+                        }
+                        if (gapCandles && gapCandles.length > 0) {
+                            // 🔥 FIX: Pakai pushGapCandlesToWASM (primaryLoading=true)
+                            pushGapCandlesToWASM(CURRENT_SYMBOL, gapCandles);
+                            // Save to IDB
+                            addToBuffer(CURRENT_SYMBOL, gapCandles);
+                            await flushBuffer();
+                            logGood(`[BIN-GAP] ✅ +${gapCandles.length.toLocaleString()} gap candles RENDERED + saved`);
+                        }
+                    } catch(e) {
+                        logWarn(`[BIN-GAP] Gap fill error: ${e.message}`);
+                    }
+                })();
+            }
+
         } else {
             // ═══════════════════════════════════════════════════════
             // FALLBACK: Binary tidak ada (404) → fetch dari HL REST
-            //   (alur lama, tetap pakai IDB karena data kecil)
             // ═══════════════════════════════════════════════════════
             logWarn(`[FALLBACK] Binary tidak tersedia → fetch ${PLATFORM.HISTORY_BARS} candles dari Hyperliquid REST`);
             candles = await fetchHistoryPaginated(CURRENT_SYMBOL, PLATFORM.HISTORY_BARS);
             if (candles && candles.length > 0) {
-                updateProgress(candles.length, candles.length, "Saving");
-                addToBuffer(CURRENT_SYMBOL, candles);
-                await flushBuffer();
-                await rebuildFullFromDB(CURRENT_SYMBOL);
+                showLoadingOverlay(`Rendering ${CURRENT_SYMBOL}...`, 80);
+                pushCandlesDirectToWASM(CURRENT_SYMBOL, candles);
+                hideLoadingOverlay();
+                saveToIDBBackground(CURRENT_SYMBOL, candles).then(() => {
+                    logGood(`[FALLBACK] ✅ IDB background save selesai`);
+                });
             } else {
                 logErr(`[DOWNLOAD] Tidak ada data untuk ${CURRENT_SYMBOL}`);
+                hideLoadingOverlay();
             }
-            hideLoadingOverlay();
         }
 
         isDownloading = false;
         g_initialLoadDone = true;
 
-        const source = usedBinary ? 'TURBO binary + HL gap' : 'HL REST';
+        const source = usedBinary ? 'TURBO binary + BG gap (FIXED)' : 'HL REST + BG save';
         logGood(`✅ ${CURRENT_SYMBOL} fully loaded! (source: ${source})`);
 
         if (pendingSymbolSwitch) {
@@ -1976,7 +2201,10 @@ window.reloadLiveAfterReplay = async function() {
 };
 
 // =========================================================
-// 11. LOAD TAB SYMBOL (multi-tab)
+// 11. LOAD TAB SYMBOL (multi-tab) — OPTIMIZED V2
+//   - Gap fill di BACKGROUND (chart muncul dulu dari cache)
+//   - Tidak ada double IDB read (hemat 50-200ms)
+//   - 🔥 FIX: Gap push pakai tab-level set_loading agar KASUS 3A
 // =========================================================
 window.LoadTabSymbol = async function(tabId, symbol) {
     g_tabSymbolMap.set(tabId, symbol);
@@ -1988,48 +2216,63 @@ window.LoadTabSymbol = async function(tabId, symbol) {
 
     if (candles.length >= MIN) {
         candles.sort((a, b) => a.time - b.time);
+        logGood(`[TAB${tabId}] IDB hit: ${candles.length} bars → push langsung`);
 
-        // Gap fill via fetch langsung
+        // 🔥 OPTIMASI: Push langsung dari memori, TIDAK baca IDB ulang
+        if (Module._wasm_push_candle_for_tab) {
+            if (Module._wasm_clear_tab) {
+                Module._wasm_clear_tab(tabId);
+            }
+            for (const c of candles) {
+                Module.ccall('wasm_push_candle_for_tab', null,
+                    ['number','number','number','number','number','number','number'],
+                    [tabId, c.o, c.h, c.l, c.c, c.time, c.v || 1]);
+            }
+            logGood(`[TAB${tabId}] ${candles.length} M1 candles pushed`);
+            if (Module._wasm_rebuild_htfs_for_tab) Module._wasm_rebuild_htfs_for_tab(tabId);
+            logGood(`[TAB${tabId}] ${symbol} siap!`);
+        }
+
+        // 🔥 OPTIMASI: Gap fill di BACKGROUND — chart sudah muncul
         const latestTime = candles.reduce((max, c) => c.time > max ? c.time : max, 0);
         const nowEpoch   = Math.floor(Date.now() / 1000);
         const gapSeconds = nowEpoch - latestTime;
 
         if (gapSeconds > 30) {
             const gapMinutes = Math.floor(gapSeconds / 60);
-            logWarn(`[TAB${tabId}-GAP] ${gapMinutes}m gap → fetch dari HL REST`);
-            const gapCandles = await fetchGapCandles(symbol, latestTime);
-            if (gapCandles.length > 0) {
-                addToBuffer(symbol, gapCandles);
-                await flushBuffer();
-                logGood(`[TAB${tabId}-GAP] ✅ +${gapCandles.length} candles`);
-            }
-        }
+            logWarn(`[TAB${tabId}-GAP-BG] ${gapMinutes}m gap → background fill`);
+            (async () => {
+                try {
+                    const gapCandles = await fetchGapCandles(symbol, latestTime);
+                    if (gapCandles.length > 0) {
+                        // Push gap candles langsung ke tab
+                        // (wasm_push_candle_for_tab selalu push_back tanpa KASUS 3B check → aman)
+                        for (const c of gapCandles) {
+                            if (Module._wasm_push_candle_for_tab) {
+                                Module.ccall('wasm_push_candle_for_tab', null,
+                                    ['number','number','number','number','number','number','number'],
+                                    [tabId, c.o, c.h, c.l, c.c, c.time, c.v || 1]);
+                            }
+                        }
 
-        // Reload fresh dari IDB (termasuk gap candles)
-        const freshCandles = await getAllCandlesFromDB(symbol);
-        freshCandles.sort((a, b) => a.time - b.time);
-        logGood(`[TAB${tabId}] IDB hit: ${freshCandles.length} bars -> render`);
-
-        if (Module._wasm_push_candle_for_tab) {
-            if (Module._wasm_clear_tab) {
-                Module._wasm_clear_tab(tabId);
-            }
-            for (const c of freshCandles) {
-                Module.ccall('wasm_push_candle_for_tab', null,
-                    ['number','number','number','number','number','number','number'],
-                    [tabId, c.o, c.h, c.l, c.c, c.time, c.v || 1]);
-            }
-            logGood(`[TAB${tabId}] ${freshCandles.length} M1 candles pushed`);
-            if (Module._wasm_rebuild_htfs_for_tab) Module._wasm_rebuild_htfs_for_tab(tabId);
-            logGood(`[TAB${tabId}] ${symbol} siap!`);
+                        if (Module._wasm_rebuild_htfs_for_tab) Module._wasm_rebuild_htfs_for_tab(tabId);
+                        // Save to IDB
+                        addToBuffer(symbol, gapCandles);
+                        await flushBuffer();
+                        logGood(`[TAB${tabId}-GAP-BG] ✅ +${gapCandles.length} gap candles RENDERED + saved`);
+                    }
+                } catch(e) {
+                    logWarn(`[TAB${tabId}-GAP-BG] Gap fill error: ${e.message}`);
+                }
+            })();
         }
 
     } else {
         // IDB kosong → download fresh dari HL REST
         logWarn(`[TAB${tabId}] IDB kosong untuk ${symbol} → download fresh`);
-        const candles = await fetchHistoryPaginated(symbol, PLATFORM.HISTORY_BARS);
-        if (candles.length > 0) {
-            addToBuffer(symbol, candles);
+        const dlCandles = await fetchHistoryPaginated(symbol, PLATFORM.HISTORY_BARS);
+        if (dlCandles.length > 0) {
+            addToBuffer(symbol, dlCandles);
             await flushBuffer();
             await rebuildTabFromDB(tabId, symbol);
         }

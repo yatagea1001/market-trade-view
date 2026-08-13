@@ -1,121 +1,124 @@
-console.log("%c[JS] V17 - ON-DEMAND ONLY (HAPUS NINJA PREFETCH)", "color: #00FFAA; font-weight:bold; background: #0B0E11; padding: 4px;");
+console.log("%c[JS] V20 — MULTI-PROVIDER (Hyperliquid + Binance Futures + Forex Poll)", "color: #00FFAA; font-weight:bold; background: #0B0E11; padding: 4px;");
 
-// =========================================================
-// CHANGELOG V17 (dari V16):
-//   1. HAPUS ninja prefetch sepenuhnya
-//      → Tidak ada background download pair yang tidak dipilih user
-//      → Scalable ke 1000+ pair tanpa makan RAM/storage
-//   2. Market Watch price → dari tick stream live (wasm_push_tick selalu jalan)
-//      → C++ sudah aman: UpdateTick() dipanggil semua sym, candle hanya terbentuk
-//        kalau ada tab buka pair itu ATAU pair itu adalah g_symbol
-//   3. Tick handler → selalu teruskan ke WASM (tidak perlu downloadedSymbols guard)
-//      → downloadedSymbols tetap ada untuk footprint/tick_flow guard (orderflow.js)
-//   4. Startup → TIDAK scan IDB semua pair, TIDAK push prefetchQueue
-//      → Hanya load pair yang dipilih user (SetActiveSymbol/picker)
-//   5. addToBuffer untuk tick → HANYA untuk CURRENT_SYMBOL dan tab aktif
-//      → Tick pair lain tidak masuk IDB
-//   6. ALL_SYMBOLS → tetap ada untuk Market Watch initial row setup
-//      → Tapi TIDAK digunakan untuk download background
-// =========================================================
-
-const WS_URL = "ws://127.0.0.1:8765";
-//const WS_URL = "wss://file-dear-all-addition.trycloudflare.com";
+// ═══════════════════════════════════════════════════════════════
+// websocket.js V20 — MULTI-PROVIDER (GitHub Pages Compatible)
+//
+// ARSITEKTUR:
+//   - TIDAK ADA server localhost
+//   - Data candle dari MULTI-PROVIDER:
+//       • Crypto  → Hyperliquid REST + WebSocket
+//       • Forex/Gold → Binance Futures REST + WebSocket
+//   - Cache di IndexedDB browser per user
+//   - Bisa jalan 100% di GitHub Pages
+//
+// DATA FLOW:
+//   Startup   → cek IDB → gap fill dari REST → render chart
+//   Fresh     → fetch bar dari REST (HL atau BN) → simpan IDB → render
+//   Live      → WebSocket candle stream (HL atau BN) → push WASM + simpan IDB
+//   Lazy Load → scroll kiri → fetch older dari REST → simpan IDB
+//   MarketWatch → HL WS allMids + BN WS kline → update harga semua pair
+//
+// CHANGELOG V20 (dari V19):
+//   1. FIX kline=0 bug — Binance exchangeInfo validation, hanya subscribe valid symbols
+//   2. FIX EURUSD/GBPUSD — tidak ada di Binance Futures → route ke forex-poll provider
+//   3. TAMBAH fetchValidBinanceSymbols() — cek exchangeInfo sebelum subscribe
+//   4. TAMBAH startForexPolling() — polling EURUSD/GBPUSD dari free API
+//   5. TAMBAH raw message debug logging untuk Binance WS
+//   6. UPDATE connectBinanceWebSocket() — filter invalid symbols, better logging
+// ═══════════════════════════════════════════════════════════════
 
 // =========================================================
 // 1. STATE
 // =========================================================
 
-// 🔥 SCALABLE: Pisah forex & crypto — mudah tambah pair nanti
-// Cukup tambah nama pair di sini, tidak perlu ubah kode lain
 const SYMBOLS_FOREX  = ["XAUUSD","EURUSD","GBPUSD"];
 const SYMBOLS_CRYPTO = ["BTCUSDT","ETHUSDT"];
-const ALL_SYMBOLS    = [...SYMBOLS_FOREX, ...SYMBOLS_CRYPTO];
+// ALL_SYMBOLS sudah didefinisikan di config.js
 
-let CURRENT_SYMBOL = ""; // Kosong → tunggu picker C++ pilih dulu
+let CURRENT_SYMBOL = "";
 let lastWasmTime   = 0;
 
 var isWasmReady   = false;
-var isWSConnected = false;
+// isWSConnected tidak diperlukan lagi (HL WS manage sendiri)
 
 let isDownloading      = false;
-let isRendering        = false; // true saat rebuildFullFromDB berjalan
+let isRendering        = false;
 let pendingSymbolSwitch = null;
 let downloadedSymbols  = new Set();
 let downloadedCandles  = [];
 let candleBuffer       = [];
 
-// ══════════════════════════════════════════════════════════════
-// 🔒 REBUILD MUTEX — mencegah double/triple rebuild concurrent
-//
-// Masalah: rebuildFullFromDB() berisi `await getAllCandlesFromDB()`
-// yang menyebabkan JS yield ke event loop. Saat itu lazy/gap bisa
-// masuk dan memanggil rebuildFullFromDB lagi → 3 rebuild bersamaan.
-//
-// Solusi: flag g_rebuildInProgress sebagai mutex.
-// Siapa pun yang masuk lebih dahulu, yang lain skip/wait.
-// ══════════════════════════════════════════════════════════════
+// 🔒 REBUILD MUTEX
 let g_rebuildInProgress = false;
 
-// ══════════════════════════════════════════════════════════════
-// 🔥 GAP PREFILL BEFORE RENDER
-// Digunakan saat CACHE HIT — gap fill harus selesai SEBELUM
-// rebuildFullFromDB dipanggil, agar render pertama sudah lengkap.
-// g_prefillResolve: callback Promise yang di-resolve handleGapData
-// ══════════════════════════════════════════════════════════════
-let g_prefillResolve = null; // set saat menunggu gap prefill, null saat idle
+// 🔒 INITIAL LOAD GUARD
+let g_initialLoadDone = true;
 
-// 🔥 Per-tab prefill resolvers (agar multi-tab gap fill tidak konflik)
-const g_tabPrefillResolvers = new Map(); // tabId → resolve function
+// 🔥 HL WebSocket reference
+let hlWS = null;
+let hlSubscribedCoin = null; // coin yang sedang di-subscribe candle stream
+let hlLastCandleTime = {};   // coin → last candle open time (untuk deteksi bar close)
 
-// ══════════════════════════════════════════════════════════════
-// 🔥 LAZY GAP FILL — ON-DEMAND SAAT USER PILIH SYMBOL
-// Startup: scan IDB → catat gap di memory → TIDAK request apapun
-// User pilih symbol → cek g_startupGapMap → kalau ada gap →
-//   prefillGapBeforeRender → simpan IDB → baru render
-// Paling hemat: request hanya terjadi saat user betul-betul butuh
-// ══════════════════════════════════════════════════════════════
-const g_startupGapMap = new Map(); // symbol → latestTime (cache dari startup scan)
+// 💹 Finnhub WebSocket reference
+let fhWS = null;
+let fhSubscribedCoin = null;
 
-// 🔒 INITIAL LOAD GUARD — block lazy selama startup flow
-// Set true saat SetActiveSymbol mulai, false setelah gap terselesaikan.
-// Mencegah lazy dari C++ ikut-ikutan rebuild sebelum data awal selesai.
-let g_initialLoadDone = true; // default true (hanya false saat switch symbol)
+// 🔥 Binance WebSocket reference
+let bnWS = null;
+let bnSubscribedStreams = new Set();
+let bnValidSymbols = null;       // Set of valid Binance Futures symbols (from exchangeInfo)
+let bnValidUISymbols = [];       // UI symbols yang valid di Binance (filtered BN_SYMBOLS)
+let bnInvalidUISymbols = [];     // UI symbols yang TIDAK valid di Binance (untuk forex-poll)
 
-// 🥷 NINJA PRE-FETCH VARIABLES
-// V17: prefetchQueue DIHAPUS — tidak ada background download
-// downloadedSymbols tetap ada untuk guard di websocket_orderflow.js (footprint/tick_flow)
+// 💱 Forex Polling state (untuk EURUSD/GBPUSD yang tidak ada di Binance)
+let forexPollInterval = null;
+let forexPollSymbols = [];       // symbols yang di-poll dari free API
 
 function logInfo(m) { console.log ("%c" + m, "color:#0af"); }
 function logGood(m) { console.log ("%c" + m, "color:#0f0;font-weight:bold"); }
 function logWarn(m) { console.warn("%c" + m, "color:orange;font-weight:bold"); }
 function logErr (m) { console.error("%c"+ m, "color:red;font-weight:bold"); }
 
-// =========================================================
-// UTIL: isCryptoSymbol
-// Sentralisasi cek crypto — dipakai di bar close & footprint request
-// Tambah pair baru di SYMBOLS_CRYPTO, fungsi ini otomatis tahu
-// =========================================================
 function isCryptoSymbol(sym) {
     return SYMBOLS_CRYPTO.includes(sym) || sym.includes("USDT") || sym === "BTC" || sym === "ETH";
 }
 
 // =========================================================
-// SATU FUNGSI UNTUK KIRIM TICK KE C++
+// 2. WASM BRIDGE
 // =========================================================
 function sendTickToWasm(symbol, price, vol, time) {
     if (!isWasmReady || !Module || !Module.ccall) return;
     Module.ccall('wasm_push_tick', null,
         ['string', 'number', 'number', 'number'],
         [symbol,   price,    vol,      time]);
+
+    // 🔥 TAHAP 2: Simpan harga terbaru ke global registry untuk ticker bar
+    if (!window.g_tickerPrices) window.g_tickerPrices = {};
+    const prev = window.g_tickerPrices[symbol];
+    window.g_tickerPrices[symbol] = {
+        price: price,
+        prevPrice: prev ? prev.price : price,   // untuk hitung change
+        time: Date.now()
+    };
+}
+
+function notifyWASM_candle(o, h, l, c, t, v) {
+    if (!isWasmReady || !Module || !Module.ccall) return;
+    if (Module._wasm_get_replay_gate && Module._wasm_get_replay_gate() === 1) return;
+    Module.ccall('wasm_push_candle', null,
+        ['number','number','number','number','number','number'],
+        [o, h, l, c, t, v]);
+}
+
+function notifyWASM_footprint(symbol, time, price, buy_vol, sell_vol, fromIDB = 0) {
+    if (!isWasmReady || !Module || !Module.ccall) return;
+    Module.ccall('wasm_push_footprint', null,
+        ['string', 'number', 'number', 'number', 'number', 'number'],
+        [symbol, time, price, buy_vol, sell_vol, fromIDB]);
 }
 
 // =========================================================
-// 🥷 NINJA BACKGROUND PRE-FETCH PROCESSOR
-// =========================================================
-// V17: processPrefetchQueue DIHAPUS — tidak ada background download pair
-
-// =========================================================
-// 2. PROGRESS UI
+// 3. PROGRESS UI
 // =========================================================
 function showLoadingOverlay(msg, pct = 0) {
     let ov = document.getElementById('data-loading-overlay');
@@ -128,8 +131,13 @@ function showLoadingOverlay(msg, pct = 0) {
             display:flex;flex-direction:column;align-items:center;justify-content:center;
             color:#0af;font-family:'Segoe UI',sans-serif;pointer-events:none;`;
         ov.innerHTML = `
+            <style>
+            @keyframes ov_spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            .ov-spinner { border: 4px solid rgba(0, 170, 255, 0.2); border-top: 4px solid #0af; border-radius: 50%; width: 40px; height: 40px; animation: ov_spin 1s linear infinite; margin: 0 auto 15px auto; }
+            </style>
             <div style="text-align:center">
-              <div id="ov-msg"  style="font-size:18px;font-weight:bold;margin-bottom:20px">Loading...</div>
+              <div class="ov-spinner"></div>
+              <div id="ov-msg"  style="font-size:18px;font-weight:bold;margin-bottom:20px;letter-spacing:1px">Synchronizing...</div>
               <div style="width:320px;height:8px;background:#222;border-radius:4px;overflow:hidden;margin-bottom:10px">
                 <div id="ov-bar" style="width:0%;height:100%;background:linear-gradient(90deg,#0af,#0f0);transition:width .3s"></div>
               </div>
@@ -148,13 +156,8 @@ function hideLoadingOverlay() {
     if (ov) ov.style.display = 'none';
 }
 
-// ── CORNER SPINNER — indikator background activity (prefetch/prepend) ───────
-// Muncul saat ada aktivitas background (IDB write, prepend, prefetch).
-// Tidak ada teks — hanya 3 titik berputar di pojok kanan bawah.
-// User tahu "masih ada proses" → lebih sabar kalau ada frame drop kecil.
-// Hilang otomatis saat semua background activity selesai.
+// ── CORNER SPINNER ──────────────────────────────────────────
 (function() {
-    // Inject CSS keyframes sekali
     const style = document.createElement('style');
     style.textContent = `
         @keyframes _yt_dot { 0%,80%,100%{opacity:.15} 40%{opacity:1} }
@@ -168,22 +171,13 @@ function hideLoadingOverlay() {
         #_yt_spinner span:nth-child(3){animation-delay:.4s}
     `;
     document.head.appendChild(style);
-
     const el = document.createElement('div');
     el.id = '_yt_spinner';
     el.innerHTML = '<span></span><span></span><span></span>';
     document.body.appendChild(el);
-
-    // Counter — berapa proses background sedang jalan
     let _count = 0;
-    window._spinnerShow = function() {
-        _count++;
-        el.style.display = 'flex';
-    };
-    window._spinnerHide = function() {
-        _count = Math.max(0, _count - 1);
-        if (_count === 0) el.style.display = 'none';
-    };
+    window._spinnerShow = function() { _count++; el.style.display = 'flex'; };
+    window._spinnerHide = function() { _count = Math.max(0, _count - 1); if (_count === 0) el.style.display = 'none'; };
 })();
 
 function updateProgress(current, total, phase) {
@@ -194,130 +188,10 @@ function updateProgress(current, total, phase) {
     if (bar) bar.style.width  = pct + '%';
     if (msg) msg.innerText    = `${phase} ${CURRENT_SYMBOL}`;
     if (det) det.innerText    = `${current.toLocaleString()} / ${total.toLocaleString()} candles`;
-    logInfo(`[PROGRESS] ${phase}: ${Math.round(pct)}% (${current}/${total})`);
 }
 
 // =========================================================
-// 3. SWITCH PAIR
-// =========================================================
-window.SetActiveSymbol = async function(newSym) {
-    if (isDownloading) {
-        logWarn(`[UI] Still loading ${CURRENT_SYMBOL}, queued: ${newSym}`);
-        pendingSymbolSwitch = newSym;
-        return;
-    }
-
-    if (CURRENT_SYMBOL && CURRENT_SYMBOL === newSym && isWasmReady) return;
-
-    logInfo(`[UI] Switching: ${CURRENT_SYMBOL} → ${newSym}`);
-    await flushBuffer();
-
-    const oldSym = CURRENT_SYMBOL;
-    CURRENT_SYMBOL = newSym;
-    lastWasmTime   = 0;
-    g_noMoreHistory.delete(newSym);
-
-    // 🔥 Clear FP cache untuk symbol lama saat switch
-    // FP data di WASM akan di-clear saat wasm_clear_chart → request baru diizinkan
-    // Kalau user balik ke symbol ini lagi → FP di-request fresh (data sudah di-clear WASM)
-    if (oldSym && oldSym !== newSym && window.clearFPForSymbol) {
-        window.clearFPForSymbol(oldSym);
-    }
-    g_lazyLoadInProgress = false;
-
-    // 🔒 Kunci initial load — lazy TIDAK boleh rebuild selama proses ini
-    g_initialLoadDone = false;
-
-    g_tabSymbolMap.set(0, newSym);
-    resetTabLazy(0);
-
-    showLoadingOverlay(`Switching to ${newSym}...`, 0);
-
-    if (Module && Module._wasm_clear_chart) {
-        Module._wasm_clear_chart();
-        logInfo(`[CHART] GPU + candles cleared for ${oldSym} → ${newSym}`);
-    }
-
-    await new Promise(r => setTimeout(r, 16)); // ~1 frame @ 60fps
-
-    const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
-
-    const MIN = 500;
-
-    if (existing.length >= MIN) {
-        logGood(`[CACHE HIT] ${CURRENT_SYMBOL}: ${existing.length} bars`);
-
-        // ══════════════════════════════════════════════════════════
-        // 🔥 ON-DEMAND GAP FILL saat user pilih symbol
-        // g_startupGapMap sudah catat gap sejak startup scan (tanpa request).
-        // Kalau symbol ini ada di map → pakai latestTime dari cache (lebih cepat).
-        // Kalau tidak ada di map → hitung dari IDB (fallback).
-        // ══════════════════════════════════════════════════════════
-        const cachedLatest = g_startupGapMap.get(CURRENT_SYMBOL);
-        const latestTime = cachedLatest
-            ?? existing.reduce((max, c) => c.time > max ? c.time : max, 0);
-        const nowEpoch   = Math.floor(Date.now() / 1000);
-        const gapSeconds = nowEpoch - latestTime;
-        const gapMinutes = Math.floor(gapSeconds / 60);
-        const estCandles = Math.floor(gapSeconds / 60);
-
-        if (gapSeconds > 30) {
-            logWarn(`[GAP-PREFILL] ${gapMinutes}m gap (~${estCandles} candle) → fetch sebelum render dari ${new Date(latestTime*1000).toISOString().slice(0,19)}Z`);
-            showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (${gapMinutes}m gap)...`, 0);
-            await prefillGapBeforeRender(CURRENT_SYMBOL, latestTime);
-            logGood(`[GAP-PREFILL] ✅ IDB sudah lengkap → lanjut render`);
-        } else {
-            logInfo(`[GAP] IDB fresh (gap ${gapSeconds}s) → langsung render`);
-        }
-        // 🔥 Hapus cache setelah gap terisi — next switch pakai hitung IDB fresh
-        g_startupGapMap.delete(CURRENT_SYMBOL);
-
-        showLoadingOverlay(`Loading ${CURRENT_SYMBOL} from cache`, 0);
-        updateProgress(existing.length, existing.length, "Rendering");
-        await rebuildFullFromDB(CURRENT_SYMBOL);
-        hideLoadingOverlay();
-
-        // Buka lazy setelah render pertama selesai
-        g_initialLoadDone = true;
-        logInfo(`[INIT] Initial load selesai — lazy diizinkan`);
-    } else if (existing.length > 0) {
-        logWarn(`[CACHE] Incomplete (${existing.length} < ${MIN}) → full download`);
-        showLoadingOverlay(`Downloading ${CURRENT_SYMBOL} history`, 0);
-        isDownloading = true;
-        wsSend({ type: "request_sync", symbol: CURRENT_SYMBOL, count: 10000 }); // 10k candle
-    } else {
-        logWarn(`[CACHE MISS] ${CURRENT_SYMBOL} → download`);
-        showLoadingOverlay(`Downloading ${CURRENT_SYMBOL} history`, 0);
-        isDownloading = true;
-        wsSend({ type: "request_sync", symbol: CURRENT_SYMBOL, count: 10000 }); // 10k candle
-    }
-};
-
-// =========================================================
-// 4. WASM BRIDGE
-// =========================================================
-function notifyWASM_candle(o, h, l, c, t, v) {
-    if (!isWasmReady || !Module || !Module.ccall) return;
-    if (Module._wasm_get_replay_gate && Module._wasm_get_replay_gate() === 1) return;
-    Module.ccall('wasm_push_candle', null,
-        ['number','number','number','number','number','number'],
-        [o, h, l, c, t, v]);
-}
-
-// Footprint bridge — symbol wajib untuk routing primary vs non-primary tab
-// 🔥 fromIDB=0 default → live feed (diblok gate C++ saat replay)
-// Signature harus cocok dengan wasm_push_footprint di main.cpp (6 param)
-function notifyWASM_footprint(symbol, time, price, buy_vol, sell_vol, fromIDB = 0) {
-    if (!isWasmReady || !Module || !Module.ccall) return;
-    Module.ccall('wasm_push_footprint', null,
-        ['string', 'number', 'number', 'number', 'number', 'number'],
-        [symbol, time, price, buy_vol, sell_vol, fromIDB]);
-}
-// Catatan: fmtUSD DIHAPUS dari sini (V16)
-// Sudah ada di websocket_orderflow.js dan sudah global — tidak perlu duplikat
-
-// =========================================================
-// 5. INDEXEDDB
+// 4. INDEXEDDB (TIDAK BERUBAH dari V17)
 // =========================================================
 let db = null;
 const DB_NAME = 'TradingAppDB';
@@ -351,7 +225,6 @@ async function getAllCandlesFromDB(symbol) {
     });
 }
 
-// V17: Ambil daftar symbol unik yang sudah ada di IDB (untuk downloadedSymbols tracking)
 async function getAllSymbolsInDB() {
     if (!db) return [];
     return new Promise(res => {
@@ -371,7 +244,7 @@ async function saveBufferToDB(data) {
     if (!db || !data.length) return;
     const bigWrite = data.length > 500;
     if (bigWrite && window._spinnerShow) window._spinnerShow();
-    const BATCH = 500;
+    const BATCH = 3000;
     for (let i = 0; i < data.length; i += BATCH) {
         const chunk = data.slice(i, i + BATCH);
         await new Promise((res, rej) => {
@@ -382,7 +255,7 @@ async function saveBufferToDB(data) {
             t.onerror    = e  => { console.error('[DB] Save error:', e); res(); };
         });
         if (i + BATCH < data.length)
-            await new Promise(r => requestAnimationFrame(r));
+            await new Promise(r => setTimeout(r, 0));
     }
     if (bigWrite && window._spinnerHide) window._spinnerHide();
 }
@@ -405,21 +278,74 @@ async function flushBuffer() {
     await saveBufferToDB(tmp);
 }
 
-// =========================================================
-// 6. REBUILD FROM DB
-// 🆕 V16: Pakai requestAnimationFrame bukan setTimeout(r, 10)
-//
-// Kenapa rAF lebih baik:
-//   - setTimeout(r, 10) = tunggu 10ms FLAT, tidak peduli frame state
-//   - requestAnimationFrame = yield TEPAT sebelum browser paint berikutnya
-//   - Hasilnya: ImGui/WebGL dapat frame budget penuh tiap siklus
-//   - Chart muncul bertahap (smooth progressif) tanpa freeze
-//
-// isRendering flag:
-//   - Pasang sebelum loop mulai, lepas setelah HTF selesai
-//   - Ninja cek flag ini sebelum minta data ke server
-// =========================================================
-// ── IDB range query: ambil candle lebih lama dari beforeTime ──────────────
+/**
+ * TURBO MODE: Push candle langsung ke WASM tanpa lewat IndexedDB.
+ * Chart langsung muncul tanpa menunggu IDB selesai menyimpan.
+ * Data sudah harus terurut (oldest → newest).
+ */
+function pushCandlesDirectToWASM(symbol, candles) {
+    if (!isWasmReady || !candles.length) return;
+
+    logGood(`[DIRECT] ${candles.length.toLocaleString()} bars → push langsung ke WASM...`);
+    isRendering = true;
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+
+    for (let i = 0; i < candles.length; i++) {
+        const c = candles[i];
+        notifyWASM_candle(
+            c.o || c.open,  c.h || c.high,
+            c.l || c.low,   c.c || c.close,
+            c.time,         c.v || c.volume || 1
+        );
+        if (c.time > lastWasmTime) lastWasmTime = c.time;
+    }
+
+    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+    isRendering = false;
+    downloadedSymbols.add(symbol);
+
+    logGood(`[DIRECT] ✅ ${symbol}: ${candles.length.toLocaleString()} bars rendered!`);
+}
+
+/**
+ * Background IDB Save: Simpan candle ke IndexedDB tanpa blocking UI.
+ * Dipanggil SETELAH chart sudah muncul, jadi user tidak perlu menunggu.
+ * Menggunakan batch besar (5000) dan setTimeout(0) agar tidak mengganggu rendering.
+ */
+async function saveToIDBBackground(symbol, candles) {
+    if (!db || !candles.length) return;
+
+    const data = candles.map(c => ({
+        symbol,
+        time: c.time || c.t,
+        o: c.o || c.open,  h: c.h || c.high,
+        l: c.l || c.low,   c: c.c || c.close,
+        v: c.v || c.volume || 1
+    }));
+
+    const BATCH = 5000;
+    const totalBatches = Math.ceil(data.length / BATCH);
+    logInfo(`[BG-SAVE] 💾 Menyimpan ${data.length.toLocaleString()} candles ke IDB (${totalBatches} batch, background)...`);
+
+    for (let i = 0; i < data.length; i += BATCH) {
+        const chunk = data.slice(i, i + BATCH);
+        const batchNum = Math.floor(i / BATCH) + 1;
+        await new Promise((res) => {
+            const t = db.transaction([STORE], 'readwrite');
+            const s = t.objectStore(STORE);
+            chunk.forEach(item => s.put(item));
+            t.oncomplete = () => res();
+            t.onerror    = () => res();
+        });
+        logInfo(`[BG-SAVE] batch ${batchNum}/${totalBatches} done`);
+        // Yield ke main thread agar chart tetap responsif
+        await new Promise(r => setTimeout(r, 10));
+    }
+
+    logGood(`[BG-SAVE] ✅ ${data.length.toLocaleString()} candles tersimpan di IDB`);
+}
+
 async function getOlderCandlesFromDB(symbol, beforeTime, limit = 10000) {
     if (!db) return [];
     return new Promise(res => {
@@ -428,60 +354,1424 @@ async function getOlderCandlesFromDB(symbol, beforeTime, limit = 10000) {
         const req = t.objectStore(STORE).getAll(range);
         req.onsuccess = () => {
             let r = req.result || [];
-            r.sort((a, b) => b.time - a.time);  // newest-first
-            r = r.slice(0, limit);               // ambil limit terbaru dari yang lebih lama
-            r.reverse();                          // kembalikan oldest→newest untuk prepend
+            r.sort((a, b) => b.time - a.time);
+            r = r.slice(0, limit);
+            r.reverse();
             res(r);
         };
         req.onerror = () => res([]);
     });
 }
 
-// ── Prepend candles ke WASM tanpa blokir chart ─────────────────────────────
-// ── DEPRECATED: prependCandlesBackground ─────────────────────────────────────
-// V2: Tidak lagi dipakai. Semua data path sekarang pakai:
-//   clear WASM → rebuildFullFromDB (atomic push ALL dari IDB)
-// Fungsi ini tetap ada untuk backward compat tapi tidak dipanggil.
-async function prependCandlesBackground(candles) {
-    if (!candles.length) return;
-    if (!Module._wasm_begin_prepend) { logWarn('[PREPEND] wasm_begin_prepend belum ada'); return; }
-    if (window._spinnerShow) window._spinnerShow();
-    Module._wasm_begin_prepend();
-    // V2: push atomic tanpa yield (kalau masih dipanggil dari mana)
-    for (let i = 0; i < candles.length; i++) {
-        const c = candles[i];
-        Module.ccall('wasm_prepend_candle', null,
-            ['number','number','number','number','number','number'],
-            [c.o, c.h, c.l, c.c, c.time, c.v || 1]);
+// =========================================================
+// 5. REBUILD FROM DB (TIDAK BERUBAH dari V17)
+// =========================================================
+async function rebuildTabFromDB(tabId, symbol) {
+    let candles = await getAllCandlesFromDB(symbol);
+    if (!candles.length) {
+        logWarn(`[REBUILD TAB${tabId}] Tidak ada data IDB untuk ${symbol}`);
+        return;
     }
-    Module._wasm_end_prepend();
-    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
-    if (Module._wasm_sync_views_after_prepend) Module._wasm_sync_views_after_prepend();
-    if (window._spinnerHide) window._spinnerHide();
-    logGood(`[PREPEND] ✅ ${candles.length} candles prepended + HTF rebuilt`);
+    candles.sort((a, b) => a.time - b.time);
+    if (Module._wasm_clear_tab) Module._wasm_clear_tab(tabId);
+    for (const c of candles) {
+        Module.ccall('wasm_push_candle_for_tab', null,
+            ['number','number','number','number','number','number','number'],
+            [tabId, c.o, c.h, c.l, c.c, c.time, c.v || 1]);
+    }
+    if (Module._wasm_rebuild_htfs_for_tab)
+        Module.ccall('wasm_rebuild_htfs_for_tab', null, ['number'], [tabId]);
+    logGood(`[REBUILD TAB${tabId}] ✅ ${symbol}: ${candles.length} bars OK`);
 }
 
-// ── ON-DEMAND LAZY LOAD V2 ───────────────────────────────────────────────
-// Dipanggil C++ via EM_ASM saat scroll kiri mendekati ujung data.
-// V2: TIDAK pakai prepend lagi. Clear WASM → rebuild ALL dari IDB.
-// Ini menghilangkan race condition karena data selalu lengkap saat render.
-const LAZY_CHUNK = 20000;
+async function rebuildFullFromDB(symbol) {
+    if (!isWasmReady) { console.log('[REBUILD] WASM not ready'); return; }
+    if (g_rebuildInProgress) {
+        logWarn(`[REBUILD] Skipped (rebuild already in progress) for ${symbol}`);
+        return;
+    }
+    g_rebuildInProgress = true;
+
+    let candles = await getAllCandlesFromDB(symbol);
+    if (!candles.length) { logWarn(`[REBUILD] No data for ${symbol}`); g_rebuildInProgress = false; return; }
+    candles.sort((a, b) => a.time - b.time);
+
+    // 🛡️ IDB SANITIZER: Hapus candle corrupt
+    if (candles.length > 10) {
+        const recent = candles.slice(-Math.max(100, Math.floor(candles.length * 0.5)));
+        const closes = recent.map(c => c.c).sort((a, b) => a - b);
+        const median = closes[Math.floor(closes.length / 2)];
+        if (median > 0) {
+            const hiLim = median * 5.0;
+            const loLim = median * 0.2;
+            const before = candles.length;
+            const corruptTimes = [];
+            for (const c of candles) {
+                if (!(c.c >= loLim && c.c <= hiLim && c.h > 0 && c.l > 0)) {
+                    corruptTimes.push(c.time);
+                }
+            }
+            candles = candles.filter(c =>
+                c.c >= loLim && c.c <= hiLim &&
+                c.h > 0 && c.l > 0
+            );
+            const removed = before - candles.length;
+            if (removed > 0) {
+                logWarn(`[REBUILD] 🛡️ ${removed} corrupt removed (median=${median.toFixed(2)})`);
+                try {
+                    const tx = db.transaction([STORE], 'readwrite');
+                    const store = tx.objectStore(STORE);
+                    for (const t of corruptTimes) {
+                        store.delete([symbol, t]);
+                    }
+                    await new Promise((res) => { tx.oncomplete = res; tx.onerror = res; });
+                    logGood(`[REBUILD] 🗑️ ${removed} corrupt deleted from IDB`);
+                } catch (e) {
+                    console.warn('[REBUILD] Failed to delete corrupt from IDB:', e);
+                }
+            }
+        }
+    }
+
+    logGood(`[REBUILD] ${candles.length} bars → push...`);
+    isRendering = true;
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+
+    for (const c of candles) {
+        notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v);
+        if (c.time > lastWasmTime) lastWasmTime = c.time;
+    }
+
+    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+    isRendering = false;
+    downloadedSymbols.add(symbol);
+    hideLoadingOverlay();
+    logGood(`[REBUILD] ✅ ${symbol}: ${candles.length} bars OK`);
+    g_rebuildInProgress = false;
+}
+
+// =========================================================
+// 6. HYPERLIQUID REST ADAPTER (BARU)
+// =========================================================
+
+async function fetchFinnhubCandles(uiSymbol, startMs, endMs) {
+    const coin = PLATFORM.SYMBOL_MAP[uiSymbol].coin; // misal "OANDA:XAU_USD"
+    const startSec = Math.floor(startMs / 1000);
+    const endSec = Math.floor(endMs / 1000);
+    const apiKey = PLATFORM.FINNHUB_API_KEY;
+
+    if (!apiKey) {
+        logErr(`[FH-REST] API Key kosong, tidak bisa fetch history untuk ${uiSymbol}`);
+        return [];
+    }
+
+    logInfo(`[FH-REST] Fetching ${coin} (${uiSymbol}) candles: ${new Date(startMs).toISOString().slice(0,16)} → ${new Date(endMs).toISOString().slice(0,16)}`);
+
+    try {
+        const url = `https://finnhub.io/api/v1/forex/candle?symbol=${coin}&resolution=1&from=${startSec}&to=${endSec}&token=${apiKey}`;
+        const resp = await fetch(url);
+
+        if (!resp.ok) {
+            logErr(`[FH-REST] HTTP ${resp.status} for ${coin}`);
+            return [];
+        }
+
+        const data = await resp.json();
+        
+        // Finnhub mengembalikan status "no_data" jika tidak ada candle di range tsb
+        if (data.s !== "ok" || !data.t) {
+            logWarn(`[FH-REST] No data/Unexpected response for ${coin}: ${data.s}`);
+            return [];
+        }
+
+        const count = data.t.length;
+        const candles = new Array(count);
+        for (let i = 0; i < count; i++) {
+            candles[i] = {
+                time: data.t[i],          // Finnhub sudah dalam seconds
+                o: parseFloat(data.o[i]),
+                h: parseFloat(data.h[i]),
+                l: parseFloat(data.l[i]),
+                c: parseFloat(data.c[i]),
+                v: parseFloat(data.v[i]) || 1
+            };
+        }
+
+        logGood(`[FH-REST] ✅ ${coin}: ${candles.length} candles fetched`);
+        return candles;
+
+    } catch (e) {
+        logErr(`[FH-REST] Fetch error for ${coin}: ${e.message}`);
+        return [];
+    }
+}
+
+/**
+ * Fetch candle history dari Hyperliquid (atau dialihkan ke Finnhub) REST API
+ * @param {string} uiSymbol - nama UI (misal "BTCUSDT")
+ * @param {number} startMs  - Unix timestamp milliseconds (inclusive)
+ * @param {number} endMs    - Unix timestamp milliseconds (inclusive)
+ * @returns {Array} candles dalam format {time, o, h, l, c, v}
+ */
+async function fetchCandlesFromHL(uiSymbol, startMs, endMs) {
+    const provider = PLATFORM.SYMBOL_MAP[uiSymbol] ? PLATFORM.SYMBOL_MAP[uiSymbol].provider : "hyperliquid";
+
+    // ── Route ke Binance ─────────────────────────────────────
+    if (provider === "binance") {
+        // Kalau fetchBinanceCandles ada di config.js, pakai itu
+        if (typeof fetchBinanceCandles === "function") {
+            return await fetchBinanceCandles(uiSymbol, startMs, endMs);
+        }
+        // Fallback: inline fetch (kalau config.js belum loaded)
+        return await _fetchBinanceCandlesInline(uiSymbol, startMs, endMs);
+    }
+
+    // ── Route ke Forex-Poll ─────────────────────────────────
+    if (provider === "forex-poll") {
+        // Forex-poll tidak punya candle history — hanya live price via polling
+        logWarn(`[FOREX-POLL] ${uiSymbol} — no candle history (polling-only provider)`);
+        return [];
+    }
+
+    // ── Route ke Finnhub ─────────────────────────────────────
+    if (provider === "finnhub") {
+        return await fetchFinnhubCandles(uiSymbol, startMs, endMs);
+    }
+
+    // ── Default: Hyperliquid ─────────────────────────────────
+    const coin = getHLCoin(uiSymbol);
+    logInfo(`[HL-REST] Fetching ${coin} (${uiSymbol}) candles: ${new Date(startMs).toISOString().slice(0,16)} → ${new Date(endMs).toISOString().slice(0,16)}`);
+
+    try {
+        const resp = await fetch(PLATFORM.HL_REST_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                type: "candleSnapshot",
+                req: {
+                    coin: coin,
+                    interval: "1m",
+                    startTime: startMs,
+                    endTime: endMs
+                }
+            })
+        });
+
+        if (!resp.ok) {
+            logErr(`[HL-REST] HTTP ${resp.status} for ${coin}`);
+            return [];
+        }
+
+        const data = await resp.json();
+        if (!Array.isArray(data)) {
+            logWarn(`[HL-REST] Unexpected response for ${coin}`);
+            return [];
+        }
+
+        const candles = data.map(c => ({
+            time: Math.floor(c.t / 1000),   // HL pakai ms → kita pakai seconds
+            o: parseFloat(c.o),
+            h: parseFloat(c.h),
+            l: parseFloat(c.l),
+            c: parseFloat(c.c),
+            v: parseFloat(c.v) || 1
+        }));
+
+        logGood(`[HL-REST] ✅ ${coin}: ${candles.length} candles fetched`);
+        return candles;
+
+    } catch (e) {
+        logErr(`[HL-REST] Fetch error for ${coin}: ${e.message}`);
+        return [];
+    }
+}
+
+/**
+ * Inline Binance candle fetch (fallback kalau config.js fetchBinanceCandles belum loaded)
+ */
+async function _fetchBinanceCandlesInline(uiSymbol, startMs, endMs) {
+    const entry = PLATFORM.SYMBOL_MAP[uiSymbol];
+    const coin = entry ? entry.coin : uiSymbol + "USDT";
+    const interval = "1m";
+    const limit = 1500;
+    let allCandles = [];
+    let currentEnd = endMs;
+
+    logInfo(`[BN-REST] Fetching ${coin} (${uiSymbol})...`);
+
+    try {
+        while (true) {
+            const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${coin}&interval=${interval}&endTime=${currentEnd}&limit=${limit}`;
+            const resp = await fetch(url);
+            if (!resp.ok) { logErr(`[BN-REST] HTTP ${resp.status} for ${coin}`); break; }
+
+            const data = await resp.json();
+            if (!Array.isArray(data) || data.length === 0) break;
+
+            const batch = data.map(c => ({
+                time: Math.floor(c[0] / 1000),
+                o: parseFloat(c[1]), h: parseFloat(c[2]), l: parseFloat(c[3]),
+                c: parseFloat(c[4]), v: parseFloat(c[5]) || 1
+            }));
+
+            allCandles = [...batch, ...allCandles];
+            if (batch[0].time * 1000 <= startMs) break;
+            currentEnd = batch[0].time * 1000 - 1;
+            await new Promise(r => setTimeout(r, 80));
+        }
+
+        allCandles = allCandles.filter(c => c.time * 1000 >= startMs && c.time * 1000 <= endMs);
+        const seen = new Set();
+        allCandles = allCandles.filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; });
+        allCandles.sort((a, b) => a.time - b.time);
+
+        logGood(`[BN-REST] ✅ ${coin}: ${allCandles.length} candles`);
+        return allCandles;
+    } catch (e) {
+        logErr(`[BN-REST] Error: ${e.message}`);
+        return [];
+    }
+}
+
+/**
+ * Fetch historical candles dengan PAGINATION otomatis
+ * Hyperliquid limit ~5000 candle per request. Fungsi ini fetch berulang
+ * sampai tercapai targetBars atau data habis.
+ *
+ * @param {string} uiSymbol   - nama UI
+ * @param {number} targetBars - jumlah bar yang diinginkan
+ * @param {number} endMs      - waktu akhir (default: sekarang)
+ * @returns {Array} all candles sorted oldest→newest
+ */
+async function fetchHistoryPaginated(uiSymbol, targetBars, endMs = Date.now()) {
+    const PAGE_SIZE = 5000;
+    let allCandles = [];
+    let currentEnd = endMs;
+    let pages = 0;
+    const maxPages = Math.ceil(targetBars / PAGE_SIZE) + 1;
+
+    while (allCandles.length < targetBars && pages < maxPages) {
+        // Hitung start: targetBars sisa × 60 detik per bar × 1000 ms
+        const remaining = targetBars - allCandles.length;
+        const barsToFetch = Math.min(remaining, PAGE_SIZE);
+        const startMs = currentEnd - (barsToFetch * 60 * 1000);
+
+        const pct = Math.round((allCandles.length / targetBars) * 100);
+        updateProgress(allCandles.length, targetBars, "Downloading");
+
+        const batch = await fetchCandlesFromHL(uiSymbol, startMs, currentEnd);
+        if (!batch.length) {
+            logInfo(`[HL-REST] No more history for ${uiSymbol} (page ${pages+1})`);
+            break;
+        }
+
+        allCandles = [...batch, ...allCandles]; // prepend (batch lebih lama)
+        pages++;
+
+        // Geser window ke belakang
+        const oldestInBatch = batch[0].time * 1000;
+        currentEnd = oldestInBatch - 1; // -1 ms agar tidak overlap
+
+        logInfo(`[HL-REST] Page ${pages}: +${batch.length} | total: ${allCandles.length}/${targetBars}`);
+
+        // Yield sedikit agar UI tidak freeze
+        await new Promise(r => setTimeout(r, 100));
+    }
+
+    // Deduplicate by time
+    const seen = new Set();
+    allCandles = allCandles.filter(c => {
+        if (seen.has(c.time)) return false;
+        seen.add(c.time);
+        return true;
+    });
+
+    allCandles.sort((a, b) => a.time - b.time);
+    logGood(`[HL-REST] ✅ Pagination done: ${allCandles.length} unique candles (${pages} pages)`);
+    return allCandles;
+}
+
+/**
+ * Gap fill: fetch candle dari fromTime sampai sekarang
+ */
+async function fetchGapCandles(uiSymbol, fromTimeSec) {
+    const startMs = (fromTimeSec + 60) * 1000; // +60s agar tidak overlap candle terakhir
+    const endMs   = Date.now();
+    const gapMinutes = Math.floor((endMs - startMs) / 60000);
+    logInfo(`[GAP] ${uiSymbol}: fetching ${gapMinutes}m gap...`);
+    return await fetchCandlesFromHL(uiSymbol, startMs, endMs);
+}
+
+/**
+ * Lazy load: fetch candle lebih lama dari beforeTime
+ */
+async function fetchOlderCandles(uiSymbol, beforeTimeSec, limitBars) {
+    const endMs   = beforeTimeSec * 1000;
+    const startMs = endMs - (limitBars * 60 * 1000);
+    logInfo(`[LAZY] ${uiSymbol}: fetching ${limitBars} older candles...`);
+    return await fetchCandlesFromHL(uiSymbol, startMs, endMs);
+}
+
+/**
+ * Download dan parse binary candle file (.bin) dari folder data/
+ * Format MTVC: Header(12 bytes) + Body(N × 24 bytes)
+ *   Header: Magic"MTVC"(4) + Version uint32(4) + Count uint32(4)
+ *   Candle: time uint32(4) + open float32(4) + high float32(4)
+ *           + low float32(4) + close float32(4) + vol float32(4)
+ *
+ * File ini di-generate dari candles.db via export_candles_binary.py
+ * dan di-upload ke GitHub bersama project.
+ * Hanya dipakai saat user pertama kali buka (IndexedDB kosong).
+ */
+async function downloadBinaryHistory(uiSymbol) {
+    const url = `data/${uiSymbol}.bin`;
+    logInfo(`[BIN] ⬇️ Syncing ${url}...`);
+    showLoadingOverlay(`Synchronizing ${uiSymbol}...`, 5);
+
+    try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+            logWarn(`[BIN] ${url} not found (HTTP ${resp.status}) → fallback HL REST`);
+            return null;
+        }
+
+        const contentLength = resp.headers.get('content-length');
+        const totalBytes = contentLength ? parseInt(contentLength) : 0;
+
+        // Stream download dengan progress
+        let buffer;
+        if (totalBytes > 0 && resp.body && resp.body.getReader) {
+            const reader = resp.body.getReader();
+            const chunks = [];
+            let received = 0;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                received += value.length;
+                const pct = Math.round((received / totalBytes) * 40); // 0-40%
+                showLoadingOverlay(`Synchronizing ${uiSymbol}`, pct);
+            }
+            // Gabungkan chunks
+            const merged = new Uint8Array(received);
+            let pos = 0;
+            for (const chunk of chunks) {
+                merged.set(chunk, pos);
+                pos += chunk.length;
+            }
+            buffer = merged.buffer;
+        } else {
+            buffer = await resp.arrayBuffer();
+        }
+
+        const view = new DataView(buffer);
+
+        // Parse header (12 bytes)
+        if (buffer.byteLength < 12) {
+            logErr(`[BIN] File terlalu kecil: ${buffer.byteLength} bytes`);
+            return null;
+        }
+        const magic = String.fromCharCode(
+            view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)
+        );
+        if (magic !== 'MTVC') {
+            logErr(`[BIN] Invalid magic: "${magic}" (expected MTVC)`);
+            return null;
+        }
+
+        const version = view.getUint32(4, true);  // little-endian
+        const count   = view.getUint32(8, true);
+
+        logInfo(`[BIN] Format MTVC v${version} — ${count.toLocaleString()} candles`);
+
+        // Parse body
+        const HEADER  = 12;
+        const CANDLE  = 24;  // 6 × float32/uint32
+        const expectedSize = HEADER + (count * CANDLE);
+        if (buffer.byteLength < expectedSize) {
+            logErr(`[BIN] Ukuran file tidak sesuai: ${buffer.byteLength} < ${expectedSize}`);
+            return null;
+        }
+
+        showLoadingOverlay(`Processing Data...`, 45);
+
+        const candles = new Array(count);
+        for (let i = 0; i < count; i++) {
+            const off = HEADER + (i * CANDLE);
+            candles[i] = {
+                time: view.getUint32(off,      true),
+                o:    view.getFloat32(off + 4,  true),
+                h:    view.getFloat32(off + 8,  true),
+                l:    view.getFloat32(off + 12, true),
+                c:    view.getFloat32(off + 16, true),
+                v:    view.getFloat32(off + 20, true)
+            };
+        }
+
+        logGood(`[BIN] ✅ ${candles.length.toLocaleString()} candles parsed dari ${uiSymbol}.bin`);
+        return candles;
+
+    } catch (e) {
+        logErr(`[BIN] Download error: ${e.message}`);
+        return null;
+    }
+}
+
+// =========================================================
+// 7. HYPERLIQUID WEBSOCKET ADAPTER (BARU)
+// =========================================================
+
+/**
+ * Connect ke Hyperliquid WebSocket untuk live data
+ * - candle 1m stream untuk CURRENT_SYMBOL
+ * - allMids untuk Market Watch harga semua pair
+ * - trades untuk footprint (opsional)
+ */
+function connectHLWebSocket() {
+    if (hlWS && hlWS.readyState === WebSocket.OPEN) {
+        logWarn('[HL-WS] Already connected');
+        return;
+    }
+
+    logInfo('[HL-WS] Connecting to Hyperliquid...');
+    hlWS = new WebSocket(PLATFORM.HL_WS_URL);
+
+    hlWS.onopen = () => {
+        logGood('[HL-WS] ✅ Connected!');
+
+        // Subscribe allMids untuk Market Watch
+        hlWS.send(JSON.stringify({
+            method: "subscribe",
+            subscription: { type: "allMids" }
+        }));
+        logInfo('[HL-WS] Subscribed: allMids (Market Watch)');
+
+        // Subscribe candle untuk symbol aktif (jika ada)
+        if (CURRENT_SYMBOL) {
+            subscribeCandleStream(CURRENT_SYMBOL);
+        }
+    };
+
+    hlWS.onmessage = (evt) => {
+        try {
+            const msg = JSON.parse(evt.data);
+            handleHLMessage(msg);
+        } catch (e) {
+            // Ignore parse errors (e.g. pong responses)
+        }
+    };
+
+    hlWS.onerror = (e) => {
+        logErr('[HL-WS] Error');
+    };
+
+    hlWS.onclose = (e) => {
+        logWarn(`[HL-WS] Disconnected (${e.code}) → reconnect 3s`);
+        hlWS = null;
+        hlSubscribedCoin = null;
+        setTimeout(connectHLWebSocket, 3000);
+    };
+
+    // Keepalive ping setiap 30 detik
+    // HL WS tidak butuh ping eksplisit, tapi kita jaga koneksi
+}
+
+/**
+ * Subscribe candle 1m stream untuk symbol tertentu
+ */
+function subscribeCandleStream(uiSymbol) {
+    const provider = PLATFORM.SYMBOL_MAP[uiSymbol] ? PLATFORM.SYMBOL_MAP[uiSymbol].provider : "hyperliquid";
+
+    // ── Forex-Poll: tidak ada WebSocket, harga dari polling ──
+    if (provider === "forex-poll") {
+        logInfo(`[FOREX-POLL] ${uiSymbol} live via polling (no WebSocket available)`);
+        return;
+    }
+
+    // ── Binance: Combined stream sudah subscribe semua BN_SYMBOLS ──
+    // Tidak perlu subscribe individual, live data sudah mengalir
+    if (provider === "binance") {
+        logInfo(`[BN-WS] ${uiSymbol} live via combined stream (already subscribed)`);
+        return;
+    }
+
+    // ── Finnhub ──────────────────────────────────────────────────────
+    if (provider === "finnhub") {
+        if (!fhWS || fhWS.readyState !== WebSocket.OPEN) return;
+        
+        const fhCoin = PLATFORM.SYMBOL_MAP[uiSymbol].coin;
+
+        // Unsubscribe old
+        if (fhSubscribedCoin && fhSubscribedCoin !== fhCoin) {
+            fhWS.send(JSON.stringify({ type: "unsubscribe", symbol: fhSubscribedCoin }));
+            logInfo(`[FH-WS] Unsubscribed: ${fhSubscribedCoin}`);
+        }
+        
+        fhWS.send(JSON.stringify({ type: "subscribe", symbol: fhCoin }));
+        fhSubscribedCoin = fhCoin;
+        logGood(`[FH-WS] Subscribed: trades for ${fhCoin} (${uiSymbol})`);
+        return;
+    }
+
+    // ── Default: Hyperliquid ─────────────────────────────────────────
+    if (!hlWS || hlWS.readyState !== WebSocket.OPEN) return;
+
+    const coin = getHLCoin(uiSymbol);
+
+    // Unsubscribe coin lama (jika beda)
+    if (hlSubscribedCoin && hlSubscribedCoin !== coin) {
+        hlWS.send(JSON.stringify({
+            method: "unsubscribe",
+            subscription: { type: "candle", coin: hlSubscribedCoin, interval: "1m" }
+        }));
+        // Juga unsubscribe trades untuk footprint
+        hlWS.send(JSON.stringify({
+            method: "unsubscribe",
+            subscription: { type: "trades", coin: hlSubscribedCoin }
+        }));
+        logInfo(`[HL-WS] Unsubscribed: ${hlSubscribedCoin}`);
+    }
+
+    // Subscribe candle baru
+    hlWS.send(JSON.stringify({
+        method: "subscribe",
+        subscription: { type: "candle", coin: coin, interval: "1m" }
+    }));
+
+    // Subscribe trades untuk live footprint
+    hlWS.send(JSON.stringify({
+        method: "subscribe",
+        subscription: { type: "trades", coin: coin }
+    }));
+
+    hlSubscribedCoin = coin;
+    logGood(`[HL-WS] Subscribed: candle 1m + trades for ${coin} (${uiSymbol})`);
+}
+
+/**
+ * Handle pesan dari Hyperliquid WebSocket
+ */
+function handleHLMessage(msg) {
+    if (!msg.channel) return;
+
+    // ── A. CANDLE UPDATE (live bar forming / bar close) ─────────
+    if (msg.channel === "candle") {
+        handleHLCandle(msg.data);
+        return;
+    }
+
+    // ── B. ALL MIDS (harga semua pair untuk Market Watch) ───────
+    if (msg.channel === "allMids") {
+        handleHLAllMids(msg.data);
+        return;
+    }
+
+    // ── C. TRADES (footprint / order flow) ──────────────────────
+    if (msg.channel === "trades") {
+        handleHLTrades(msg.data);
+        return;
+    }
+
+    // ── D. SUBSCRIPTION ACK ────────────────────────────────────
+    if (msg.channel === "subscriptionResponse") {
+        // logInfo('[HL-WS] Subscription ack');
+        return;
+    }
+}
+
+// =========================================================
+// 8. FINNHUB WEBSOCKET ADAPTER (FOREX)
+// =========================================================
+
+function connectFinnhubWebSocket() {
+    if (!PLATFORM.FINNHUB_API_KEY || PLATFORM.FINNHUB_API_KEY === "") {
+        logWarn('[FH-WS] API Key kosong, fitur Forex dilewati.');
+        return;
+    }
+
+    if (fhWS && fhWS.readyState === WebSocket.OPEN) return;
+
+    logInfo('[FH-WS] Connecting to Finnhub...');
+    fhWS = new WebSocket(`wss://ws.finnhub.io?token=${PLATFORM.FINNHUB_API_KEY}`);
+
+    fhWS.onopen = () => {
+        logGood('[FH-WS] ✅ Connected!');
+        
+        // Auto-subscribe ke semua pair Forex untuk ngisi Market Watch
+        for (const [uiSym, info] of Object.entries(PLATFORM.SYMBOL_MAP)) {
+            if (info.provider === 'finnhub') {
+                fhWS.send(JSON.stringify({ type: "subscribe", symbol: info.coin }));
+                logInfo(`[FH-WS] Subscribed Market Watch: ${info.coin}`);
+            }
+        }
+        
+        // Jika symbol aktif saat ini adalah forex, jadikan fokus
+        if (CURRENT_SYMBOL && PLATFORM.SYMBOL_MAP[CURRENT_SYMBOL]?.provider === "finnhub") {
+            fhSubscribedCoin = PLATFORM.SYMBOL_MAP[CURRENT_SYMBOL].coin;
+        }
+    };
+
+    fhWS.onmessage = (evt) => {
+        try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === "trade" && msg.data) {
+                msg.data.forEach(trade => handleFinnhubTrade(trade));
+            }
+        } catch (e) {}
+    };
+
+    fhWS.onclose = () => {
+        logWarn('[FH-WS] Disconnected → reconnect 5s');
+        fhWS = null;
+        setTimeout(connectFinnhubWebSocket, 5000);
+    };
+}
+
+// Pseudo-candle builder dari trade (karena Finnhub free tidak kasih WSS candle)
+let fhCurrentCandle = {};
+
+function handleFinnhubTrade(trade) {
+    // trade: { p: price, s: symbol, t: ms_timestamp, v: volume }
+    const fhCoin = trade.s;
+    const uiSymbol = Object.keys(PLATFORM.SYMBOL_MAP).find(k => PLATFORM.SYMBOL_MAP[k].coin === fhCoin) || fhCoin;
+    
+    const price = trade.p;
+    const vol = trade.v;
+    const timeMs = trade.t;
+    const openTimeSec = Math.floor(timeMs / 60000) * 60; // Dibulatkan ke menit terdekat (1m)
+
+    // Push tick untuk Market Watch (berkedip)
+    sendTickToWasm(uiSymbol, price, vol, Math.floor(timeMs / 1000));
+
+    // Jika ini bukan simbol utama chart, stop di sini (hanya update market watch)
+    if (uiSymbol !== CURRENT_SYMBOL || isDownloading) return;
+
+    // --- Build Pseudo 1m Candle untuk Chart Utama ---
+    if (!fhCurrentCandle[uiSymbol] || fhCurrentCandle[uiSymbol].time !== openTimeSec) {
+        // Bar baru terbentuk, siram bar lama ke IDB
+        if (fhCurrentCandle[uiSymbol]) {
+            addToBuffer(uiSymbol, [fhCurrentCandle[uiSymbol]]);
+            flushBuffer();
+        }
+        // Inisialisasi bar baru
+        fhCurrentCandle[uiSymbol] = {
+            time: openTimeSec,
+            o: price, h: price, l: price, c: price, v: vol
+        };
+    } else {
+        // Update bar berjalan
+        const c = fhCurrentCandle[uiSymbol];
+        c.h = Math.max(c.h, price);
+        c.l = Math.min(c.l, price);
+        c.c = price;
+        c.v += vol;
+    }
+
+    // Gambar ke Chart WASM
+    const c = fhCurrentCandle[uiSymbol];
+    notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v);
+}
+
+// =========================================================
+// 9. BINANCE FUTURES WEBSOCKET (FOREX / GOLD)
+// =========================================================
+
+// Debug counters — throttled log biar console tidak spam
+let _bnKlineCount = 0, _bnBookCount = 0, _bnTradeCount = 0;
+let _bnLastLogSec = 0;
+let _bnFirstMsgLogged = false;
+// Raw stream type tracking — untuk debug kline=0
+let _bnStreamTypes = {};  // streamType → count
+
+function _bnDebugLog() {
+    const now = Math.floor(Date.now() / 1000);
+    if (now - _bnLastLogSec >= 5) {  // log setiap 5 detik
+        if (_bnKlineCount + _bnBookCount + _bnTradeCount > 0) {
+            logInfo(`[BN-WS] 📊 5s stats: kline=${_bnKlineCount} bookTicker=${_bnBookCount} aggTrade=${_bnTradeCount}`);
+        }
+        // Log raw stream types jika ada mismatch
+        const types = Object.keys(_bnStreamTypes);
+        if (types.length > 0) {
+            const summary = types.map(t => `${t}=${_bnStreamTypes[t]}`).join(' ');
+            logInfo(`[BN-WS] 📡 raw streams: ${summary}`);
+        }
+        _bnKlineCount = 0; _bnBookCount = 0; _bnTradeCount = 0;
+        _bnStreamTypes = {};
+        _bnLastLogSec = now;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Binance ExchangeInfo — Validasi Symbol
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Fetch Binance Futures exchangeInfo untuk validasi symbol
+ * Hanya symbol yang ADA di Binance Futures yang bisa di-subscribe
+ * Symbol yang TIDAK ADA (EURUSDT, GBPUSDT) → route ke forex-poll
+ *
+ * @returns {Set} Set of valid symbol names (e.g., "XAUUSDT", "BTCUSDT")
+ */
+async function fetchValidBinanceSymbols() {
+    try {
+        const restUrl = (typeof PLATFORM !== 'undefined' && PLATFORM.BN_REST_URL)
+            ? PLATFORM.BN_REST_URL : "https://fapi.binance.com/fapi/v1";
+        const resp = await fetch(`${restUrl}/exchangeInfo`);
+        if (!resp.ok) {
+            logWarn(`[BN] exchangeInfo HTTP ${resp.status}, fallback: assume all valid`);
+            return null;  // null = don't know, assume all valid
+        }
+        const data = await resp.json();
+        const validSet = new Set(data.symbols.map(s => s.symbol));
+        logGood(`[BN] exchangeInfo: ${validSet.size} symbols available`);
+        return validSet;
+    } catch (e) {
+        logWarn(`[BN] exchangeInfo fetch failed: ${e.message}, fallback: assume all valid`);
+        return null;
+    }
+}
+
+/**
+ * Filter BN_SYMBOLS berdasarkan exchangeInfo
+ * Pisahkan mana yang valid di Binance, mana yang tidak
+ * Symbol yang tidak valid → route ke forex-poll
+ */
+async function validateBinanceSymbols() {
+    const bnSymbols = (typeof BN_SYMBOLS !== 'undefined') ? BN_SYMBOLS : [];
+    if (bnSymbols.length === 0) {
+        bnValidUISymbols = [];
+        bnInvalidUISymbols = [];
+        forexPollSymbols = [];
+        return;
+    }
+
+    const validSet = await fetchValidBinanceSymbols();
+
+    if (!validSet) {
+        // Tidak bisa fetch exchangeInfo → assume semua valid
+        bnValidUISymbols = [...bnSymbols];
+        bnInvalidUISymbols = [];
+        forexPollSymbols = [];
+        return;
+    }
+
+    bnValidSymbols = validSet;
+    bnValidUISymbols = [];
+    bnInvalidUISymbols = [];
+
+    bnSymbols.forEach(ui => {
+        const coin = (typeof getBinanceCoin === 'function')
+            ? getBinanceCoin(ui)
+            : (PLATFORM.SYMBOL_MAP[ui]?.coin || ui + "USDT");
+
+        if (validSet.has(coin)) {
+            bnValidUISymbols.push(ui);
+        } else {
+            bnInvalidUISymbols.push(ui);
+            logWarn(`[BN] ⚠️ ${ui} (${coin}) NOT found on Binance Futures → forex-poll`);
+        }
+    });
+
+    logGood(`[BN] Valid: ${bnValidUISymbols.join(', ') || 'none'}`);
+    if (bnInvalidUISymbols.length > 0) {
+        logWarn(`[BN] Invalid (will poll): ${bnInvalidUISymbols.join(', ')}`);
+        forexPollSymbols = [...bnInvalidUISymbols];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Forex Polling — EURUSD/GBPUSD live price dari free API
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Poll harga forex dari free API
+ * API yang digunakan:
+ *   - Frankfurter (ECB rates): https://api.frankfurter.app/latest?from=USD&to=EUR,GBP
+ *   - Gratis, tanpa API key, update ~daily (ECB)
+ *   - Untuk tick-by-tick yang lebih cepat, perlu provider berbayar
+ *
+ * Alternatif yang lebih real-time (butuh API key):
+ *   - Twelve Data: https://twelvedata.com (WebSocket forex, free tier 8 hits/min)
+ *   - Finnhub: https://finnhub.io (WebSocket forex, free tier)
+ */
+async function pollForexPrices() {
+    if (forexPollSymbols.length === 0) return;
+
+    try {
+        // Frankfurter API — gratis, tanpa API key
+        // Returns: { rates: { EUR: 0.9234, GBP: 0.7891 }, base: "USD" }
+        const currencies = forexPollSymbols.map(ui => {
+            // EURUSD → EUR, GBPUSD → GBP, XAUUSD → XAU (tidak supported)
+            if (ui === "EURUSD") return "EUR";
+            if (ui === "GBPUSD") return "GBP";
+            if (ui === "JPYUSD") return "JPY";
+            if (ui === "AUDUSD") return "AUD";
+            if (ui === "NZDUSD") return "NZZ";
+            if (ui === "USDCAD") return "CAD";
+            if (ui === "USDCNY") return "CNY";
+            return null;
+        }).filter(Boolean);
+
+        if (currencies.length === 0) return;
+
+        const resp = await fetch(`https://api.frankfurter.app/latest?from=USD&to=${currencies.join(',')}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const timeSec = Math.floor(Date.now() / 1000);
+
+        // Map rates ke UI symbols
+        forexPollSymbols.forEach(ui => {
+            let rate = null;
+            if (ui === "EURUSD" && data.rates.EUR) rate = data.rates.EUR;
+            else if (ui === "GBPUSD" && data.rates.GBP) rate = data.rates.GBP;
+            else if (ui === "JPYUSD" && data.rates.JPY) rate = 1 / data.rates.JPY; // inverted
+            else if (ui === "AUDUSD" && data.rates.AUD) rate = 1 / data.rates.AUD;
+            else if (ui === "NZDUSD" && data.rates.NZD) rate = 1 / data.rates.NZD;
+            else if (ui === "USDCAD" && data.rates.CAD) rate = data.rates.CAD;
+            else if (ui === "USDCNY" && data.rates.CNY) rate = data.rates.CNY;
+
+            if (rate && rate > 0) {
+                // Push ke Market Watch
+                sendTickToWasm(ui, rate, 0, timeSec);
+            }
+        });
+
+    } catch (e) {
+        // Silent fail — polling, akan coba lagi next interval
+    }
+}
+
+/**
+ * Start forex polling interval
+ * @param {number} intervalMs — polling interval (default 10000 = 10 detik)
+ */
+function startForexPolling(intervalMs = 10000) {
+    if (forexPollInterval) clearInterval(forexPollInterval);
+    if (forexPollSymbols.length === 0) return;
+
+    logInfo(`[FOREX-POLL] Starting poll for: ${forexPollSymbols.join(', ')} every ${intervalMs/1000}s`);
+
+    // Poll pertama langsung
+    pollForexPrices();
+
+    // Lalu interval
+    forexPollInterval = setInterval(pollForexPrices, intervalMs);
+}
+
+/**
+ * Connect ke Binance Futures WebSocket — Combined Stream
+ * - Hanya subscribe symbol yang VALID (dari exchangeInfo)
+ * - Symbol yang tidak valid → sudah di-route ke forex-poll
+ * - Format: wss://fstream.binance.com/stream?streams=xauusdt@kline_1m/xauusdt@bookTicker/...
+ * - TIDAK BUTUH API KEY
+ *
+ * Data yang diterima:
+ *   - @kline_1m   → live candle forming + bar close → push ke WASM chart + IDB
+ *   - @bookTicker → best bid/ask tick-by-tick → Market Watch live price
+ *   - @aggTrade   → individual trades → footprint + candle tick update
+ */
+async function connectBinanceWebSocket() {
+    if (bnWS && (bnWS.readyState === WebSocket.OPEN || bnWS.readyState === WebSocket.CONNECTING)) {
+        logWarn('[BN-WS] Already connected / connecting');
+        return;
+    }
+
+    // ── VALIDASI SYMBOL DULU ──────────────────────────────────
+    // Cek exchangeInfo untuk filter symbol yang benar-benar ada
+    await validateBinanceSymbols();
+
+    // Hanya subscribe symbol yang valid di Binance Futures
+    const symbolsToSubscribe = bnValidUISymbols;
+    if (symbolsToSubscribe.length === 0) {
+        logWarn('[BN-WS] No valid Binance symbols found — skipping Binance WS');
+        // Tapi tetap start forex polling untuk invalid symbols
+        startForexPolling();
+        return;
+    }
+
+    // Build combined stream URL — TIGA stream per symbol:
+    //   1. @kline_1m   → untuk candle chart (update ~100ms, bar close ke IDB)
+    //   2. @bookTicker → untuk live price tick-by-tick di Market Watch
+    //   3. @aggTrade   → individual trades untuk footprint + candle tick
+    const streams = [];
+    symbolsToSubscribe.forEach(ui => {
+        const coin = (typeof getBinanceCoin === 'function') ? getBinanceCoin(ui) : (PLATFORM.SYMBOL_MAP[ui]?.coin || ui + "USDT");
+        const sym = coin.toLowerCase();
+        streams.push(`${sym}@kline_1m`);    // candle stream
+        streams.push(`${sym}@bookTicker`);   // tick-by-tick live price (Market Watch)
+        streams.push(`${sym}@aggTrade`);     // individual trades (footprint + candle tick)
+    });
+
+    const streamUrl = `wss://fstream.binance.com/stream?streams=${streams.join("/")}`;
+
+    logInfo(`[BN-WS] Connecting to Binance Futures...`);
+    logInfo(`[BN-WS] ${symbolsToSubscribe.length} valid symbols × 3 streams = ${streams.length} total`);
+    logInfo(`[BN-WS] Subscribing: ${symbolsToSubscribe.map(ui => getBinanceCoin(ui)).join(', ')}`);
+    bnWS = new WebSocket(streamUrl);
+
+    bnWS.onopen = () => {
+        logGood(`[BN-WS] ✅ Connected! Streams: ${streams.length} (kline + bookTicker + aggTrade)`);
+        logGood(`[BN-WS] Symbols: ${symbolsToSubscribe.join(', ')}`);
+        bnSubscribedStreams = new Set(streams);
+    };
+
+    bnWS.onmessage = (evt) => {
+        try {
+            const msg = JSON.parse(evt.data);
+            // ── RAW DEBUG: Track semua stream types ──
+            if (msg.stream) {
+                const streamType = msg.stream.split('@')[1] || 'unknown';
+                _bnStreamTypes[streamType] = (_bnStreamTypes[streamType] || 0) + 1;
+            }
+            // ── FIRST MESSAGE DEBUG ──
+            if (!_bnFirstMsgLogged) {
+                _bnFirstMsgLogged = true;
+                logInfo(`[BN-WS] 📨 First message: stream="${msg.stream || 'N/A'}" hasData=${!!msg.data} keys=${Object.keys(msg).join(',')}`);
+            }
+            handleBinanceMessage(msg);
+        } catch (e) {
+            // Ignore parse errors
+        }
+    };
+
+    bnWS.onerror = (e) => {
+        logErr('[BN-WS] Error');
+    };
+
+    bnWS.onclose = (e) => {
+        logWarn(`[BN-WS] Disconnected (${e.code}) → reconnect 3s`);
+        bnWS = null;
+        bnSubscribedStreams.clear();
+        setTimeout(connectBinanceWebSocket, 3000);
+    };
+
+    // ── START FOREX POLLING untuk symbol yang tidak ada di Binance ──
+    startForexPolling();
+}
+
+/**
+ * Handle pesan dari Binance Combined WebSocket
+ * Format combined stream:
+ *   { stream: "xauusdt@kline_1m",   data: { e: "kline", ... } }
+ *   { stream: "xauusdt@bookTicker", data: { e: "bookTicker", ... } }
+ *   { stream: "xauusdt@aggTrade",   data: { e: "aggTrade", ... } }
+ */
+function handleBinanceMessage(msg) {
+    // Combined stream format
+    if (!msg.stream || !msg.data) {
+        // Bisa jadi connection result atau error — log sekali untuk debug
+        if (msg.error) {
+            logErr(`[BN-WS] Binance error: ${JSON.stringify(msg.error)}`);
+        }
+        return;
+    }
+
+    // Route berdasarkan stream type
+    if (msg.stream.includes("@kline_")) {
+        _bnKlineCount++;
+        handleBinanceCandle(msg.data);
+    } else if (msg.stream.includes("@bookTicker")) {
+        _bnBookCount++;
+        handleBinanceBookTicker(msg.data);
+    } else if (msg.stream.includes("@aggTrade")) {
+        _bnTradeCount++;
+        handleBinanceAggTrade(msg.data);
+    }
+    _bnDebugLog();
+}
+
+/**
+ * Handle bookTicker dari Binance WS — TICK-BY-TICK live price
+ * Format:
+ *   { e: "bookTicker", u: updateId, E: eventTime,
+ *     s: "XAUUSDT", b: "2650.50", B: "12.5", a: "2650.60", A: "8.3" }
+ *   b = best bid price, B = best bid qty
+ *   a = best ask price, A = best ask qty
+ *
+ * Ini yang bikin Market Watch XAUUSD/GBPUSD berkedip real-time!
+ */
+function handleBinanceBookTicker(data) {
+    if (!data || !data.s) return;
+
+    const bnSymbol = data.s;                    // "XAUUSDT"
+    const uiSymbol = getUISymbol(bnSymbol);      // "XAUUSD"
+    if (!uiSymbol) return;
+
+    // Mid price = (best bid + best ask) / 2
+    const bestBid = parseFloat(data.b);
+    const bestAsk = parseFloat(data.a);
+    const midPrice = (bestBid + bestAsk) / 2;
+    const timeSec = Math.floor(Date.now() / 1000);
+
+    // Push ke Market Watch — ini yang bikin harga berkedip!
+    sendTickToWasm(uiSymbol, midPrice, 0, timeSec);
+}
+
+/**
+ * Handle aggTrade dari Binance WS — INDIVIDUAL TRADES
+ * Format:
+ *   { e: "aggTrade", E: eventTime, s: "XAUUSDT",
+ *     p: "2650.55", q: "0.5", T: tradeTime, m: isBuyerMaker }
+ *   p = price, q = quantity, m = true if seller is maker
+ *
+ * Dipakai untuk:
+ *   1. Push footprint ke WASM (buy/sell volume per price level)
+ *   2. Update candle tick-by-tick (lebih responsif dari kline 100ms)
+ *   3. Market Watch live price (backup bookTicker)
+ */
+function handleBinanceAggTrade(data) {
+    if (!data || !data.s) return;
+
+    const bnSymbol = data.s;                    // "XAUUSDT"
+    const uiSymbol = getUISymbol(bnSymbol);      // "XAUUSD"
+    if (!uiSymbol) return;
+
+    const price = parseFloat(data.p);
+    const qty = parseFloat(data.q);
+    const timeMs = data.T;
+    const timeSec = Math.floor(timeMs / 1000);
+    const isSell = data.m === true;   // isBuyerMaker = true → sell trade
+
+    // ── 1. Push footprint ke WASM (buy_vol, sell_vol per price) ──
+    if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
+        const buyVol  = isSell ? 0 : qty;
+        const sellVol = isSell ? qty : 0;
+        notifyWASM_footprint(uiSymbol, timeSec, price, buyVol, sellVol, 0);
+    }
+
+    // ── 2. Push tick ke Market Watch ──
+    sendTickToWasm(uiSymbol, price, qty, timeSec);
+}
+
+// Track last candle time per BN symbol (untuk deteksi bar close)
+let bnLastCandleTime = {};
+
+/**
+ * Handle candle update dari Binance WS
+ * Format kline data:
+ *   { e: "kline", E: eventTime, s: "XAUUSDT", k: { t, T, s, i, o, h, l, c, v, x... } }
+ *   k.x = is this kline closed? (boolean)
+ *
+ * Binance @kline_1m update setiap ~100ms (jauh lebih sering dari HL)
+ * → candle chart XAUUSD update real-time sama kayak BTC!
+ */
+function handleBinanceCandle(data) {
+    if (!data || !data.k) return;
+
+    const k = data.k;
+    const bnSymbol = k.s;                    // "XAUUSDT"
+    const uiSymbol = getUISymbol(bnSymbol);   // "XAUUSD"
+    if (!uiSymbol) return;
+
+    const openTime = Math.floor(k.t / 1000);  // ms → seconds
+    const o = parseFloat(k.o);
+    const h = parseFloat(k.h);
+    const l = parseFloat(k.l);
+    const c = parseFloat(k.c);
+    const v = parseFloat(k.v) || 1;
+    const isBarClosed = k.x === true;
+
+    // Deteksi BAR CLOSE
+    const prevTime = bnLastCandleTime[bnSymbol];
+    const isNewBar = (prevTime !== undefined && openTime !== prevTime);
+
+    if (isNewBar && prevTime) {
+        // Bar sebelumnya sudah close — flush buffer ke IDB
+        flushBuffer();
+    }
+    bnLastCandleTime[bnSymbol] = openTime;
+
+    // Buffer ke IDB (simpan candle yang sudah close)
+    if (downloadedSymbols.has(uiSymbol)) {
+        if (isBarClosed) {
+            addToBuffer(uiSymbol, [{ time: openTime, o, h, l, c, v }]);
+        }
+    }
+
+    // Push ke chart utama (WASM) — candle forming tick-by-tick + bar close
+    // Binance @kline_1m update ~100ms → candle XAUUSD bergerak real-time!
+    if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
+        notifyWASM_candle(o, h, l, c, openTime, v);
+        if (openTime > lastWasmTime) lastWasmTime = openTime;
+    }
+}
+
+/**
+ * Handle candle update dari HL WS
+ * Format: { s: "BTC", i: "1m", t: openMs, T: closeMs, o, h, l, c, v, n }
+ */
+function handleHLCandle(data) {
+    if (!data || !data.s) return;
+
+    const hlCoin   = data.s;
+    const uiSymbol = getUISymbol(hlCoin);
+    const openTime = Math.floor(data.t / 1000); // ms → seconds
+    const price    = parseFloat(data.c);
+    const vol      = parseFloat(data.v) || 1;
+
+    // Deteksi BAR CLOSE: kalau openTime berubah, candle sebelumnya sudah close
+    const prevTime = hlLastCandleTime[hlCoin];
+    const isNewBar = (prevTime !== undefined && openTime !== prevTime);
+
+    if (isNewBar && prevTime) {
+        // Bar sebelumnya sudah close — simpan ke IDB
+        // (data bar close sudah di-push ke WASM saat update terakhir)
+        // Flush buffer agar masuk IDB
+        flushBuffer();
+    }
+
+    hlLastCandleTime[hlCoin] = openTime;
+
+    const o = parseFloat(data.o);
+    const h = parseFloat(data.h);
+    const l = parseFloat(data.l);
+    const c = parseFloat(data.c);
+    const v = parseFloat(data.v) || 1;
+
+    // Push tick ke semua symbol (Market Watch + tab non-primary)
+    sendTickToWasm(uiSymbol, c, v, openTime);
+
+    // Buffer untuk IDB (hanya symbol yang pernah dibuka)
+    if (downloadedSymbols.has(uiSymbol)) {
+        addToBuffer(uiSymbol, [{ time: openTime, o, h, l, c, v }]);
+    }
+
+    // Push candle ke chart (hanya CURRENT_SYMBOL)
+    if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
+        notifyWASM_candle(o, h, l, c, openTime, v);
+        if (openTime > lastWasmTime) lastWasmTime = openTime;
+    } else if (downloadedSymbols.has(uiSymbol) && !isDownloading) {
+        // Non-primary tab
+        if (Module._wasm_push_candle_for_symbol) {
+            Module.ccall('wasm_push_candle_for_symbol', null,
+                ['string','number','number','number','number','number','number'],
+                [uiSymbol, o, h, l, c, openTime, v]);
+        }
+    }
+}
+
+/**
+ * Handle allMids — update harga semua pair untuk Market Watch
+ * Format: { mids: { "BTC": "70050.0", "ETH": "3800.0", ... } }
+ */
+function handleHLAllMids(data) {
+    if (!data || !data.mids) return;
+
+    for (const [hlCoin, priceStr] of Object.entries(data.mids)) {
+        const uiSymbol = getUISymbol(hlCoin);
+        if (!uiSymbol || !PLATFORM.SYMBOL_MAP[uiSymbol]) continue;
+
+        const price = parseFloat(priceStr);
+        if (price <= 0 || isNaN(price)) continue;
+
+        // Kirim ke WASM sebagai tick (untuk Market Watch panel)
+        sendTickToWasm(uiSymbol, price, 1, Math.floor(Date.now() / 1000));
+    }
+}
+
+/**
+ * Handle trades stream — untuk live footprint
+ * Format: [{ coin, side, px, sz, time, ... }, ...]
+ */
+function handleHLTrades(dataArray) {
+    if (!Array.isArray(dataArray)) return;
+
+    for (const trade of dataArray) {
+        if (!trade.coin) continue;
+
+        const uiSymbol = getUISymbol(trade.coin);
+        if (!downloadedSymbols.has(uiSymbol)) continue;
+
+        const price   = parseFloat(trade.px);
+        const size    = parseFloat(trade.sz);
+        const isBuy   = trade.side === "B";
+        const barTime = Math.floor((trade.time || Date.now()) / 1000);
+        // Round down ke menit (bar time M1)
+        const barTimeM1 = barTime - (barTime % 60);
+
+        const buyVol  = isBuy  ? size * price : 0;
+        const sellVol = !isBuy ? size * price : 0;
+
+        notifyWASM_footprint(uiSymbol, barTimeM1, price, buyVol, sellVol);
+    }
+}
+
+// =========================================================
+// 8. SWITCH PAIR (SetActiveSymbol)
+// =========================================================
+window.SetActiveSymbol = async function(newSym) {
+    if (isDownloading) {
+        logWarn(`[UI] Still loading ${CURRENT_SYMBOL}, queued: ${newSym}`);
+        pendingSymbolSwitch = newSym;
+        return;
+    }
+
+    if (CURRENT_SYMBOL && CURRENT_SYMBOL === newSym && isWasmReady) return;
+
+    logInfo(`[UI] Switching: ${CURRENT_SYMBOL} → ${newSym}`);
+    await flushBuffer();
+
+    const oldSym = CURRENT_SYMBOL;
+    CURRENT_SYMBOL = newSym;
+    lastWasmTime   = 0;
+    g_noMoreHistory.delete(newSym);
+
+    if (oldSym && oldSym !== newSym && window.clearFPForSymbol) {
+        window.clearFPForSymbol(oldSym);
+    }
+    g_lazyLoadInProgress = false;
+    g_initialLoadDone = false;
+
+    g_tabSymbolMap.set(0, newSym);
+    resetTabLazy(0);
+
+    showLoadingOverlay(`Switching to ${newSym}...`, 0);
+
+    if (Module && Module._wasm_clear_chart) {
+        Module._wasm_clear_chart();
+        logInfo(`[CHART] GPU + candles cleared for ${oldSym} → ${newSym}`);
+    }
+
+    await new Promise(r => setTimeout(r, 16));
+
+    // Subscribe ke HL WS untuk symbol baru
+    subscribeCandleStream(newSym);
+
+    // Cek IDB cache
+    const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
+    const MIN = 500;
+
+    if (existing.length >= MIN) {
+        logGood(`[CACHE HIT] ${CURRENT_SYMBOL}: ${existing.length} bars`);
+
+        // Gap fill langsung via fetch (bukan wsSend!)
+        const latestTime = existing.reduce((max, c) => c.time > max ? c.time : max, 0);
+        const nowEpoch   = Math.floor(Date.now() / 1000);
+        const gapSeconds = nowEpoch - latestTime;
+        const gapMinutes = Math.floor(gapSeconds / 60);
+
+        if (gapSeconds > 30) {
+            logWarn(`[GAP] ${gapMinutes}m gap → fetch dari HL REST`);
+            showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (${gapMinutes}m gap)...`, 0);
+
+            const gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestTime);
+            if (gapCandles.length > 0) {
+                addToBuffer(CURRENT_SYMBOL, gapCandles);
+                await flushBuffer();
+                logGood(`[GAP] ✅ +${gapCandles.length} candles saved to IDB`);
+            }
+        } else {
+            logInfo(`[GAP] IDB fresh (gap ${gapSeconds}s) → langsung render`);
+        }
+
+        showLoadingOverlay(`Loading ${CURRENT_SYMBOL} from cache`, 0);
+        await rebuildFullFromDB(CURRENT_SYMBOL);
+        hideLoadingOverlay();
+
+        g_initialLoadDone = true;
+        logInfo(`[INIT] Initial load selesai — lazy diizinkan`);
+
+    } else {
+        // CACHE MISS → coba download binary dulu, fallback HL REST
+        logWarn(`[CACHE MISS] ${CURRENT_SYMBOL} → sync...`);
+        showLoadingOverlay(`Synchronizing ${CURRENT_SYMBOL}...`, 0);
+        isDownloading = true;
+
+        // ═══════════════════════════════════════════════════════════
+        // TAHAP 1: Coba download binary file (.bin) dari folder data/
+        // ═══════════════════════════════════════════════════════════
+        let candles = await downloadBinaryHistory(CURRENT_SYMBOL);
+        let usedBinary = false;
+        let allCandles = [];  // semua candle (binary + gap) untuk IDB save
+
+        if (candles && candles.length > 0) {
+            usedBinary = true;
+            allCandles = [...candles];
+
+            // ═══════════════════════════════════════════════════════
+            // TAHAP 2: Gap fill — binary mungkin sudah lama,
+            //   ambil candle terbaru dari Hyperliquid REST
+            // ═══════════════════════════════════════════════════════
+            const latestBinTime = candles[candles.length - 1].time;
+            const nowEpoch = Math.floor(Date.now() / 1000);
+            const gapSec = nowEpoch - latestBinTime;
+            const gapMin = Math.floor(gapSec / 60);
+
+            if (gapSec > 60) {
+                logInfo(`[BIN-GAP] ${gapMin}m gap → fill dari HL REST`);
+                showLoadingOverlay(`Synchronizing ${CURRENT_SYMBOL}`, 60);
+
+                let gapCandles;
+                if (gapMin > 4500) {
+                    gapCandles = await fetchHistoryPaginated(CURRENT_SYMBOL, gapMin);
+                } else {
+                    gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestBinTime);
+                }
+
+                if (gapCandles && gapCandles.length > 0) {
+                    allCandles = [...candles, ...gapCandles];
+                    logGood(`[BIN-GAP] ✅ +${gapCandles.length.toLocaleString()} candles terbaru dari HL`);
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════
+            // TURBO: Push LANGSUNG ke WASM → chart muncul INSTAN!
+            //   Tidak perlu simpan ke IDB dulu!
+            // ═══════════════════════════════════════════════════════
+            showLoadingOverlay(`Completing Sync...`, 80);
+            pushCandlesDirectToWASM(CURRENT_SYMBOL, allCandles);
+            hideLoadingOverlay();
+
+            // Chart sudah muncul! ✅ Sekarang simpan ke IDB di background
+            // User sudah bisa scroll/zoom chart sementara IDB menyimpan
+            logInfo(`[TURBO] Chart sudah tampil! Menyimpan ke IDB di background...`);
+            saveToIDBBackground(CURRENT_SYMBOL, allCandles).then(() => {
+                logGood(`[TURBO] ✅ IDB background save selesai — lazy load siap!`);
+            });
+
+        } else {
+            // ═══════════════════════════════════════════════════════
+            // FALLBACK: Binary tidak ada (404) → fetch dari HL REST
+            //   (alur lama, tetap pakai IDB karena data kecil)
+            // ═══════════════════════════════════════════════════════
+            logWarn(`[FALLBACK] Binary tidak tersedia → fetch ${PLATFORM.HISTORY_BARS} candles dari Hyperliquid REST`);
+            candles = await fetchHistoryPaginated(CURRENT_SYMBOL, PLATFORM.HISTORY_BARS);
+            if (candles && candles.length > 0) {
+                updateProgress(candles.length, candles.length, "Saving");
+                addToBuffer(CURRENT_SYMBOL, candles);
+                await flushBuffer();
+                await rebuildFullFromDB(CURRENT_SYMBOL);
+            } else {
+                logErr(`[DOWNLOAD] Tidak ada data untuk ${CURRENT_SYMBOL}`);
+            }
+            hideLoadingOverlay();
+        }
+
+        isDownloading = false;
+        g_initialLoadDone = true;
+
+        const source = usedBinary ? 'TURBO binary + HL gap' : 'HL REST';
+        logGood(`✅ ${CURRENT_SYMBOL} fully loaded! (source: ${source})`);
+
+        if (pendingSymbolSwitch) {
+            const next = pendingSymbolSwitch;
+            pendingSymbolSwitch = null;
+            setTimeout(() => window.SetActiveSymbol(next), 300);
+        }
+    }
+};
+
+// =========================================================
+// 9. LAZY LOAD (scroll kiri = fetch lebih lama)
+// =========================================================
+const LAZY_CHUNK = PLATFORM.LAZY_CHUNK || 5000;
 let g_lazyLoadInProgress = false;
-let g_noMoreHistory      = new Set(); // 🔥 V2: per-symbol tracking
+let g_noMoreHistory      = new Set();
 
-// =========================================================
-// 🔥 PER-TAB LAZY STATE (V3)
-// Setiap tab punya state sendiri → tidak rebutan dengan tab lain
-// =========================================================
-const g_tabLazy      = new Map(); // tabId → { inProgress, noMoreHistory }
-const g_tabSymbolMap = new Map(); // tabId → symbol (diisi saat LoadTabSymbol)
-
-// 🔥 FIX: Server tidak echo tab_id di gap_data response
-// Kita track sendiri: symbol → tabId yang sedang menunggu gap
-// Saat gap_data datang, lookup tabId dari symbol ini
-const g_pendingTabGap  = new Map(); // symbol → tabId (request_gap / request_sync pending)
-let   g_tabDownloadBuf = new Map(); // tabId → { sym, candles[] } — akumulasi multi-chunk history untuk tab
-const g_pendingTabLazy = new Map(); // symbol → tabId (request_candles lazy pending)
+// Per-tab lazy state
+const g_tabLazy      = new Map();
+const g_tabSymbolMap = new Map();
 
 function getTabLazy(tabId) {
     if (!g_tabLazy.has(tabId)) {
@@ -497,34 +1787,21 @@ function resetTabLazy(tabId) {
 window.onNearLeftEdge = async function(oldestTime) {
     if (g_lazyLoadInProgress) return;
     if (g_noMoreHistory.has(CURRENT_SYMBOL)) return;
-
-    // 🔒 Block lazy selama initial load (SetActiveSymbol belum selesai gap fill)
-    // Ini mencegah lazy ikut rebuild saat startup — penyebab double/triple rebuild
     if (!g_initialLoadDone) {
         logInfo(`[LAZY] ${CURRENT_SYMBOL}: initial load belum selesai, skip`);
-        return;
-    }
-
-    // 🔒 Block lazy selama gap-prefill berjalan
-    // g_prefillResolve != null = sedang await server response untuk gap fill
-    // Kalau lazy jalan sekarang → double rebuild (lazy rebuild + prefill rebuild)
-    if (g_prefillResolve) {
-        logInfo(`[LAZY] ${CURRENT_SYMBOL}: gap-prefill aktif, skip (cegah double rebuild)`);
         return;
     }
 
     g_lazyLoadInProgress = true;
     logInfo(`[LAZY] ${CURRENT_SYMBOL} oldest: ${new Date(oldestTime * 1000).toISOString().slice(0,10)}`);
 
-    // TAHAP 1: cek IDB dulu — gratis, tanpa network
+    // TAHAP 1: cek IDB dulu
     const older = await getOlderCandlesFromDB(CURRENT_SYMBOL, oldestTime, LAZY_CHUNK);
     if (older.length > 0) {
         logInfo(`[LAZY] IDB +${older.length} → rebuild`);
-        // 🔥 V3: Simpan posisi view SEBELUM clear
         if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
         if (Module._wasm_clear_chart) Module._wasm_clear_chart();
         await rebuildFullFromDB(CURRENT_SYMBOL);
-        // 🔥 V3: Restore posisi view SETELAH rebuild → user tidak kehilangan scroll
         if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
         logGood(`[LAZY] ✅ rebuilt from IDB (+${older.length})`);
         if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
@@ -532,17 +1809,39 @@ window.onNearLeftEdge = async function(oldestTime) {
         return;
     }
 
-    // TAHAP 2: IDB kosong → request server 20k sekaligus
-    // Response di candle_page handler → simpan IDB → clear + rebuild
-    logInfo(`[LAZY] IDB habis → req server before=${new Date(oldestTime*1000).toISOString().slice(0,10)}`);
-    wsSend({ type: "request_candles", symbol: CURRENT_SYMBOL, before_time: oldestTime, limit: LAZY_CHUNK });
+    // TAHAP 2: IDB habis → fetch dari Hyperliquid REST
+    logInfo(`[LAZY] IDB habis → fetch dari HL REST before=${new Date(oldestTime*1000).toISOString().slice(0,10)}`);
+    if (window._spinnerShow) window._spinnerShow();
+
+    const olderCandles = await fetchOlderCandles(CURRENT_SYMBOL, oldestTime, LAZY_CHUNK);
+
+    if (!olderCandles.length) {
+        logInfo('[LAZY] HL tidak punya data lebih lama');
+        g_noMoreHistory.add(CURRENT_SYMBOL);
+        getTabLazy(0).noMoreHistory = true;
+        if (Module._wasm_set_tab_no_more_history)
+            Module.ccall('wasm_set_tab_no_more_history', null, ['number'], [0]);
+        if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+        g_lazyLoadInProgress = false;
+        if (window._spinnerHide) window._spinnerHide();
+        return;
+    }
+
+    logGood(`[LAZY] ✅ +${olderCandles.length} candles dari HL REST`);
+    addToBuffer(CURRENT_SYMBOL, olderCandles);
+    await flushBuffer();
+
+    if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
+    if (Module._wasm_clear_chart) Module._wasm_clear_chart();
+    await rebuildFullFromDB(CURRENT_SYMBOL);
+    if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
+
+    if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+    g_lazyLoadInProgress = false;
+    if (window._spinnerHide) window._spinnerHide();
 };
 
-// =========================================================
-// 🔥 PER-TAB LAZY TRIGGER (V3)
-// tabId=0 = primary tab → pakai rebuildFullFromDB (global data)
-// tabId>0 = non-primary  → pakai rebuildTabFromDB (SYMBOL_TF data)
-// =========================================================
+// Per-tab lazy load
 window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
     const state = getTabLazy(tabId);
     if (state.inProgress || state.noMoreHistory) return;
@@ -559,7 +1858,7 @@ window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
     const tag = isPrimary ? '[LAZY]' : `[LAZY TAB${tabId}]`;
     logInfo(`${tag} ${symbol} oldest: ${new Date(oldestTime*1000).toISOString().slice(0,10)}`);
 
-    // TAHAP 1: cek IDB dulu — tanpa network
+    // TAHAP 1: cek IDB dulu
     const older = await getOlderCandlesFromDB(symbol, oldestTime, LAZY_CHUNK);
     if (older.length > 0) {
         logInfo(`${tag} IDB +${older.length} → rebuild`);
@@ -582,152 +1881,43 @@ window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
         return;
     }
 
-    // TAHAP 2: IDB kosong → request server
-    logInfo(`${tag} IDB habis → req server before=${new Date(oldestTime*1000).toISOString().slice(0,10)}`);
-    if (isPrimary) {
-        wsSend({ type: "request_candles", symbol, before_time: oldestTime, limit: LAZY_CHUNK });
-    } else {
-        // Track pending agar candle_page bisa route ke tab yang benar
-        // (server tidak selalu echo tab_id di response)
-        g_pendingTabLazy.set(symbol, tabId);
-        wsSend({ type: "request_candles", symbol, before_time: oldestTime, limit: LAZY_CHUNK, tab_id: tabId });
+    // TAHAP 2: IDB habis → fetch dari HL REST
+    logInfo(`${tag} IDB habis → fetch dari HL REST`);
+    const olderCandles = await fetchOlderCandles(symbol, oldestTime, LAZY_CHUNK);
+
+    if (!olderCandles.length) {
+        logWarn(`${tag} HL tidak punya data lebih lama`);
+        state.noMoreHistory = true;
+        if (Module._wasm_set_tab_no_more_history)
+            Module.ccall('wasm_set_tab_no_more_history', null, ['number'], [tabId]);
+        state.inProgress = false;
+        return;
     }
+
+    addToBuffer(symbol, olderCandles);
+    await flushBuffer();
+
+    if (isPrimary) {
+        if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
+        if (Module._wasm_clear_chart) Module._wasm_clear_chart();
+        await rebuildFullFromDB(symbol);
+        if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
+        if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+    } else {
+        if (Module._wasm_save_view_anchor_tab)
+            Module.ccall('wasm_save_view_anchor_tab', null, ['number'], [tabId]);
+        await rebuildTabFromDB(tabId, symbol);
+        if (Module._wasm_restore_view_anchor_tab)
+            Module.ccall('wasm_restore_view_anchor_tab', null, ['number'], [tabId]);
+        if (Module._wasm_set_tab_lazy_done)
+            Module.ccall('wasm_set_tab_lazy_done', null, ['number'], [tabId]);
+    }
+    state.inProgress = false;
 };
 
-// ─── rebuildTabFromDB — analog rebuildFullFromDB tapi untuk tab non-utama ───
-// Key IDB sama: per-symbol (bukan per-tab) → semua tab BTCUSDT pakai IDB yang sama
-// Setelah rebuild, GPU buffer tab ini langsung terupdate via wasm_rebuild_htfs_for_tab
-async function rebuildTabFromDB(tabId, symbol) {
-    let candles = await getAllCandlesFromDB(symbol);
-    if (!candles.length) {
-        logWarn(`[REBUILD TAB${tabId}] Tidak ada data IDB untuk ${symbol}`);
-        return;
-    }
-    candles.sort((a, b) => a.time - b.time);
-
-    if (Module._wasm_clear_tab) Module._wasm_clear_tab(tabId);
-
-    // Atomic push — sama seperti rebuildFullFromDB, tidak ada rAF yield
-    for (const c of candles) {
-        Module.ccall('wasm_push_candle_for_tab', null,
-            ['number','number','number','number','number','number','number'],
-            [tabId, c.o, c.h, c.l, c.c, c.time, c.v || 1]);
-    }
-
-    if (Module._wasm_rebuild_htfs_for_tab)
-        Module.ccall('wasm_rebuild_htfs_for_tab', null, ['number'], [tabId]);
-
-    logGood(`[REBUILD TAB${tabId}] ✅ ${symbol}: ${candles.length} bars OK`);
-}
-
-// ── rebuildFullFromDB V2: ATOMIC PUSH (no yield, no prepend) ────────────────
-// Push SEMUA candle dari IDB ke WASM dalam satu loop synchronous.
-// Tidak ada rAF yield = tidak ada render loop jalan di tengah push = NO RACE CONDITION.
-// 21000 candle × ccall ≈ 20ms — user tidak kerasa.
-//
-// 🔒 MUTEX: g_rebuildInProgress mencegah 2+ panggilan concurrent.
-// Masalah: SetActiveSymbol dan lazy sama-sama await rebuildFullFromDB →
-// JS yield di `await getAllCandlesFromDB` → keduanya jalan sekaligus →
-// triple rebuild. Mutex memastikan hanya 1 yang jalan, sisanya skip.
-async function rebuildFullFromDB(symbol) {
-    if (!isWasmReady) { console.log('[REBUILD] WASM not ready'); return; }
-
-    // 🔒 Cek mutex — kalau sudah ada rebuild berjalan, skip
-    if (g_rebuildInProgress) {
-        logWarn(`[REBUILD] Skipped (rebuild already in progress) for ${symbol}`);
-        return;
-    }
-    g_rebuildInProgress = true;
-
-    let candles = await getAllCandlesFromDB(symbol);
-    if (!candles.length) { logWarn(`[REBUILD] No data for ${symbol}`); return; }
-
-    candles.sort((a, b) => a.time - b.time);
-
-    // ═══════════════════════════════════════════════════════════════
-    // 🛡️ IDB SANITIZER: Hapus candle corrupt SEBELUM push ke WASM
-    //
-    // IDB bisa mengandung candle dari symbol lain (dari race condition
-    // versi lama). Detect via median close price — candle yang > 5x
-    // atau < 0.2x dari median = pasti dari symbol lain → buang.
-    //
-    // Ini JAUH lebih akurat dari guard C++ karena:
-    //   1. Median dihitung dari data sendiri (tidak perlu MW live price)
-    //   2. Filter sebelum masuk WASM → C++ selalu terima data bersih
-    //   3. Tidak ada gap dari neutralize — candle corrupt benar-benar dihapus
-    // ═══════════════════════════════════════════════════════════════
-    if (candles.length > 10) {
-        // Hitung median close dari 50% candle terbaru (paling akurat)
-        const recent = candles.slice(-Math.max(100, Math.floor(candles.length * 0.5)));
-        const closes = recent.map(c => c.c).sort((a, b) => a - b);
-        const median = closes[Math.floor(closes.length / 2)];
-
-        if (median > 0) {
-            const hiLim = median * 5.0;
-            const loLim = median * 0.2;
-            const before = candles.length;
-
-            // Collect corrupt candle times BEFORE filtering
-            const corruptTimes = [];
-            for (const c of candles) {
-                if (!(c.c >= loLim && c.c <= hiLim && c.h > 0 && c.l > 0)) {
-                    corruptTimes.push(c.time);
-                }
-            }
-
-            candles = candles.filter(c =>
-                c.c >= loLim && c.c <= hiLim &&
-                c.h > 0 && c.l > 0
-            );
-            const removed = before - candles.length;
-            if (removed > 0) {
-                logWarn(`[REBUILD] 🛡️ ${removed} corrupt removed (median=${median.toFixed(2)})`);
-
-                // 🔥 FIX: Hapus corrupt candles dari IDB juga!
-                // Tanpa ini, lazy load menemukan mereka lagi → rebuild → sanitize → lazy → INFINITE LOOP
-                try {
-                    const delDb = await new Promise((res, rej) => {
-                        const r = indexedDB.open(DB_NAME);
-                        r.onsuccess = () => res(r.result);
-                        r.onerror = () => rej(r.error);
-                    });
-                    const tx = delDb.transaction([STORE], 'readwrite');
-                    const store = tx.objectStore(STORE);
-                    for (const t of corruptTimes) {
-                        store.delete([symbol, t]); // keyPath = [symbol, time]
-                    }
-                    await new Promise((res) => { tx.oncomplete = res; tx.onerror = res; });
-                    logGood(`[REBUILD] 🗑️ ${removed} corrupt deleted from IDB`);
-                } catch (e) {
-                    console.warn('[REBUILD] Failed to delete corrupt from IDB:', e);
-                }
-            }
-        }
-    }
-
-    logGood(`[REBUILD] ${candles.length} bars → push...`);
-
-    isRendering = true;
-    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
-
-    // 🔥 ATOMIC: push ALL candles in one synchronous loop
-    for (const c of candles) {
-        notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v);
-        if (c.time > lastWasmTime) lastWasmTime = c.time;
-    }
-
-    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
-    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
-    isRendering = false;
-    downloadedSymbols.add(symbol);
-    hideLoadingOverlay();
-    logGood(`[REBUILD] ✅ ${symbol}: ${candles.length} bars OK`);
-
-    // 🔒 Lepas mutex
-    g_rebuildInProgress = false;
-}
-
-// Simpan ke IDB SAJA — tidak push ke WASM, tidak ada render sama sekali.
+// =========================================================
+// 10. REPLAY SUPPORT
+// =========================================================
 window.reloadLiveAfterReplay = async function() {
     console.log('%c[RELOAD] Replay selesai — reload live dari IDB...', 'color:#00AAFF;font-weight:bold');
 
@@ -743,402 +1933,111 @@ window.reloadLiveAfterReplay = async function() {
 
     lastWasmTime = 0;
 
-    // 🔥 FIX: Buka gate replay SEBELUM rebuildFullFromDB
-    // Alasan: notifyWASM_candle() cek wasm_get_replay_gate() — kalau gate masih ON,
-    // semua push candle di dalam rebuildFullFromDB di-skip → chart kosong.
-    // Gate HARUS dibuka dulu agar candle bisa masuk ke WASM.
     if (Module._wasm_set_replay_mode) {
         Module._wasm_set_replay_mode(0);
-        console.log('[RELOAD] Gate dibuka — siap terima candle dari IDB');
+        console.log('[RELOAD] Gate dibuka');
     }
 
-    // 🔥 FIX REPLAY KE-2+: Force-reset mutex g_rebuildInProgress
-    // Masalah: saat replay ke-2 selesai, lazy load (candle_page) sebelumnya masih running
-    // rebuildFullFromDB → g_rebuildInProgress=true. Saat reloadLiveAfterReplay memanggil
-    // rebuildFullFromDB, fungsi langsung di-skip → chart kosong selamanya.
-    // Solusi: reset mutex di sini. Aman karena:
-    //   1. Gate replay sudah dibuka (wasm_set_replay_mode(0))
-    //   2. wasm_clear_chart() sudah dijalankan — WASM dalam keadaan bersih
-    //   3. Kita adalah satu-satunya yang boleh rebuild di titik ini
     if (g_rebuildInProgress) {
-        logWarn('[RELOAD] ⚠️ g_rebuildInProgress masih ON — force reset (replay ke-2 fix)');
+        logWarn('[RELOAD] ⚠️ g_rebuildInProgress ON → force reset');
         g_rebuildInProgress = false;
     }
 
-    // Yield 1 rAF agar WASM selesai process wasm_clear_chart sebelum push candle baru
     await new Promise(r => requestAnimationFrame(r));
 
     showLoadingOverlay('Restoring live data...', 0);
     await rebuildFullFromDB(CURRENT_SYMBOL);
     hideLoadingOverlay();
 
-    // 🔥 SMART GUARD: Setelah replay selesai, reload FP jika sebelumnya aktif
-    // clearAllFP() → reset tracking agar requestFootprint tidak di-skip
-    // requestFootprint() → reload dari server dengan data terbaru
-    // Ini memastikan angka footprint tidak stale setelah kembali ke live
     if (window.clearAllFP) {
         window.clearAllFP();
-        console.log('[RELOAD] FP cache cleared — siap reload');
+        console.log('[RELOAD] FP cache cleared');
     }
 
-    // 🔥 SMART GUARD: Cek apakah ada tab yang pakai FP atau VP style
-    // Kalau ada → auto-request FP untuk symbol aktif
-    // Trader tidak perlu klik ulang tombol FP setelah replay
+    // Smart guard: auto-reload FP jika sebelumnya aktif
     let needsFP = false;
     try {
-        // Cek via JS — WASM expose info tab aktif
         if (Module._wasm_get_active_renderstyle) {
             const style = Module._wasm_get_active_renderstyle();
-            // style 3,4,5 = FP_OVERLAY, FP_PROFILE, FP_BAR (sesuai enum CandleRenderStyle)
             needsFP = (style >= 3 && style <= 5);
         }
-        // Fallback: kalau tidak ada fungsi itu, cek dari flag yang kita simpan
         if (!needsFP && window._lastFPStyleActive) {
             needsFP = true;
         }
     } catch(e) {}
 
     if (needsFP && CURRENT_SYMBOL) {
-        console.log(`%c[RELOAD] Smart Guard: FP style aktif → auto-reload FP untuk ${CURRENT_SYMBOL}`,
-            'color:#FF9900;font-weight:bold');
-        // bypassGate=0 karena replay sudah selesai — gate sudah dibuka
         if (window.requestFootprint) {
             window.requestFootprint(CURRENT_SYMBOL, 500, 0);
         }
     }
 
-    console.log('%c[RELOAD] ✅ Live restored! Gate dibuka.', 'color:#00FF88;font-weight:bold');
+    console.log('%c[RELOAD] ✅ Live restored!', 'color:#00FF88;font-weight:bold');
 };
 
 // =========================================================
-// 7. WEBSOCKET HELPER
+// 11. LOAD TAB SYMBOL (multi-tab)
 // =========================================================
-let ws = null;
+window.LoadTabSymbol = async function(tabId, symbol) {
+    g_tabSymbolMap.set(tabId, symbol);
+    resetTabLazy(tabId);
+    logInfo(`[TAB${tabId}] LoadTabSymbol: ${symbol}`);
 
-// ── Queue untuk pesan yang dikirim sebelum WS siap ───────────────
-const g_wsSendQueue = [];
+    const MIN     = 100;
+    const candles = await getAllCandlesFromDB(symbol);
 
-function wsSend(obj) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(obj));
-    } else {
-        // Antri — akan dikirim saat WS onopen
-        g_wsSendQueue.push(obj);
-        logInfo(`[WS] Queue +1 (${g_wsSendQueue.length} pending): ${obj.type}`);
-    }
-}
+    if (candles.length >= MIN) {
+        candles.sort((a, b) => a.time - b.time);
 
-function wsFlushQueue() {
-    if (!g_wsSendQueue.length) return;
-    logInfo(`[WS] Flushing ${g_wsSendQueue.length} queued messages`);
-    while (g_wsSendQueue.length > 0) {
-        const obj = g_wsSendQueue.shift();
-        if (ws && ws.readyState === WebSocket.OPEN)
-            ws.send(JSON.stringify(obj));
-    }
-}
+        // Gap fill via fetch langsung
+        const latestTime = candles.reduce((max, c) => c.time > max ? c.time : max, 0);
+        const nowEpoch   = Math.floor(Date.now() / 1000);
+        const gapSeconds = nowEpoch - latestTime;
 
-async function connectWS() {
-    if (isWSConnected || ws) { logWarn('[WS] Already connected'); return; }
-    isWSConnected = true;
-    ws = new WebSocket(WS_URL);
-
-    ws.onopen = () => {
-        logGood('[WS] Connected!');
-        wsFlushQueue();
-        ws.send(JSON.stringify({ type: "init", email: "TRADER_CLIENT" }));
-
-        // 🔥 ON-DEMAND GAP: tidak request apapun di sini.
-        // g_startupGapMap sudah berisi gap info dari startup scan (memory only).
-        // Gap akan di-request saat user pilih symbol → SetActiveSymbol.
-        if (g_startupGapMap.size > 0) {
-            const syms = [...g_startupGapMap.keys()].join(', ');
-            logInfo(`[STARTUP] Gap info cached untuk: ${syms} — menunggu user pilih`);
-        }
-
-        if (CURRENT_SYMBOL && !downloadedSymbols.has(CURRENT_SYMBOL)) {
-            // IDB kosong → download fresh
-            showLoadingOverlay(`Downloading ${CURRENT_SYMBOL} history`, 0);
-            isDownloading     = true;
-            downloadedCandles = [];
-            wsSend({ type: "request_sync", symbol: CURRENT_SYMBOL, count: 10000 });
-        } else {
-            logInfo("[WS] Connected, menunggu user pilih symbol dari picker...");
-            hideLoadingOverlay();
-        }
-
-        setInterval(() => ws.readyState === WebSocket.OPEN && ws.send('{"type":"ping"}'), 30000);
-    };
-
-    ws.onmessage = async evt => {
-        try {
-            const msg = JSON.parse(evt.data);
-
-            // ─────────────────────────────────────────────────────
-            // A. HISTORY DOWNLOAD (Main Chart & Ninja)
-            // ─────────────────────────────────────────────────────
-            if (msg.type === "history" && msg.symbol) {
-                const sym   = msg.symbol;
-                const chunk = msg.candles || [];
-
-                // 🔥 JALUR TAB NON-UTAMA: server kirim history untuk symbol yang
-                // bukan CURRENT_SYMBOL — ini response dari request_sync Tab tertentu
-                // g_pendingTabGap track: symbol → tabId yang menunggu
-                // CATATAN: cek ini DULU sebelum CURRENT_SYMBOL check karena bisa overlap
-                if (g_pendingTabGap.has(sym) && !(sym === CURRENT_SYMBOL && isDownloading)) {
-                    const tabId = g_pendingTabGap.get(sym);
-
-                    // Akumulasi chunks (server bisa kirim multi-chunk)
-                    if (!g_tabDownloadBuf.has(tabId)) g_tabDownloadBuf.set(tabId, { sym, candles: [] });
-                    if (chunk.length) g_tabDownloadBuf.get(tabId).candles.push(...chunk);
-
-                    let done = false;
-                    if (msg.chunk_info) {
-                        const [cur, tot] = msg.chunk_info.split('/').map(Number);
-                        if (cur >= tot) done = true;
-                    } else if (!chunk.length && g_tabDownloadBuf.get(tabId).candles.length > 0) {
-                        done = true;
-                    } else if (chunk.length > 0 && !msg.chunk_info) {
-                        done = true; // single chunk tanpa chunk_info
-                    }
-
-                    if (done) {
-                        const allCandles = g_tabDownloadBuf.get(tabId).candles;
-                        g_tabDownloadBuf.delete(tabId);
-                        g_pendingTabGap.delete(sym);
-                        logGood(`[TAB${tabId}] HIST ✅ ${sym}: ${allCandles.length} candles → rebuild`);
-                        addToBuffer(sym, allCandles);
-                        await flushBuffer();
-                        await rebuildTabFromDB(tabId, sym);
-                    }
-                    return;
-                }
-
-                // JALUR 1: DOWNLOAD NORMAL (chart aktif)
-                if (sym === CURRENT_SYMBOL) {
-                    if (chunk.length) downloadedCandles.push(...chunk);
-
-                    let done = false;
-                    if (msg.chunk_info) {
-                        const [cur, tot] = msg.chunk_info.split('/').map(Number);
-                        updateProgress(cur, tot, "Downloading");
-                        if (cur >= tot) done = true;
-                    } else if (!chunk.length && downloadedCandles.length > 0) {
-                        done = true;
-                    }
-
-                    if (done) {
-                        updateProgress(downloadedCandles.length, downloadedCandles.length, "Saving");
-                        addToBuffer(sym, downloadedCandles);
-                        await flushBuffer();
-                        await rebuildFullFromDB(sym);
-
-                        hideLoadingOverlay();
-                        isDownloading = false;
-                        // 🔥 FIX: Buka lazy setelah CACHE MISS download selesai
-                        // Sebelumnya g_initialLoadDone tidak di-set true di sini
-                        // → lazy terblokir selamanya setelah download pertama
-                        g_initialLoadDone = true;
-                        logInfo(`[INIT] CACHE MISS selesai — lazy diizinkan`);
-
-                        logGood(`✅ ${sym} fully loaded!`);
-
-                        // Request footprint setelah chart beres
-                        // V2: FP hanya di-request saat user pilih FP style
-
-                        if (pendingSymbolSwitch) {
-                            const next = pendingSymbolSwitch;
-                            pendingSymbolSwitch = null;
-                            setTimeout(() => window.SetActiveSymbol(next), 300);
-                        }
-                        // V17: tidak ada ninja setelah chart selesai
-                    }
-                }
-                // V17: JALUR 2 (ninja) DIHAPUS — tidak ada background download
-                return;
-            }
-
-            // ─────────────────────────────────────────────────────
-            // A2. CANDLE_PAGE — lazy load pagination dari server
-            // Dikirim server sebagai respons request_candles
-            // Berisi candle lebih lama dari titik tertua yg ada di client
-            // ─────────────────────────────────────────────────────
-            if (msg.type === "candle_page" && msg.symbol) {
-                const sym     = msg.symbol;
-                const candles = msg.candles || [];
-                const hasMore = msg.has_more === true;
-
-                // 🔥 PER-TAB DISPATCH: kalau response punya tab_id, ATAU symbol ada di g_pendingTabLazy
-                // Server tidak selalu echo tab_id → kita track sendiri via g_pendingTabLazy
-                const pendingLazyTabId = msg.tab_id !== undefined
-                    ? msg.tab_id
-                    : g_pendingTabLazy.get(sym);
-
-                if (pendingLazyTabId !== undefined && !(sym === CURRENT_SYMBOL && !g_pendingTabLazy.has(sym))) {
-                    const tabId = pendingLazyTabId;
-                    if (!candles.length) {
-                        logWarn(`[PAGE TAB${tabId}] no more history untuk ${sym}`);
-                        g_pendingTabLazy.delete(sym);
-                        getTabLazy(tabId).noMoreHistory = true;
-                        if (Module._wasm_set_tab_no_more_history)
-                            Module.ccall('wasm_set_tab_no_more_history', null, ['number'], [tabId]);
-                        return;
-                    }
-                    logGood(`[PAGE TAB${tabId}] ✅ ${sym}: ${candles.length} candles → rebuild`);
-                    g_pendingTabLazy.delete(sym);
-                    addToBuffer(sym, candles);
-                    await flushBuffer();
-                    // 🔥 V3: Save/restore view anchor saat rebuild tab dari server
-                    if (Module._wasm_save_view_anchor_tab)
-                        Module.ccall('wasm_save_view_anchor_tab', null, ['number'], [tabId]);
-                    await rebuildTabFromDB(tabId, sym);
-                    if (Module._wasm_restore_view_anchor_tab)
-                        Module.ccall('wasm_restore_view_anchor_tab', null, ['number'], [tabId]);
-                    if (Module._wasm_set_tab_lazy_done)
-                        Module.ccall('wasm_set_tab_lazy_done', null, ['number'], [tabId]);
-                    getTabLazy(tabId).inProgress = false;
-                    return;
-                }
-
-                if (sym !== CURRENT_SYMBOL) return; // ignore untuk symbol lain
-
-                if (!candles.length) {
-                    logInfo('[PAGE] Server: tidak ada data lebih lama');
-                    g_noMoreHistory.add(sym);
-                    // 🔥 FIX: Sync JS per-tab state primary (tabId=0)
-                    getTabLazy(0).inProgress    = false;
-                    getTabLazy(0).noMoreHistory = true;
-                    if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
-                    if (Module._wasm_set_tab_no_more_history)
-                        Module.ccall('wasm_set_tab_no_more_history', null, ['number'], [0]);
-                    g_lazyLoadInProgress = false;
-                    return;
-                }
-
-                logGood(`[PAGE] ✅ ${candles.length} candles dari server (has_more=${hasMore})`);
-
-                // 🔥 V2: Simpan ke IDB SAJA — tidak langsung push ke WASM
-                addToBuffer(sym, candles);
+        if (gapSeconds > 30) {
+            const gapMinutes = Math.floor(gapSeconds / 60);
+            logWarn(`[TAB${tabId}-GAP] ${gapMinutes}m gap → fetch dari HL REST`);
+            const gapCandles = await fetchGapCandles(symbol, latestTime);
+            if (gapCandles.length > 0) {
+                addToBuffer(symbol, gapCandles);
                 await flushBuffer();
-
-                // 🔥 V3: Simpan posisi view SEBELUM clear
-                if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
-                if (Module._wasm_clear_chart) Module._wasm_clear_chart();
-                await rebuildFullFromDB(sym);
-                // 🔥 V3: Restore posisi view SETELAH rebuild
-                if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
-
-                if (!hasMore) {
-                    logInfo('[PAGE] Server sudah habis — tidak akan request lagi');
-                    g_noMoreHistory.add(sym);
-                    // 🔥 FIX: Sync JS per-tab state
-                    getTabLazy(0).noMoreHistory = true;
-                    if (Module._wasm_set_tab_no_more_history)
-                        Module.ccall('wasm_set_tab_no_more_history', null, ['number'], [0]);
-                }
-
-                // 🔥 FIX: Buka gate JS per-tab state primary agar lazy bisa trigger lagi
-                getTabLazy(0).inProgress = false;
-
-                if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
-                g_lazyLoadInProgress = false;
-                return;
+                logGood(`[TAB${tabId}-GAP] ✅ +${gapCandles.length} candles`);
             }
+        }
 
-            // ─────────────────────────────────────────────────────
-            // B. TICK LIVE
-            // V17: SELALU kirim ke WASM untuk Market Watch (semua pair)
-            // C++ wasm_push_tick sudah aman:
-            //   - UpdateTick() dipanggil untuk semua sym → MW hidup
-            //   - Candle hanya terbentuk kalau ada tab buka pair itu
-            // addToBuffer HANYA untuk pair aktif → tidak buang-buang IDB
-            // ─────────────────────────────────────────────────────
-            if (msg.type === "tick" && msg.symbol) {
-                const sym   = msg.symbol;
-                const price = msg.price;
-                const vol   = msg.v || 1.0;
-                const time  = msg.time || msg.t || 0;
+        // Reload fresh dari IDB (termasuk gap candles)
+        const freshCandles = await getAllCandlesFromDB(symbol);
+        freshCandles.sort((a, b) => a.time - b.time);
+        logGood(`[TAB${tabId}] IDB hit: ${freshCandles.length} bars -> render`);
 
-                // FIX 1: SELALU kirim ke WASM untuk Market Watch — tidak peduli isDownloading
-                // isDownloading hanya relevan untuk candle chart, bukan untuk price display
-                // C++ aman: UpdateTick() semua sym, candle hanya terbentuk kalau ada tab
-                sendTickToWasm(sym, price, vol, time);
-
-                // IDB hanya untuk pair yang sedang aktif / ada tabnya
-                if (sym === CURRENT_SYMBOL || downloadedSymbols.has(sym)) {
-                    addToBuffer(sym, [{ time, o: price, h: price, l: price, c: price, v: vol }]);
-                }
-                return;
+        if (Module._wasm_push_candle_for_tab) {
+            if (Module._wasm_clear_tab) {
+                Module._wasm_clear_tab(tabId);
             }
-
-            // ─────────────────────────────────────────────────────
-            // C. BAR CLOSE
-            // ─────────────────────────────────────────────────────
-            if (msg.type === "bar" || msg.type === "active_bar") {
-                if (!msg.symbol) return;
-                const sym = msg.symbol;
-                const c   = { time: msg.time, o: msg.open, h: msg.high, l: msg.low, c: msg.close, v: msg.v };
-
-                // 🔥 IDB hanya untuk symbol yg user pernah buka di chart
-                // Market Watch harga → dari tick live stream (wasm_push_tick), TIDAK perlu IDB
-                if (downloadedSymbols.has(sym)) {
-                    addToBuffer(sym, [c]);
-                }
-
-                // sendTickToWasm untuk MW tidak perlu downloadedSymbols guard
-                // Tapi notifyWASM_candle + bar close logic tetap hanya untuk pair aktif
-                sendTickToWasm(sym, c.c, c.v || 1, c.time);
-
-                if (downloadedSymbols.has(sym) && !isDownloading) {
-
-                    if (sym === CURRENT_SYMBOL) {
-                        notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v);
-                        if (c.time > lastWasmTime) lastWasmTime = c.time;
-
-                        // 🆕 V16: Delegasikan ke orderflow.js — tidak ada logika crypto inline di sini
-                        // handleOrderFlowBarClose sudah punya guard isCrypto sendiri
-                        if (window.handleOrderFlowBarClose) window.handleOrderFlowBarClose(sym);
-
-                    } else {
-                        // Non-primary tab: route bar close ke symbol yang aktif di tab lain
-                        if (Module._wasm_push_candle_for_symbol) {
-                            Module.ccall('wasm_push_candle_for_symbol', null,
-                                ['string','number','number','number','number','number','number'],
-                                [sym, c.o, c.h, c.l, c.c, c.time, c.v || 1]);
-                        }
-                    }
-                }
-                return;
+            for (const c of freshCandles) {
+                Module.ccall('wasm_push_candle_for_tab', null,
+                    ['number','number','number','number','number','number','number'],
+                    [tabId, c.o, c.h, c.l, c.c, c.time, c.v || 1]);
             }
+            logGood(`[TAB${tabId}] ${freshCandles.length} M1 candles pushed`);
+            if (Module._wasm_rebuild_htfs_for_tab) Module._wasm_rebuild_htfs_for_tab(tabId);
+            logGood(`[TAB${tabId}] ${symbol} siap!`);
+        }
 
-            // ─────────────────────────────────────────────────────
-            // D. GAP DATA (background sync, tidak blokir UI)
-            // ─────────────────────────────────────────────────────
-            if (msg.type === "gap_data") { handleGapData(msg); return; }
-
-            // ─────────────────────────────────────────────────────
-            // E+F. ORDER FLOW — dispatch ke websocket_orderflow.js
-            // ─────────────────────────────────────────────────────
-            if (window.handleOrderFlowMessage && window.handleOrderFlowMessage(msg)) return;
-
-        } catch (e) { console.error('[WS] Parse error:', e); }
-    };
-
-    ws.onclose = () => {
-        logWarn('[WS] Disconnected');
-        isWSConnected = false;
-        isRendering   = false;
-        flushBuffer();
-        hideLoadingOverlay();
-        isDownloading = false;
-        // FP cache di-clear saat disconnect — WASM data hilang saat reconnect
-        if (window.clearAllFP) window.clearAllFP();
-        setTimeout(connectWS, 3000);
-    };
-}
+    } else {
+        // IDB kosong → download fresh dari HL REST
+        logWarn(`[TAB${tabId}] IDB kosong untuk ${symbol} → download fresh`);
+        const candles = await fetchHistoryPaginated(symbol, PLATFORM.HISTORY_BARS);
+        if (candles.length > 0) {
+            addToBuffer(symbol, candles);
+            await flushBuffer();
+            await rebuildTabFromDB(tabId, symbol);
+        }
+    }
+};
 
 // =========================================================
-// 8. STARTUP
+// 12. STARTUP
 // =========================================================
 var Module = Module || {};
 
@@ -1151,7 +2050,7 @@ Module.onRuntimeInitialized = async function() {
         if (el) el.style.display = 'none';
     });
 
-    // 🔥 GUEST MODE: Sembunyikan login gateway, tampilkan canvas langsung
+    // GUEST MODE
     const gateway = document.getElementById('login-gateway');
     if (gateway) gateway.style.display = 'none';
     const cv = document.getElementById('canvas');
@@ -1160,333 +2059,123 @@ Module.onRuntimeInitialized = async function() {
 
     await initIndexedDB();
 
-    const MIN = 500; // konsisten dengan SetActiveSymbol
-    // Market Watch akan dapat price dari tick stream live (wasm_push_tick)
-    // Hanya cek pair yang ada di IDB untuk downloadedSymbols tracking
-    const allKeys = await getAllSymbolsInDB(); // cek siapa yang sudah tersimpan
-    const nowEpochStartup = Math.floor(Date.now() / 1000);
+    const MIN = 500;
+    // Scan IDB untuk mengetahui symbol yang sudah pernah di-cache
+    const allKeys = await getAllSymbolsInDB();
     for (const sym of allKeys) {
         downloadedSymbols.add(sym);
-        // 🔍 Scan IDB per symbol: tampilkan oldest~latest + gap sebelum user pilih
         try {
             const candles = await getAllCandlesFromDB(sym);
             if (candles.length > 0) {
                 const oldest    = candles.reduce((min, c) => c.time < min ? c.time : min, candles[0].time);
                 const latest    = candles.reduce((max, c) => c.time > max ? c.time : max, 0);
-                const gapSec    = nowEpochStartup - latest;
+                const gapSec    = Math.floor(Date.now()/1000) - latest;
                 const gapMin    = Math.floor(gapSec / 60);
                 const oldestStr = new Date(oldest * 1000).toISOString().slice(0,16).replace('T',' ');
                 const latestStr = new Date(latest * 1000).toISOString().slice(0,16).replace('T',' ');
                 if (gapMin > 1) {
                     logWarn(`[STARTUP] ${sym}: ${candles.length} candles | ${oldestStr} ~ ${latestStr} | gap: ~${gapMin}m ⚠️`);
-                    // 🔥 BG-GAP hanya untuk symbol yg user pernah buka di chart
-                    // Symbol masuk IDB hanya via downloadedSymbols → aman untuk scaling
-                    // (Market Watch price tidak butuh IDB, dapat dari tick live)
-                    if (downloadedSymbols.has(sym)) {
-                        // Catat di memory — request hanya saat user pilih symbol ini
-                        g_startupGapMap.set(sym, latest);
-                    }
-                    // Symbol lain (masuk IDB karena bar close) → tidak di-cache gap
                 } else {
                     logGood(`[STARTUP] ${sym}: ${candles.length} candles | ${oldestStr} ~ ${latestStr} | gap: fresh ✅`);
                 }
-            } else {
-                logInfo(`[STARTUP] ${sym}: IDB kosong`);
             }
         } catch(e) {
             logInfo(`[STARTUP] ${sym}: IDB ✓ (scan error)`);
         }
     }
 
-    if (CURRENT_SYMBOL) {
-        // Reconnect / reload — CURRENT_SYMBOL sudah ada, load langsung
-        const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
-        if (existing.length >= MIN) {
-            // Gap check sebelum render (sama seperti SetActiveSymbol)
-            const latestTime = existing.reduce((max, c) => c.time > max ? c.time : max, 0);
-            const nowEpoch   = Math.floor(Date.now() / 1000);
-            const gapSeconds = nowEpoch - latestTime;
-            if (gapSeconds > 30) {
-                const gapMinutes = Math.floor(gapSeconds / 60);
-                logWarn(`[STARTUP-GAP] ${gapMinutes}m gap → prefill sebelum render`);
-                showLoadingOverlay(`Syncing ${CURRENT_SYMBOL} (${gapMinutes}m gap)...`, 0);
-                await prefillGapBeforeRender(CURRENT_SYMBOL, latestTime);
-                logGood(`[STARTUP-GAP] ✅ IDB lengkap → render`);
+    // Connect ke Hyperliquid WebSocket (untuk live data Crypto)
+    connectHLWebSocket();
+    
+    // Connect ke Binance WebSocket (untuk live data Forex/Gold)
+    connectBinanceWebSocket();
+    
+    // Connect ke Finnhub WebSocket (untuk live data Forex — legacy, kalau ada API key)
+    connectFinnhubWebSocket();
+
+    // ─────────────────────────────────────────────────────────────────
+    // 🔄 SYNC SYMBOL DARI C++ (single source of truth)
+    //
+    // BUG LAMA (sudah fix):
+    //   Sebelumnya WebSocket baca localStorage "MyTradingApp_ChartState"
+    //   untuk dapat symbol terakhir. Tapi kadang race condition dengan
+    //   C++ → CURRENT_SYMBOL tetap kosong → chart tampil label saja,
+    //   tanpa history & tanpa subscribe HL WS live. Baru lengkap kalau
+    //   user pindah simbol via picker (SetActiveSymbol ter-trigger).
+    //
+    // FIX:
+    //   Ambil langsung dari C++ via wasm_nav_get_symbol(). C++ sudah
+    //   LoadWebLayout() di main() dan set g_symbol sebelum JS init.
+    //   Setelah dapat symbol → panggil SetActiveSymbol penuh, yg akan
+    //   handle:
+    //     1. Clear chart di C++ (Module._wasm_clear_chart)
+    //     2. Load history dari IDB (rebuildFullFromDB) atau download fresh
+    //     3. Gap fill dari HL REST (kalau IDB ada gap)
+    //     4. Subscribe HL WebSocket live stream (subscribeCandleStream)
+    //   → chart lengkap: history + live. Sama seperti user pindah via picker.
+    // ─────────────────────────────────────────────────────────────────
+    let initialSym = "";
+
+    // 1. Prioritas: ambil dari C++ (paling akurat — sesuai chart C++)
+    try {
+        if (Module._wasm_nav_get_symbol) {
+            const symFromCpp = Module.ccall(
+                'wasm_nav_get_symbol', 'string', [], []
+            );
+            if (symFromCpp && symFromCpp.trim().length > 0) {
+                initialSym = symFromCpp.trim();
+                logGood(`[STARTUP] Symbol aktif dari C++: ${initialSym}`);
             }
-            showLoadingOverlay(`Loading ${CURRENT_SYMBOL}`, 0);
-            await rebuildFullFromDB(CURRENT_SYMBOL);
-            hideLoadingOverlay();
+        } else {
+            logWarn(`[STARTUP] wasm_nav_get_symbol tidak tersedia di Module`);
         }
-    } else {
-        logInfo("[STARTUP] Menunggu user pilih symbol dari picker...");
-        hideLoadingOverlay();
-        // V17: tidak ada ninja — Market Watch hidup dari tick stream
+    } catch(e) {
+        logWarn(`[STARTUP] Gagal ambil symbol dari C++: ${e.message}`);
     }
 
-    connectWS();
+    // 2. Fallback: baca dari localStorage (kalau C++ belum set / bridge gagal)
+    if (!initialSym) {
+        try {
+            const savedState = localStorage.getItem("MyTradingApp_ChartState");
+            if (savedState) {
+                const j = JSON.parse(savedState);
+                if (j.symbol && j.symbol.trim().length > 0) {
+                    initialSym = j.symbol.trim();
+                    logInfo(`[STARTUP] Symbol dari localStorage (fallback): ${initialSym}`);
+                }
+            }
+        } catch(e) {
+            logWarn(`[STARTUP] localStorage parse error: ${e.message}`);
+        }
+    }
+
+    // 3. Auto-load via SetActiveSymbol — handle history + gap fill + live
+    //
+    //    PENTING: JANGAN set CURRENT_SYMBOL dulu sebelum panggil SetActiveSymbol!
+    //    SetActiveSymbol punya early-return guard:
+    //        if (CURRENT_SYMBOL && CURRENT_SYMBOL === newSym) return;
+    //    Kalau CURRENT_SYMBOL sudah di-set == newSym, guard akan return early
+    //    dan chart gak ke-load. Biarkan SetActiveSymbol yg set CURRENT_SYMBOL
+    //    di dalamnya (line 1095).
+    //
+    //    Race condition dgn connectHLWebSocket() di atas aman:
+    //    - Kalau HL WS sudah open → SetActiveSymbol panggil subscribeCandleStream
+    //      langsung (line 1118).
+    //    - Kalau HL WS belum open → onopen trigger nanti, cek CURRENT_SYMBOL
+    //      (sudah di-set oleh SetActiveSymbol), lalu subscribe (line 768-770).
+    if (initialSym) {
+        logInfo(`[STARTUP] Auto-load ${initialSym} via SetActiveSymbol...`);
+        await window.SetActiveSymbol(initialSym);
+        logGood(`[STARTUP] ✅ ${initialSym} ready (history + live subscribed)`);
+    } else {
+        // Tidak ada simbol tersimpan → user pertama kali → tampilkan picker
+        logInfo("[STARTUP] Menunggu user pilih symbol dari picker...");
+        hideLoadingOverlay();
+    }
+
 };
 
 window.addEventListener('beforeunload', () => flushBuffer());
 setInterval(() => { if (candleBuffer.length > 0) flushBuffer(); }, 10000);
 
-// =========================================================
-// 9. LOAD SYMBOL UNTUK TAB NON-UTAMA (dari IDB langsung)
-// 🆕 V16: Ganti sleep(1) → rAF, sama seperti rebuildFullFromDB
-// 🔥 V18: Sync gap-prefill sama seperti tab utama (SetActiveSymbol)
-// =========================================================
-window.LoadTabSymbol = async function(tabId, symbol) {
-    g_tabSymbolMap.set(tabId, symbol);  // 🔥 track symbol tab ini
-    resetTabLazy(tabId);                // 🔥 reset lazy state — symbol baru, history belum diketahui
-    logInfo(`[TAB${tabId}] LoadTabSymbol: ${symbol}`);
-
-    const MIN     = 100;
-    const candles = await getAllCandlesFromDB(symbol);
-
-    if (candles.length >= MIN) {
-        candles.sort((a, b) => a.time - b.time);
-
-        // ══════════════════════════════════════════════════════════
-        // 🔥 GAP-PREFILL: sama seperti SetActiveSymbol (tab utama)
-        // Cek g_startupGapMap dulu (cached dari startup scan),
-        // kalau tidak ada → hitung dari IDB (fallback).
-        // Jika gap > 30 detik → await prefill SEBELUM render.
-        // ══════════════════════════════════════════════════════════
-        const cachedLatest = g_startupGapMap.get(symbol);
-        const latestTime = cachedLatest
-            ?? candles.reduce((max, c) => c.time > max ? c.time : max, 0);
-        const nowEpoch   = Math.floor(Date.now() / 1000);
-        const gapSeconds = nowEpoch - latestTime;
-        const gapMinutes = Math.floor(gapSeconds / 60);
-
-        if (gapSeconds > 30) {
-            logWarn(`[TAB${tabId}-GAP] ${gapMinutes}m gap (~${gapMinutes} candle M1) → fetch sebelum render dari ${new Date(latestTime*1000).toISOString().slice(0,19)}Z`);
-            g_pendingTabGap.set(symbol, tabId); // route response ke tab ini
-            await prefillGapForTab(symbol, latestTime, tabId);
-            logGood(`[TAB${tabId}-GAP] ✅ IDB sudah lengkap → lanjut render`);
-        } else {
-            logInfo(`[TAB${tabId}] IDB fresh (gap ${gapSeconds}s) → langsung render`);
-        }
-        // 🔥 Hapus cache setelah dipakai
-        g_startupGapMap.delete(symbol);
-
-        // Reload candles dari IDB setelah gap-fill (bisa ada candle baru)
-        const freshCandles = await getAllCandlesFromDB(symbol);
-        freshCandles.sort((a, b) => a.time - b.time);
-        logGood(`[TAB${tabId}] IDB hit: ${freshCandles.length} bars -> render`);
-
-        if (Module._wasm_push_candle_for_tab) {
-            if (Module._wasm_clear_tab) {
-                Module._wasm_clear_tab(tabId);
-                logInfo(`[TAB${tabId}] Old data cleared, isLoading=true`);
-            }
-
-            // 🔥 Push ALL candles atomically
-            for (const c of freshCandles) {
-                Module.ccall('wasm_push_candle_for_tab', null,
-                    ['number','number','number','number','number','number','number'],
-                    [tabId, c.o, c.h, c.l, c.c, c.time, c.v || 1]);
-            }
-            logGood(`[TAB${tabId}] ${freshCandles.length} M1 candles pushed (atomic)`);
-
-            if (Module._wasm_rebuild_htfs_for_tab) Module._wasm_rebuild_htfs_for_tab(tabId);
-            logGood(`[TAB${tabId}] ${symbol} siap!`);
-        } else {
-            logWarn(`[TAB${tabId}] wasm_push_candle_for_tab belum ada di C++, skip`);
-        }
-
-    } else {
-        logWarn(`[TAB${tabId}] IDB kosong untuk ${symbol} → download fresh`);
-        g_pendingTabGap.set(symbol, tabId); // track: history response untuk tabId ini
-        wsSend({ type: "request_sync", symbol: symbol, count: 10000 });
-    }
-};
-
-// =========================================================
-// ══════════════════════════════════════════════════════════════
-// 🔥 PREFILL GAP BEFORE RENDER (tab utama / primary)
-// Awaitable gap fill: kirim request_gap → tunggu handleGapData
-// simpan ke IDB → resolve → lanjut rebuildFullFromDB
-// ══════════════════════════════════════════════════════════════
-function prefillGapBeforeRender(symbol, fromTime) {
-    return new Promise((resolve) => {
-        g_prefillResolve = resolve;
-        wsSend({ type: "request_gap", symbol, from: fromTime, prefill: true });
-        // Timeout safety: kalau server tidak reply dalam 10 detik, lanjut saja
-        setTimeout(() => {
-            if (g_prefillResolve) {
-                logWarn(`[GAP-PREFILL] Timeout 10s → lanjut render tanpa gap`);
-                g_prefillResolve = null;
-                resolve();
-            }
-        }, 10000);
-    });
-}
-
-// 🔥 PREFILL GAP UNTUK TAB NON-UTAMA (per-tab version)
-// Sama seperti prefillGapBeforeRender tapi menggunakan g_tabPrefillResolvers
-// (Map per-tabId) agar tidak konflik dengan primary tab prefill.
-function prefillGapForTab(symbol, fromTime, tabId) {
-    return new Promise((resolve) => {
-        g_tabPrefillResolvers.set(tabId, resolve);
-        wsSend({ type: "request_gap", symbol, from: fromTime, tab_id: tabId, prefill_tab: true });
-        // Timeout safety: kalau server tidak reply dalam 10 detik, lanjut saja
-        setTimeout(() => {
-            if (g_tabPrefillResolvers.has(tabId)) {
-                logWarn(`[TAB${tabId}-GAP] Timeout 10s → lanjut render tanpa gap`);
-                g_tabPrefillResolvers.delete(tabId);
-                resolve();
-            }
-        }, 10000);
-    });
-}
-
-// 10. HANDLE GAP RESPONSE - candle baru background sync
-// =========================================================
-async function handleGapData(msg) {
-    if (!msg.symbol) return;
-    const sym   = msg.symbol;
-    const count = msg.candles ? msg.candles.length : 0;
-
-    // ── 🔥 PREFILL MODE: gap fill sebelum render pertama (PRIMARY) ─────────────
-    // Kalau g_prefillResolve ada, ini adalah response untuk prefillGapBeforeRender.
-    // Simpan ke IDB → resolve Promise → rebuildFullFromDB akan dipanggil setelah ini.
-    if (g_prefillResolve) {
-        const resolver = g_prefillResolve;
-        g_prefillResolve = null;
-        if (count > 0) {
-            logGood(`[GAP-PREFILL] ${sym}: +${count} candles → simpan ke IDB`);
-            addToBuffer(sym, msg.candles);
-            await flushBuffer();
-        } else {
-            logInfo(`[GAP-PREFILL] ${sym}: up-to-date, tidak ada candle baru`);
-        }
-        resolver(); // lanjutkan rebuildFullFromDB
-        return;
-    }
-    // ── 🔥 PREFILL MODE: gap fill sebelum render pertama (NON-PRIMARY TAB) ─────
-    // Kalau msg.prefill_tab && tabId ada di g_tabPrefillResolvers → resolve Promise
-    // Simpan ke IDB → resolve → LoadTabSymbol lanjut push & render.
-    if (msg.prefill_tab && msg.tab_id !== undefined) {
-        const tabId = msg.tab_id;
-        const resolver = g_tabPrefillResolvers.get(tabId);
-        if (resolver) {
-            g_tabPrefillResolvers.delete(tabId);
-            if (count > 0) {
-                logGood(`[TAB${tabId}-GAP] +${count} candles → simpan ke IDB`);
-                addToBuffer(sym, msg.candles);
-                await flushBuffer();
-            } else {
-                logInfo(`[TAB${tabId}-GAP] up-to-date, tidak ada candle baru`);
-            }
-            resolver(); // lanjutkan LoadTabSymbol
-        }
-        return;
-    }
-    // ─────────────────────────────────────────────────────────────────────────
-
-    const pendingTabId = msg.tab_id !== undefined
-        ? msg.tab_id
-        : g_pendingTabGap.get(sym);
-
-    if (pendingTabId !== undefined) {
-        g_pendingTabGap.delete(sym);
-        const tabId = pendingTabId;
-        if (!count) {
-            logInfo(`[TAB${tabId}] GAP ${sym}: up-to-date`);
-            return;
-        }
-        logGood(`[TAB${tabId}] GAP ✅ ${sym}: +${count} candles → IDB rebuild`);
-        addToBuffer(sym, msg.candles);
-        await flushBuffer();
-        await rebuildTabFromDB(tabId, sym);
-        return;
-    }
-
-    // PRIMARY TAB gap sync
-    if (!count) {
-        logInfo(`[GAP] ${sym}: up-to-date`);
-        // Buka gate lazy — gap sudah konfirmasi tidak ada candle baru
-        if (!g_initialLoadDone) {
-            g_initialLoadDone = true;
-            logInfo(`[INIT] Gap 0 — initial load selesai, lazy diizinkan`);
-        }
-        return;
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // 🔥 FIX TELEPORT: Incremental push untuk gap kecil (≤ 200 candle)
-    //
-    // MASALAH LAMA:
-    //   handleGapData → save_anchor → clear_chart → rebuildFull → restore_anchor
-    //   Anchor disimpan sebelum gap candles ditambah → idx anchor = posisi LAMA
-    //   → setelah rebuild dengan total+N bar, restore ke idx lama → view bukan
-    //   di live end → candle "teleport" (lompat beberapa menit ke belakang)
-    //
-    // FIX BARU (gap ≤ 200 candle = user tidak aktif beberapa jam atau kurang):
-    //   Push langsung ke WASM via wasm_push_candle — tidak perlu clear+rebuild.
-    //   Gap candles selalu lebih baru dari semua IDB → aman append ke ujung.
-    //   View tetap di live end, history tersambung mulus tanpa glitch.
-    //
-    // Gap besar (> 200 candle = user tidak aktif sangat lama):
-    //   Full rebuild tanpa restore anchor lama (biarkan C++ auto-resolve ke live end).
-    // ══════════════════════════════════════════════════════════════════
-    const GAP_INCREMENTAL_MAX = 200;
-
-    // Simpan ke IDB dulu (selalu, agar IDB selalu lengkap)
-    addToBuffer(sym, msg.candles);
-    await flushBuffer();
-
-    if (count <= GAP_INCREMENTAL_MAX && sym === CURRENT_SYMBOL) {
-        logGood(`[GAP] ${sym}: +${count} candles → incremental push (no rebuild, no teleport)`);
-
-        // Push langsung ke WASM: urutan oldest→newest
-        const sortedGap = [...msg.candles].sort((a, b) => a.time - b.time);
-        for (const c of sortedGap) {
-            const o  = c.o  ?? c.open  ?? c.c ?? c.close;
-            const h  = c.h  ?? c.high  ?? c.c ?? c.close;
-            const l  = c.l  ?? c.low   ?? c.c ?? c.close;
-            const cl = c.c  ?? c.close;
-            const t  = c.time;
-            const v  = c.v  ?? 1;
-            notifyWASM_candle(o, h, l, cl, t, v);
-            sendTickToWasm(sym, cl, v, t);
-            if (t > lastWasmTime) lastWasmTime = t;
-            if (Module._wasm_push_candle_for_symbol) {
-                Module.ccall('wasm_push_candle_for_symbol', null,
-                    ['string','number','number','number','number','number','number'],
-                    [sym, o, h, l, cl, t, v]);
-            }
-        }
-        // Rebuild HTF saja (tanpa clear GPU)
-        if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
-        logGood(`[GAP] ✅ ${sym}: +${count} candles incremental (history tersambung)`);
-
-    } else if (sym === CURRENT_SYMBOL) {
-        // Gap besar → full rebuild, tapi jangan restore anchor lama
-        logGood(`[GAP] ${sym}: +${count} candles → full rebuild (gap besar)`);
-        if (window._spinnerShow) window._spinnerShow();
-
-        // Update non-primary tabs
-        for (const c of msg.candles) {
-            sendTickToWasm(sym, c.c||c.close, c.v||1, c.time);
-            if (Module._wasm_push_candle_for_symbol) {
-                Module.ccall('wasm_push_candle_for_symbol', null,
-                    ['string','number','number','number','number','number','number'],
-                    [sym, c.o||c.open, c.h||c.high, c.l||c.low,
-                     c.c||c.close, c.time, c.v||1]);
-            }
-        }
-        // Rebuild tanpa restore anchor (C++ auto-resolve ke live end via viewCenterIndex=-1)
-        if (Module._wasm_clear_chart) Module._wasm_clear_chart();
-        await rebuildFullFromDB(sym);
-        // Tidak perlu restore_view_anchor: viewCenterIndex=-1 → snap ke live end
-        if (window._spinnerHide) window._spinnerHide();
-        logGood(`[GAP] ✅ ${sym}: +${count} candles full rebuild`);
-    }
-
-    // Buka gate lazy — initial load selesai
-    if (!g_initialLoadDone) {
-        g_initialLoadDone = true;
-        logInfo(`[INIT] Gap selesai — initial load done, lazy diizinkan`);
-    }
-}
+console.log("%c[WS] V18 Serverless Engine ready ✅", "color:#00FFAA;font-weight:bold");
