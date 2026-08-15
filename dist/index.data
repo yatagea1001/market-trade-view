@@ -1936,6 +1936,13 @@ public:
     int period;
     IndicatorType type;
 
+    // 🔥 INDICATOR LOOKBACK WINDOW:
+    // maxLookback = 0  → unlimited (backward compat, backtest mode)
+    // maxLookback > 0  → Calculate() hanya terima N candle terakhir
+    // Ini solve performance untuk TF kecil (M1/M5 = 150K+ candle)
+    // tanpa mengurangi akurasi (setelah warm-up, hasil identik)
+    int maxLookback = 0;
+
     Indicator(std::string n, int p, ImVec4 c, IndicatorType t) 
         : name(n), period(p), color(c), type(t) {
         static uint64_t s_id_counter = 0;
@@ -1943,6 +1950,19 @@ public:
     }
     
     virtual ~Indicator() {}
+
+    // ── Lookback helper ──────────────────────────────────────
+    // Return pair<startOffset, count> untuk slice candle vector.
+    // startOffset = index pertama yang dipakai dari candles[]
+    // count = jumlah candle yang dipakai
+    // Kalau maxLookback=0 atau data <= maxLookback → pakai semua
+    std::pair<int,int> getLookbackRange(int totalCandles) const {
+        if (maxLookback <= 0 || totalCandles <= maxLookback) {
+            return {0, totalCandles};
+        }
+        int start = totalCandles - maxLookback;
+        return {start, maxLookback};
+    }
 
     // Hitung total (saat pertama load / ganti setting)
     virtual void Calculate(const std::vector<Candle>& candles) = 0;
@@ -2444,6 +2464,7 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 //  MFI, ROC, OBV, Supertrend)
 // ==========================================================
 #include "TA_Indicators.h"
+
 
 // ==========================================================
 // SMC INDICATOR — Smart Money Concepts Overlay
