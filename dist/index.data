@@ -1872,9 +1872,11 @@ public:
 #include <vector>
 #include <string>
 #include <cmath>
+#include <iostream>
 #include "imgui.h"
 #include "implot.h"
 #include "Candle.h"
+#include "MTFHelper.h"
 
 // ==========================================
 // 1. ENUM TIPE INDIKATOR (WAJIB UNTUK LAYOUT)
@@ -1943,6 +1945,17 @@ public:
     // tanpa mengurangi akurasi (setelah warm-up, hasil identik)
     int maxLookback = 0;
 
+    // 🔥 BUFFER-LOCAL OFFSET (replay mode fix):
+    // true  = Calculate() dipanggil dari candles_to_render (windowed buffer)
+    //        → Render harus pakai calcOffsetInBuffer, BUKAN global_offset
+    // false = Calculate() dipanggil dari full array (live mode)
+    //        → Render pakai global_offset seperti biasa
+    bool calcFromBuffer      = false;
+    int  calcOffsetInBuffer  = 0;   // Saat calcFromBuffer=true: posisi awal values[] dalam render buffer
+    
+    // For MTF mappings: store pointer to the candles used for calculation
+    const std::vector<Candle>* mtfSourceCandles = nullptr;
+
     Indicator(std::string n, int p, ImVec4 c, IndicatorType t) 
         : name(n), period(p), color(c), type(t) {
         static uint64_t s_id_counter = 0;
@@ -1972,7 +1985,26 @@ public:
         // Default: Do nothing (override di child class yang perlu)
     }
 
-    // Render grafik
+    // ════════════════════════════════════════════════════════════════
+    //  🔥 BUFFER-RELATIVE MTF HOOK (V2)
+    //
+    //  Dipanggil SETIAP FRAME sebelum Render(), dengan info render buffer:
+    //    global_offset = index global candle pertama yang di-render
+    //    bufferCount    = jumlah candle yang di-render
+    //
+    //  Indicator yang mau pakai buffer-relative cache (EMA/SMA MTF):
+    //    1. Get active chart candles (M1 render buffer)
+    //    2. Compare global_offset+bufferCount dengan cache sebelumnya
+    //    3. Kalau berubah → rebuild M1→H1 map + extend EMA cache
+    //
+    //  Default: no-op (backward compatible, indicator lama tetap jalan)
+    // ════════════════════════════════════════════════════════════════
+    virtual void OnBufferChanged(int global_offset, int bufferCount) {
+        (void)global_offset;
+        (void)bufferCount;
+    }
+
+    // ── Render grafik ──
     virtual void Render(int global_offset, int count) = 0;
     
     // Render tombol setting
@@ -2004,16 +2036,26 @@ public:
     void Render(int global_offset, int count) override {
         if (values.empty()) return;
         int max_size = (int)values.size();
-        if (global_offset >= max_size) return;
 
-        int available = max_size - global_offset;
+        // 🔥 FIX #5: Smart effective_offset detection (sama kayak SMA/EMA)
+        int effective_offset;
+        if (calcFromBuffer) {
+            effective_offset = calcOffsetInBuffer;
+        } else if (max_size <= count + 50) {
+            effective_offset = 0;
+        } else {
+            effective_offset = global_offset;
+        }
+        if (effective_offset >= max_size) effective_offset = 0;
+
+        int available = max_size - effective_offset;
         int points_to_draw = (count < available) ? count : available;
 
         if (points_to_draw <= 0) return;
 
         // Volume biasanya dirender sebagai Bar Chart
         ImPlot::SetNextFillStyle(color);
-        ImPlot::PlotBars(name.c_str(), values.data() + global_offset, points_to_draw);
+        ImPlot::PlotBars(name.c_str(), values.data() + effective_offset, points_to_draw);
     }
 
     bool RenderSettings(const std::vector<Candle>& candles) override {
@@ -2032,11 +2074,23 @@ public:
 };
 // ==========================================
 // 📈 SMA INDICATOR (MT5 STYLE) ✅
+//  🔥 V2: Buffer-Relative MTF Mapping
+//    - Cache SMA values per H1 candle (persistent, running-sum)
+//    - Forward/backward extend sesuai render buffer
+//    - O(1) lookup per point via M1→H1 map
 // ==========================================
 class SMAIndicator : public Indicator {
 public:
     std::vector<double> values;
     PriceSource priceSource = PS_CLOSE;
+
+    // ── V2: MTF Buffer-Relative Cache ──
+    BufferMappedMTFMap mtfMap;
+    std::vector<double> mtfSmaValues;     // SMA values aligned to mtfCandles indices
+    std::vector<double> mtfRunningSum;    // running sum per H1 idx (untuk O(1) extend)
+    int firstValidMtfIdx = -1;
+    int lastValidMtfIdx  = -1;
+    int cachedMtfSize    = -1;
 
     SMAIndicator(int p = 14, ImVec4 c = ImVec4(1, 0.5f, 0, 1)) 
         : Indicator("SMA", p, c, IND_OVERLAY) {}
@@ -2063,6 +2117,14 @@ public:
                 values[i] = runningSum / period;
             }
         }
+
+        // ── V2: Reset MTF cache (TF change atau Calculate manual) ──
+        mtfSmaValues.clear();
+        mtfRunningSum.clear();
+        firstValidMtfIdx = -1;
+        lastValidMtfIdx  = -1;
+        cachedMtfSize = -1;
+        mtfMap.invalidate();
     }
 
     void UpdateLive(int index, double price, double volume, const std::vector<Candle>& candles) override {
@@ -2078,15 +2140,172 @@ public:
         values[index] = sum / period;
     }
 
+    // ════════════════════════════════════════════════════════════════
+    //  🔥 V2: OnBufferChanged — Rebuild M1→H1 map kalau buffer shift
+    // ════════════════════════════════════════════════════════════════
+    void OnBufferChanged(int global_offset, int bufferCount) override {
+        const std::vector<Candle>* baseCandles = GetActiveChartCandles();
+        if (!baseCandles || !mtfSourceCandles) return;
+
+        if (baseCandles == mtfSourceCandles) return;  // non-MTF
+
+        // Update M1→H1 map (cache hit kalau buffer gak berubah)
+        mtfMap.updateIfBufferChanged(
+            baseCandles, mtfSourceCandles,
+            global_offset, bufferCount,
+            0.0
+        );
+
+        // Extend MTF SMA cache kalau H1 array tumbuh (live mode)
+        int mtfSize = (int)mtfSourceCandles->size();
+        if (mtfSize != cachedMtfSize) {
+            if ((int)mtfSmaValues.size() < mtfSize) {
+                mtfSmaValues.resize(mtfSize, NAN);
+                mtfRunningSum.resize(mtfSize, 0.0);
+            }
+            cachedMtfSize = mtfSize;
+        }
+
+        // Extend SMA cache untuk range yang di-render
+        if (mtfMap.mtfStartIdx >= 0 && mtfMap.mtfEndIdx >= 0) {
+            ExtendSMACache(*mtfSourceCandles, mtfMap.mtfStartIdx, mtfMap.mtfEndIdx);
+        }
+    }
+
+    // ── V2: Extend SMA cache forward + backward (running sum) ──
+    void ExtendSMACache(const std::vector<Candle>& mtfCandles,
+                        int neededStartIdx, int neededEndIdx) {
+        int mn = (int)mtfCandles.size();
+        if (mn == 0 || period < 1) return;
+
+        neededStartIdx = std::max(0, std::min(neededStartIdx, mn - 1));
+        neededEndIdx   = std::max(0, std::min(neededEndIdx,   mn - 1));
+        if (neededStartIdx > neededEndIdx) return;
+
+        // Resize kalau array tumbuh
+        if ((int)mtfSmaValues.size() < mn) {
+            mtfSmaValues.resize(mn, NAN);
+            mtfRunningSum.resize(mn, 0.0);
+        }
+
+        // ── Backward extend: recompute dari awal ──
+        // SMA gak punya recursive state seperti EMA, jadi backward lebih gampang:
+        // tinggal recompute running sum dari awal sampai neededEndIdx.
+        if (firstValidMtfIdx < 0 || neededStartIdx < firstValidMtfIdx) {
+            // Full recompute dari 0 (atau lanjutkan kalau ada gap di tengah)
+            int seedStart = 0;
+            if (firstValidMtfIdx >= 0 && neededStartIdx >= firstValidMtfIdx) {
+                seedStart = lastValidMtfIdx + 1;
+            } else {
+                // Recompute from scratch
+                firstValidMtfIdx = -1;
+                lastValidMtfIdx  = -1;
+                seedStart = 0;
+            }
+
+            double sum = 0;
+            for (int i = seedStart; i <= neededEndIdx && i < mn; i++) {
+                sum += GetPrice(mtfCandles[i], priceSource);
+                if (i >= period) {
+                    sum -= GetPrice(mtfCandles[i - period], priceSource);
+                }
+                mtfRunningSum[i] = sum;
+                if (i >= period - 1) {
+                    mtfSmaValues[i] = sum / period;
+                    if (firstValidMtfIdx < 0) firstValidMtfIdx = i;
+                    lastValidMtfIdx = i;
+                }
+            }
+            return;
+        }
+
+        // ── Forward extend: lanjutkan dari lastValidMtfIdx + 1 ──
+        if (neededEndIdx > lastValidMtfIdx) {
+            if (lastValidMtfIdx < 0) lastValidMtfIdx = 0;
+            if (lastValidMtfIdx >= mn) lastValidMtfIdx = mn - 1;
+
+            // Kalau lastValidMtfIdx < period - 1, belum ada nilai valid → mulai dari awal
+            if (lastValidMtfIdx < period - 1) {
+                double sum = 0;
+                for (int i = 0; i <= neededEndIdx && i < mn; i++) {
+                    sum += GetPrice(mtfCandles[i], priceSource);
+                    if (i >= period) {
+                        sum -= GetPrice(mtfCandles[i - period], priceSource);
+                    }
+                    mtfRunningSum[i] = sum;
+                    if (i >= period - 1) {
+                        mtfSmaValues[i] = sum / period;
+                        if (firstValidMtfIdx < 0) firstValidMtfIdx = i;
+                        lastValidMtfIdx = i;
+                    }
+                }
+            } else {
+                // Lanjutkan running sum dari lastValidMtfIdx
+                double sum = mtfRunningSum[lastValidMtfIdx];
+                for (int i = lastValidMtfIdx + 1; i <= neededEndIdx && i < mn; i++) {
+                    sum += GetPrice(mtfCandles[i], priceSource);
+                    if (i >= period) {
+                        sum -= GetPrice(mtfCandles[i - period], priceSource);
+                    }
+                    mtfRunningSum[i] = sum;
+                    mtfSmaValues[i] = sum / period;
+                    lastValidMtfIdx = i;
+                }
+            }
+        }
+    }
+
     void Render(int global_offset, int count) override {
         if (!visible || values.empty()) return;
-        int max_size = (int)values.size();
-        if (global_offset >= max_size) return;
-        int points = std::min(count, max_size - global_offset);
-        if (points <= 0) return;
 
-        ImPlot::SetNextLineStyle(color, 2.0f);
-        ImPlot::PlotLine(name.c_str(), values.data() + global_offset, points);
+        const std::vector<Candle>* baseCandles = GetActiveChartCandles();
+
+        if (baseCandles && mtfSourceCandles && baseCandles != mtfSourceCandles) {
+            // ── V2: MTF mode pakai cached map + cached SMA values ──
+            if (mtfMap.m1ToMtfMap.empty() || mtfSmaValues.empty()) return;
+
+            BufferMappedGetterData data;
+            data.map    = &mtfMap;
+            data.values = &mtfSmaValues;
+
+            ImPlot::SetNextLineStyle(color, 2.0f);
+            ImPlot::PlotLineG(name.c_str(), BufferMappedGetter, &data, count);
+        } else {
+            // ── Non-MTF: existing path (sudah cepat) ──
+            int max_size = (int)values.size();
+
+            // 🔥 FIX #5: Smart effective_offset detection
+            // Problem: Saat replay dengan buffer FULL (M15 offset=3227, values.size()=10001 LOCAL),
+            // calcFromBuffer mungkin false (frame pertama / dari RecalculateAllIndicators).
+            // Render pakai effective_offset=global_offset=3227 → plot values[3227..10000] di X=0..6773
+            // → indicator cuma muncul separuh → NYASAR.
+            //
+            // Solution: Kalau values.size() <= bufferCount, berarti values dari BUFFER (LOCAL).
+            // Pakai effective_offset=0 (LOCAL render). Kalau values.size() > bufferCount (full source),
+            // pakai effective_offset=global_offset (GLOBAL render).
+            int effective_offset;
+            if (calcFromBuffer) {
+                effective_offset = calcOffsetInBuffer;
+            } else if (max_size <= count + 50) {
+                // Values dari buffer (LOCAL), pakai offset 0
+                // +50 tolerance untuk handle off-by-one saat candle baru masuk
+                effective_offset = 0;
+            } else {
+                // Values dari full source (GLOBAL), pakai global_offset
+                effective_offset = global_offset;
+            }
+
+            // Safety clamp: kalau effective_offset >= max_size, fallback ke 0
+            if (effective_offset >= max_size) {
+                effective_offset = 0;
+            }
+
+            int points = std::min(count, max_size - effective_offset);
+            if (points <= 0) return;
+
+            ImPlot::SetNextLineStyle(color, 2.0f);
+            ImPlot::PlotLine(name.c_str(), values.data() + effective_offset, points);
+        }
     }
 
     bool RenderSettings(const std::vector<Candle>& candles) override {
@@ -2115,17 +2334,31 @@ public:
 
 // ==========================================
 // 📉 EMA INDICATOR (MT5 STYLE) ✅
+//  🔥 V2: Buffer-Relative MTF Mapping
+//    - Cache EMA values per H1 candle (persistent)
+//    - Forward/backward extend sesuai render buffer
+//    - O(1) lookup per point via M1→H1 map
 // ==========================================
 class EMAIndicator : public Indicator {
 public:
     std::vector<double> values;
     PriceSource priceSource = PS_CLOSE;
 
+    // ── V2: MTF Buffer-Relative Cache ──
+    BufferMappedMTFMap mtfMap;
+    std::vector<double> mtfEmaValues;   // EMA values aligned to mtfCandles indices
+    int firstValidMtfIdx = -1;         // first H1 index with valid EMA
+    int lastValidMtfIdx  = -1;         // last H1 index with valid EMA
+    bool needsSeed       = true;
+    int cachedMtfSize     = -1;        // untuk detect H1 array tumbuh
+
+    // For non-MTF path, retain old behavior (mtfSourceCandles = source)
     EMAIndicator(int p = 20, ImVec4 c = ImVec4(0, 0.8f, 1, 1)) 
         : Indicator("EMA", p, c, IND_OVERLAY) {}
 
     void Calculate(const std::vector<Candle>& candles) override {
         values.clear();
+        mtfSourceCandles = &candles;
         if (candles.empty() || period < 1) return;
         
         values.resize(candles.size(), NAN);
@@ -2149,6 +2382,14 @@ public:
             double prevEMA = values[i - 1];
             values[i] = (GetPrice(candles[i], priceSource) - prevEMA) * multiplier + prevEMA;
         }
+
+        // ── V2: Reset MTF cache (TF change atau Calculate manual) ──
+        mtfEmaValues.clear();
+        firstValidMtfIdx = -1;
+        lastValidMtfIdx  = -1;
+        needsSeed = true;
+        cachedMtfSize = -1;
+        mtfMap.invalidate();
     }
 
     void UpdateLive(int index, double price, double volume, const std::vector<Candle>& candles) override {
@@ -2162,15 +2403,159 @@ public:
         }
     }
 
+    // ════════════════════════════════════════════════════════════════
+    //  🔥 V2: OnBufferChanged — Rebuild M1→H1 map kalau buffer shift
+    //
+    //  Ini dipanggil setiap frame sebelum Render(). Cuma lakukan kerja
+    //  berat (binary search + build map + extend EMA cache) kalau
+    //  (global_offset, bufferCount) berubah. Kalau sama → cache hit.
+    // ════════════════════════════════════════════════════════════════
+    void OnBufferChanged(int global_offset, int bufferCount) override {
+        const std::vector<Candle>* baseCandles = GetActiveChartCandles();
+        if (!baseCandles || !mtfSourceCandles) return;
+
+        // Kalau base == mtf source → bukan MTF, gak perlu cache M1→H1
+        if (baseCandles == mtfSourceCandles) return;
+
+        // ── V2: Update M1→H1 map (cache hit kalau buffer gak berubah) ──
+        bool rebuilt = mtfMap.updateIfBufferChanged(
+            baseCandles, mtfSourceCandles,
+            global_offset, bufferCount,
+            0.0  // safety margin = 0, pakai H1 candle pertama yang overlap
+        );
+
+        // ── Extend MTF EMA cache kalau H1 array tumbuh (live mode) ──
+        int mtfSize = (int)mtfSourceCandles->size();
+        if (mtfSize != cachedMtfSize) {
+            if ((int)mtfEmaValues.size() < mtfSize) {
+                mtfEmaValues.resize(mtfSize, NAN);
+            }
+            cachedMtfSize = mtfSize;
+        }
+
+        // ── Extend EMA cache untuk range yang di-render ──
+        if (mtfMap.mtfStartIdx >= 0 && mtfMap.mtfEndIdx >= 0) {
+            ExtendEMACache(*mtfSourceCandles, mtfMap.mtfStartIdx, mtfMap.mtfEndIdx);
+        }
+    }
+
+    // ── V2: Extend EMA cache forward + backward ──
+    void ExtendEMACache(const std::vector<Candle>& mtfCandles,
+                        int neededStartIdx, int neededEndIdx) {
+        int mn = (int)mtfCandles.size();
+        if (mn == 0) return;
+
+        neededStartIdx = std::max(0, std::min(neededStartIdx, mn - 1));
+        neededEndIdx   = std::max(0, std::min(neededEndIdx,   mn - 1));
+        if (neededStartIdx > neededEndIdx) return;
+
+        // Resize kalau array tumbuh
+        if ((int)mtfEmaValues.size() < mn) {
+            mtfEmaValues.resize(mn, NAN);
+        }
+
+        double mult = 2.0 / (period + 1);
+
+        // ── Seed: compute SMA buat first EMA value (satu kali aja) ──
+        if (needsSeed) {
+            int seedEnd = period - 1;
+            if (seedEnd >= mn) return;  // H1 array belum cukup untuk seed
+            if (seedEnd < 0) seedEnd = 0;
+
+            double sum = 0;
+            for (int i = 0; i <= seedEnd; i++) {
+                sum += GetPrice(mtfCandles[i], priceSource);
+            }
+            mtfEmaValues[seedEnd] = sum / period;
+            firstValidMtfIdx = seedEnd;
+            lastValidMtfIdx  = seedEnd;
+            needsSeed = false;
+        }
+
+        // ── Backward extend: user pan jauh ke kiri, melewati cache ──
+        // Strategi: full recompute dari awal ke firstValidMtfIdx.
+        // EMA inverse formula amplifies error → lebih aman recompute.
+        if (neededStartIdx < firstValidMtfIdx) {
+            int recomputedStart = std::max(period - 1, neededStartIdx);
+            int recomputedEnd   = firstValidMtfIdx;
+
+            if (recomputedStart <= recomputedEnd && recomputedStart >= period - 1) {
+                // Seed SMA di recomputedStart
+                double sum = 0;
+                for (int i = 0; i < period; i++) {
+                    int idx = recomputedStart - period + 1 + i;
+                    if (idx < 0) idx = 0;
+                    sum += GetPrice(mtfCandles[idx], priceSource);
+                }
+                mtfEmaValues[recomputedStart] = sum / period;
+
+                // Forward dari recomputedStart ke recomputedEnd
+                for (int i = recomputedStart + 1; i <= recomputedEnd; i++) {
+                    double prev = mtfEmaValues[i - 1];
+                    mtfEmaValues[i] = (GetPrice(mtfCandles[i], priceSource) - prev) * mult + prev;
+                }
+                firstValidMtfIdx = recomputedStart;
+            }
+        }
+
+        // ── Forward extend: user pan ke kanan, candle baru muncul ──
+        if (neededEndIdx > lastValidMtfIdx) {
+            int startExtend = std::max(lastValidMtfIdx + 1, firstValidMtfIdx + 1);
+            for (int i = startExtend; i <= neededEndIdx; i++) {
+                if (i >= mn) break;
+                double prev = mtfEmaValues[i - 1];
+                if (std::isnan(prev)) {
+                    // Gap in cache (shouldn't happen), seed ulang dari harga saat ini
+                    mtfEmaValues[i] = GetPrice(mtfCandles[i], priceSource);
+                } else {
+                    mtfEmaValues[i] = (GetPrice(mtfCandles[i], priceSource) - prev) * mult + prev;
+                }
+            }
+            lastValidMtfIdx = std::min(neededEndIdx, mn - 1);
+        }
+    }
+
     void Render(int global_offset, int count) override {
         if (!visible || values.empty()) return;
-        int max_size = (int)values.size();
-        if (global_offset >= max_size) return;
-        int points = std::min(count, max_size - global_offset);
-        if (points <= 0) return;
+        
+        const std::vector<Candle>* baseCandles = GetActiveChartCandles();
+        
+        if (baseCandles && mtfSourceCandles && baseCandles != mtfSourceCandles) {
+            // ── V2: MTF mode pakai cached map + cached EMA values ──
+            if (mtfMap.m1ToMtfMap.empty() || mtfEmaValues.empty()) return;
 
-        ImPlot::SetNextLineStyle(color, 2.0f);
-        ImPlot::PlotLine(name.c_str(), values.data() + global_offset, points);
+            BufferMappedGetterData data;
+            data.map    = &mtfMap;
+            data.values = &mtfEmaValues;
+
+            ImPlot::SetNextLineStyle(color, 2.0f);
+            ImPlot::PlotLineG(name.c_str(), BufferMappedGetter, &data, count);
+        } else {
+            // ── Non-MTF: existing path (sudah cepat) ──
+            int max_size = (int)values.size();
+
+            // 🔥 FIX #5: Smart effective_offset detection (sama kayak SMA)
+            // Kalau values dari buffer (LOCAL, size <= bufferCount), pakai offset 0.
+            // Kalau values dari full source (GLOBAL, size > bufferCount), pakai global_offset.
+            int effective_offset;
+            if (calcFromBuffer) {
+                effective_offset = calcOffsetInBuffer;
+            } else if (max_size <= count + 50) {
+                effective_offset = 0;
+            } else {
+                effective_offset = global_offset;
+            }
+
+            if (effective_offset >= max_size) {
+                effective_offset = 0;
+            }
+
+            int points = std::min(count, max_size - effective_offset);
+            if (points <= 0) return;
+
+            ImPlot::SetNextLineStyle(color, 2.0f);
+            ImPlot::PlotLine(name.c_str(), values.data() + effective_offset, points);
+        }
     }
 
     bool RenderSettings(const std::vector<Candle>& candles) override {
@@ -2270,24 +2655,35 @@ public:
 
     void Render(int global_offset, int count) override {
         if (!visible || upper.empty()) return;
+        int effective_offset = calcFromBuffer ? calcOffsetInBuffer : global_offset;
         int max_size = (int)upper.size();
-        if (global_offset >= max_size) return;
-        int points = std::min(count, max_size - global_offset);
+
+        // 🔥 FIX #5: Smart effective_offset detection (sama kayak SMA/EMA)
+        if (calcFromBuffer) {
+            effective_offset = calcOffsetInBuffer;
+        } else if (max_size <= count + 50) {
+            effective_offset = 0;
+        } else {
+            effective_offset = global_offset;
+        }
+        if (effective_offset >= max_size) effective_offset = 0;
+
+        int points = std::min(count, max_size - effective_offset);
         if (points <= 0) return;
 
         // Render Shaded Area (Cloud)
         ImPlot::SetNextFillStyle(ImVec4(color.x, color.y, color.z, 0.15f));
-        ImPlot::PlotShaded("##BB_Cloud", lower.data() + global_offset, upper.data() + global_offset, points);
+        ImPlot::PlotShaded("##BB_Cloud", lower.data() + effective_offset, upper.data() + effective_offset, points);
 
         // Render Lines
         ImPlot::SetNextLineStyle(ImVec4(color.x, color.y, color.z, 0.7f), 1.0f);
-        ImPlot::PlotLine("BB Upper", upper.data() + global_offset, points);
+        ImPlot::PlotLine("BB Upper", upper.data() + effective_offset, points);
         
         ImPlot::SetNextLineStyle(ImVec4(color.x, color.y, color.z, 0.9f), 1.5f);
-        ImPlot::PlotLine("BB Middle", middle.data() + global_offset, points);
+        ImPlot::PlotLine("BB Middle", middle.data() + effective_offset, points);
         
         ImPlot::SetNextLineStyle(ImVec4(color.x, color.y, color.z, 0.7f), 1.0f);
-        ImPlot::PlotLine("BB Lower", lower.data() + global_offset, points);
+        ImPlot::PlotLine("BB Lower", lower.data() + effective_offset, points);
     }
 
     bool RenderSettings(const std::vector<Candle>& candles) override {
@@ -2401,13 +2797,24 @@ public:
     void Render(int global_offset, int count) override {
         if (!visible || values.empty()) return;
         int max_size = (int)values.size();
-        if (global_offset >= max_size) return;
-        int points = std::min(count, max_size - global_offset);
+
+        // 🔥 FIX #5: Smart effective_offset detection (sama kayak SMA/EMA)
+        int effective_offset;
+        if (calcFromBuffer) {
+            effective_offset = calcOffsetInBuffer;
+        } else if (max_size <= count + 50) {
+            effective_offset = 0;
+        } else {
+            effective_offset = global_offset;
+        }
+        if (effective_offset >= max_size) effective_offset = 0;
+
+        int points = std::min(count, max_size - effective_offset);
         if (points <= 0) return;
 
         // Main Line
         ImPlot::SetNextLineStyle(color, 2.0f);
-        ImPlot::PlotLine(name.c_str(), values.data() + global_offset, points);
+        ImPlot::PlotLine(name.c_str(), values.data() + effective_offset, points);
 
         // Overbought (70) & Oversold (30) Lines
         ImPlot::PushStyleColor(ImPlotCol_Line, ImVec4(1, 0, 0, 0.4f));
@@ -2465,20 +2872,12 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 // ==========================================================
 #include "TA_Indicators.h"
 
-
 // ==========================================================
 // SMC INDICATOR — Smart Money Concepts Overlay
 //  OB zones, BOS/CHOCH lines, Swing pivots
 //  V2: Incremental scan + Dual Validation + Evolution
 // ==========================================================
 #include "SMC_Indicator.h"
-
-// ==========================================================
-// SNIPER PRO — Composite Indicator
-//  EMA crossover + VWAP + Smart Filter (6/7)
-//  BUY/SELL arrows + Entry/SL/TP1-5 levels
-//  Port dari Sniper Pro by Hammad Dilber V.05 (MQL5)
-// ==========================================================
 #include "SniperPro_Indicator.h"
 // ============================================================
 // JarvisBridge.h — Bridge antara Jarvis AI dan Chart Engine
