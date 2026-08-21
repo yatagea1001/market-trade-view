@@ -1878,6 +1878,35 @@ public:
 #include "Candle.h"
 #include "MTFHelper.h"
 
+// ════════════════════════════════════════════════════════════════
+//  📖 INDICATOR RENDERING PATTERN — WAJIB BACA SEBELUM BIKIN INDICATOR BARU
+//
+//  Bug historis: Indicator nyasar saat replay dengan buffer FULL.
+//  Root cause: values dari Calculate(buffer) → values.size() LOCAL (10K),
+//  tapi Render pakai global_offset (misal 3227 untuk M15) → offset salah.
+//
+//  Fix #5 (penerapan saat ini): Smart effective_offset detection di Render().
+//  Setiap indicator WAJIB pakai pattern ini:
+//
+//      int effective_offset;
+//      if (calcFromBuffer) {
+//          effective_offset = calcOffsetInBuffer;          // Case 1: replay recalc
+//      } else if (n <= count + 50) {
+//          effective_offset = 0;                          // Case 2: LOCAL buffer
+//      } else {
+//          effective_offset = off;                        // Case 3: GLOBAL full source
+//      }
+//      if (effective_offset >= n) effective_offset = 0;   // Safety fallback
+//
+//  Tiga case auto-detect:
+//    1. calcFromBuffer=true  → dari replay recalc, pakai LOCAL offset
+//    2. n ≤ count+50          → values dari BUFFER (LOCAL), pakai 0
+//    3. n > count+50          → values dari FULL SOURCE (GLOBAL), pakai off
+//
+//  Dokumentasi lengkap + template custom indicator:
+//  ARCHITECTURE_GUIDE.md → "Bug Fix Log — Indicator Nyasar saat Replay"
+// ════════════════════════════════════════════════════════════════
+
 // ==========================================
 // 1. ENUM TIPE INDIKATOR (WAJIB UNTUK LAYOUT)
 // ==========================================
@@ -2879,6 +2908,14 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 // ==========================================================
 #include "SMC_Indicator.h"
 #include "SniperPro_Indicator.h"
+
+// ==========================================================
+// STC CROSS INDICATOR — Stochastic Cross Reversal
+//  Port dari STC_Cross.mq5 by Ahmad Arju
+//  BUY: K cross above D di zona oversold + anti-streak
+//  SELL: K cross below D di zona overbought + anti-streak
+// ==========================================================
+#include "STC_Cross_Indicator.h"
 // ============================================================
 // JarvisBridge.h — Bridge antara Jarvis AI dan Chart Engine
 // Phase 6: Swing + Key Levels + Auto-Context + DRAW TOOLS
