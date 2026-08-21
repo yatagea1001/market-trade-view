@@ -2916,6 +2916,13 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 //  SELL: K cross below D di zona overbought + anti-streak
 // ==========================================================
 #include "STC_Cross_Indicator.h"
+
+// ==========================================================
+// FLAG PATTERN INDICATOR — Flag Pattern Detector
+//  Port dari Flag_Pattern_Detector.mq5 by Christian Benjamin
+//  Deteksi Bull/Bear Flag: pole + channel + rectangle + arrow
+// ==========================================================
+#include "FlagPattern_Indicator.h"
 // ============================================================
 // JarvisBridge.h — Bridge antara Jarvis AI dan Chart Engine
 // Phase 6: Swing + Key Levels + Auto-Context + DRAW TOOLS
