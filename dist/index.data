@@ -2923,6 +2923,13 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 //  Deteksi Bull/Bear Flag: pole + channel + rectangle + arrow
 // ==========================================================
 #include "FlagPattern_Indicator.h"
+
+// ==========================================================
+// TREND SIGNAL INDICATOR — HH/HL/LH/LL Structure + Entry/SL/TP
+//  Port dari Trend Signal Indicator.mq5 by Yata Tema Gea
+//  Deteksi Market Structure lengkap dengan Premium/Discount + Entry/SL/TP
+// ==========================================================
+#include "TrendSignal_Indicator.h"
 // ============================================================
 // JarvisBridge.h — Bridge antara Jarvis AI dan Chart Engine
 // Phase 6: Swing + Key Levels + Auto-Context + DRAW TOOLS
