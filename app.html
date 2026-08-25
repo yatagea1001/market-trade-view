@@ -31,6 +31,7 @@ canvas.emscripten {
     outline: none;
     -webkit-tap-highlight-color: transparent;
     opacity: 1;
+    transition: top 0.3s ease, height 0.3s ease; /* 🔥 smooth saat header toggle */
 }
 
 /* --- 👻 CLASS HANTU (RAHASIA TEMBUS PANDANG) --- */
@@ -782,23 +783,23 @@ button:hover { background: #008ccb; }
 
 <!-- 🤖 JARVIS JS TOOLBAR OVERLAY — MODULAR (v3) — loads setelah WASM siap -->
 <!-- Load order PENTING: config → state → bridge → utils → tools → ui → sync → index -->
-<!-- ?v=7 cache-busting: debug logging + alert queue -->
-<script src="web/jarvis_toolbar/config.js?v=7"></script>
-<script src="web/jarvis_toolbar/state.js?v=7"></script>
-<script src="web/jarvis_toolbar/wasm-bridge.js?v=7"></script>
-<script src="web/jarvis_toolbar/utils.js?v=7"></script>
-<script src="web/jarvis_toolbar/tools/drawing-tools.js?v=7"></script>
-<script src="web/jarvis_toolbar/tools/right-bar-tools.js?v=7"></script>
-<script src="web/jarvis_toolbar/tools/nav-tools.js?v=7"></script>
-<script src="web/jarvis_toolbar/tools/replay-tools.js?v=7"></script>
-<script src="web/jarvis_toolbar/ui/html-builder.js?v=7"></script>
-<script src="web/jarvis_toolbar/ui/css-builder.js?v=7"></script>
-<script src="web/jarvis_toolbar/ui/tooltip.js?v=7"></script>
-<script src="web/jarvis_toolbar/ui/context-menu.js?v=7"></script>
-<script src="web/jarvis_toolbar/ui/scrollbar.js?v=7"></script>
-<script src="web/jarvis_toolbar/sync/position-sync.js?v=7"></script>
-<script src="web/jarvis_toolbar/sync/state-sync.js?v=7"></script>
-<script src="web/jarvis_toolbar/index.js?v=7"></script>
+<!-- ?v=8 cache-busting: header toggle button kiri nav bar -->
+<script src="web/jarvis_toolbar/config.js?v=8"></script>
+<script src="web/jarvis_toolbar/state.js?v=8"></script>
+<script src="web/jarvis_toolbar/wasm-bridge.js?v=8"></script>
+<script src="web/jarvis_toolbar/utils.js?v=8"></script>
+<script src="web/jarvis_toolbar/tools/drawing-tools.js?v=8"></script>
+<script src="web/jarvis_toolbar/tools/right-bar-tools.js?v=8"></script>
+<script src="web/jarvis_toolbar/tools/nav-tools.js?v=8"></script>
+<script src="web/jarvis_toolbar/tools/replay-tools.js?v=8"></script>
+<script src="web/jarvis_toolbar/ui/html-builder.js?v=8"></script>
+<script src="web/jarvis_toolbar/ui/css-builder.js?v=8"></script>
+<script src="web/jarvis_toolbar/ui/tooltip.js?v=8"></script>
+<script src="web/jarvis_toolbar/ui/context-menu.js?v=8"></script>
+<script src="web/jarvis_toolbar/ui/scrollbar.js?v=8"></script>
+<script src="web/jarvis_toolbar/sync/position-sync.js?v=8"></script>
+<script src="web/jarvis_toolbar/sync/state-sync.js?v=8"></script>
+<script src="web/jarvis_toolbar/index.js?v=8"></script>
 
 <script src="web/my_dev_logic.js"></script>
 <script src="web/ob_tutorial.js"></script>

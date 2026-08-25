@@ -5,10 +5,10 @@
 // Dipisahkan dari CSS dan logic supaya mudah edit tampilan.
 //
 // NAV BAR STRUCTURE:
-//   ┌─────────────────────────────────────────┬──────────┐
-//   │ #jt-nav-scrollable (flex, overflow)     │ #pinned  │
-//   │ Symbol │ TF │ Candle │ Ind │ +New │ Rep │  🔔 Alert │
-//   └─────────────────────────────────────────┴──────────┘
+//   ┌──────────┬────────────────────────────────────────┬──────────┐
+//   │ 👁 Header │ #jt-nav-scrollable (flex, overflow)   │ #pinned  │
+//   │  (kiri)  │ Symbol │ TF │ Candle │ Ind │ +New │ Rep│  🔔 Alert│
+//   └──────────┴────────────────────────────────────────┴──────────┘
 // ============================================================
 
 window.JT = window.JT || {};
@@ -36,10 +36,16 @@ JT.HtmlBuilder = {
     </div>
 
     <!-- ═══ NAV TOOLBAR ═══════════════════════════════════════
-         Struktur: Scrollable Area (kiri) + Pinned Alert (kanan)
-         Alert selalu kelihatan, tidak bisa di-scroll.
+         Struktur: Header Toggle (kiri) + Scrollable (tengah) + Alert (kanan)
+         Header toggle & Alert SELALU kelihatan, tidak bisa di-scroll.
     ══════════════════════════════════════════════════════════ -->
     <div id="jt-nav-toolbar" class="jt-toolbar">
+        <!-- Pinned Kiri: Header Toggle -->
+        <div id="jt-nav-header-toggle-pinned" class="jt-nav-pinned jt-nav-pinned-left">
+            ${this.buildHeaderTogglePinnedButton(JT.NavTools.HEADER_TOGGLE_PINNED)}
+        </div>
+        <div class="jt-nav-pinned-separator"></div>
+        <!-- Scrollable Tengah -->
         <div id="jt-nav-scrollable" class="jt-nav-scrollable">
             <div class="jt-toolbar-inner">
                 ${JT.NavTools.SCROLLABLE_TOOLS.map(t => this.buildNavButton(t)).join('')}
@@ -47,6 +53,7 @@ JT.HtmlBuilder = {
             <div class="jt-scroll-indicator"></div>
         </div>
         <div class="jt-nav-pinned-separator"></div>
+        <!-- Pinned Kanan: Alert -->
         <div id="jt-nav-alert-pinned" class="jt-nav-pinned">
             ${this.buildAlertPinnedButton(JT.NavTools.ALERT_PINNED)}
         </div>
@@ -122,6 +129,19 @@ JT.HtmlBuilder = {
         ${iconHTML}
         <!-- Notification Badge (seperti WA) -->
         <span id="jt-alert-badge" class="jt-badge">0</span>
+    </button>
+    `;
+    },
+
+    /**
+     * Build tombol Header Toggle PINNED (selalu di kiri).
+     * Hanya icon eye / eye-off — tanpa tulisan, compact simetris dengan Alert.
+     * Active state = header sedang tersembunyi.
+     */
+    buildHeaderTogglePinnedButton(tool) {
+        return `
+    <button class="jt-btn jt-header-toggle-btn" data-tool-id="${tool.id}" data-seg-idx="${tool.segIdx}" data-tooltip="${tool.tooltip}" data-active="false" title="Sembunyikan Header">
+        <span class="jt-icon-svg">${tool.svgShow}</span>
     </button>
     `;
     }

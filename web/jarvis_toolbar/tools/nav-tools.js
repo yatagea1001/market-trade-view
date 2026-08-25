@@ -4,13 +4,14 @@
 // Tombol navigasi + label dinamis + icon update dari C++.
 //
 // ARSITEKTUR NAV BAR:
-//   ┌─────────────────────────────────────────┬──────────┐
-//   │ Symbol │ TF │ Candle │ Ind │ +New │ Rep │  🔔 Alert │
-//   │ ← scrollable (bisa geser) →            │  pinned  │
-//   └─────────────────────────────────────────┴──────────┘
+//   ┌──────────┬─────────────────────────────────────────┬──────────┐
+//   │ 👁 Header │ Symbol │ TF │ Candle │ Ind │ +New │ Rep │  🔔 Alert │
+//   │  pinned  │ ← scrollable (bisa geser) →            │  pinned  │
+//   └──────────┴─────────────────────────────────────────┴──────────┘
 //
+//   - HEADER TOGGLE (KIRI): Pinned di paling kiri, show/hide #app-header
 //   - SCROLLABLE TOOLS: Symbol → Replay (bisa di-scroll)
-//   - PINNED ALERT: Selalu kelihatan di kanan, tidak bisa scroll
+//   - PINNED ALERT (KANAN): Selalu kelihatan di kanan, tidak bisa scroll
 //     + Badge merah (seperti WA) kalau ada notif
 //
 // CARA TAMBAH NAV BUTTON BARU:
@@ -84,6 +85,26 @@ JT.NavTools = {
         }
     ],
 
+    // ── Pinned Header Toggle Button (TIDAK bisa di-scroll, selalu di KIRI) ──
+    HEADER_TOGGLE_PINNED: {
+        id: 'nav-header-toggle',
+        segIdx: -4,
+        icon: null,
+        // Panel dengan header bar di atas (header TAMPIL)
+        svgShow: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="8" x2="21" y2="8"/><line x1="8" y1="8" x2="8" y2="21"/></svg>',
+        // Panel tanpa header bar (header TERSEMBUNYI)
+        svgHide: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="8" y1="3" x2="8" y2="21"/></svg>',
+        get svg() { return JT.NavTools.headerVisible ? this.svgShow : this.svgHide; },
+        label: 'Header',
+        tooltip: 'Show / Hide Header Bar',
+        isWide: false,
+        isHeaderToggle: true,
+        isPinned: true
+    },
+
+    // ── Header Visibility State ──
+    headerVisible: true,   // true = header kelihatan (default)
+
     // ── Pinned Alert Button (TIDAK bisa di-scroll, selalu di kanan) ──
     ALERT_PINNED: {
         id: 'nav-alert',
@@ -129,7 +150,16 @@ JT.NavTools = {
             });
         });
 
-        // Bind pinned alert button
+        // Bind pinned header toggle button (kiri)
+        const headerToggleBtn = overlay.querySelector('#jt-nav-header-toggle-pinned');
+        if (headerToggleBtn) {
+            headerToggleBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                this._handleHeaderToggleClick(headerToggleBtn);
+            });
+        }
+
+        // Bind pinned alert button (kanan)
         const alertBtn = overlay.querySelector('#jt-nav-alert-pinned');
         if (alertBtn) {
             alertBtn.addEventListener('click', (e) => {
@@ -137,6 +167,66 @@ JT.NavTools = {
                 this._handleAlertClick(alertBtn);
             });
         }
+    },
+
+    // ── Click Handler: Header Toggle Button (pinned kiri) ──
+    _handleHeaderToggleClick(btn) {
+        this.headerVisible = !this.headerVisible;
+
+        const header = document.getElementById('app-header');
+        const canvas = document.getElementById('canvas');     // ImGui canvas
+        const HEADER_H = 36; // px — harus sama dengan CSS top: 36px
+
+        if (this.headerVisible) {
+            // ── TAMPILKAN header ──
+            // 1. Munculkan dulu (display flex) lalu fade-in
+            if (header) {
+                header.style.display = '';
+                // Force reflow supaya transition jalan dari opacity 0
+                void header.offsetHeight;
+                header.style.opacity = '1';
+                header.style.transform = 'translateY(0)';
+            }
+            // 2. Canvas turun kembali ke posisi normal (dengan smooth transition)
+            if (canvas) {
+                canvas.style.transition = 'top 0.3s ease, height 0.3s ease';
+                canvas.style.top  = HEADER_H + 'px';
+                canvas.style.height = 'calc(100% - ' + HEADER_H + 'px)';
+            }
+        } else {
+            // ── SEMBUNYIKAN header ──
+            // 1. Slide up header (opacity + transform)
+            if (header) {
+                header.style.opacity = '0';
+                header.style.transform = 'translateY(-100%)';
+                // Setelah animasi selesai → display none
+                setTimeout(() => {
+                    if (!this.headerVisible) header.style.display = 'none';
+                }, 300);
+            }
+            // 2. Canvas langsung naik ke top:0 full height (smooth)
+            if (canvas) {
+                canvas.style.transition = 'top 0.3s ease, height 0.3s ease';
+                canvas.style.top  = '0px';
+                canvas.style.height = '100%';
+            }
+        }
+
+        // Update tombol icon (eye / eye-off)
+        const iconSvg = btn.querySelector('.jt-icon-svg');
+        if (iconSvg) {
+            iconSvg.innerHTML = this.headerVisible
+                ? this.HEADER_TOGGLE_PINNED.svgShow
+                : this.HEADER_TOGGLE_PINNED.svgHide;
+        }
+
+        // Update active state (active = header TERSEMBUNYI = mata coret)
+        btn.dataset.active = this.headerVisible ? 'false' : 'true';
+
+        // Tooltip update
+        btn.title = this.headerVisible ? 'Sembunyikan Header' : 'Tampilkan Header';
+
+        JT.Utils.flashButton(btn);
     },
 
     // ── Click Handler: Nav Buttons (scrollable) ──

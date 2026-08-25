@@ -285,10 +285,10 @@ JT.CssBuilder = {
         margin: 4px 0;
     }
 
-    /* ── Pinned Area (kanan) ──
+    /* ── Pinned Area (kanan & kiri) ──
        - flex-shrink: 0 → TIDAK BOLEH mengecil
        - flex-grow: 0 → TIDAK ambil ruang ekstra
-       - Alert SELALU kelihatan di sini */
+       - Selalu kelihatan di ujung nav bar */
     .jt-nav-pinned {
         flex: 0 0 auto;
         display: flex;
@@ -296,10 +296,15 @@ JT.CssBuilder = {
         justify-content: center;
         padding: 0 4px;
         flex-shrink: 0;
-        background: rgba(10, 10, 18, 0.3);  /* sedikit bg biar kelihatan beda */
+        background: rgba(10, 10, 18, 0.3);
     }
 
-    /* ── Alert Button (pinned, icon only — tanpa tulisan) ── */
+    /* ── Pinned Kiri: Header Toggle ── */
+    .jt-nav-pinned-left {
+        background: rgba(10, 10, 18, 0.3);
+    }
+
+    /* ── Alert Button (pinned kanan, icon only — tanpa tulisan) ── */
     .jt-alert-btn {
         width: 36px !important;
         height: 36px !important;
@@ -321,6 +326,37 @@ JT.CssBuilder = {
     .jt-alert-btn[data-active="true"] {
         background: rgba(${R}, 0.2);
         border-color: rgba(${R}, 0.8);
+    }
+
+    /* ── Header Toggle Button (pinned kiri, simetris dengan Alert) ── */
+    .jt-header-toggle-btn {
+        width: 36px !important;
+        height: 36px !important;
+        min-width: 36px !important;
+        max-width: 36px !important;
+        padding: 4px !important;
+        border-radius: 8px;
+        position: relative;
+    }
+    .jt-header-toggle-btn .jt-icon-svg {
+        width: 20px;
+        height: 20px;
+    }
+    .jt-header-toggle-btn:hover {
+        background: rgba(${R}, 0.15);
+        border-color: rgba(${R}, 0.5);
+    }
+    /* Active = header sedang TERSEMBUNYI → warna orange (eye-off) */
+    .jt-header-toggle-btn[data-active="true"] {
+        background: rgba(255, 160, 50, 0.15);
+        border-color: rgba(255, 160, 50, 0.55);
+        color: #ffa032;
+        box-shadow: 0 0 10px rgba(255, 160, 50, 0.2);
+    }
+
+    /* ── Transisi smooth #app-header show/hide ── */
+    #app-header {
+        transition: opacity 0.3s ease, transform 0.3s ease;
     }
 
     /* ════════════════════════════════════════════════════════
