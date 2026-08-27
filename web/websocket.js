@@ -1759,7 +1759,6 @@ window.SetActiveSymbol = async function(newSym) {
     }
 
     if (CURRENT_SYMBOL && CURRENT_SYMBOL === newSym && isWasmReady) return;
-
     logInfo(`[UI] Switching: ${CURRENT_SYMBOL} → ${newSym}`);
     await flushBuffer();
 
@@ -1794,6 +1793,83 @@ window.SetActiveSymbol = async function(newSym) {
     // 🔥 OPTIMASI: Cek apakah IDB sudah punya data symbol ini
     //   - Kalau YA → SKENARIO 2 (IDB Hit): push langsung tanpa baca IDB ulang
     //   - Kalau TIDAK → SKENARIO 1 (No IDB): download binary/REST
+    // ════════════════════════════════════════════════════════════════
+    // 🚀 SNAPSHOT CACHE V22: Instant reload via WASM FS (IDBFS)
+    //   Cek snapshot dulu (instant ~50ms untuk 100K candle)
+    //   Kalau ada → pakai snapshot, return early (skip IDB JS read)
+    //   Kalau gak ada → lanjut ke IDB/binary flow (original)
+    // ════════════════════════════════════════════════════════════════
+    if (CURRENT_SYMBOL && Module._wasm_snapshot_exists && Module._wasm_load_snapshot) {
+        const exists = Module._wasm_snapshot_exists(CURRENT_SYMBOL);
+        if (exists) {
+            logGood(`[SNAPSHOT] Found for ${CURRENT_SYMBOL} → instant load...`);
+            showLoadingOverlay(`Loading ${CURRENT_SYMBOL} from snapshot`, 50);
+
+            // 🔥 Load snapshot ke WASM (instant! ~50ms untuk 100K candle)
+            const snapshotCount = Module._wasm_load_snapshot(CURRENT_SYMBOL);
+            if (snapshotCount > 0) {
+                if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+                isRendering = true;
+
+                if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+                if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+                if (Module._wasm_trigger_goto_live) Module._wasm_trigger_goto_live();
+
+                if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+                isRendering = false;
+
+                g_initialLoadDone = true;
+                hideLoadingOverlay();
+                logGood(`[SNAPSHOT] ✅ ${CURRENT_SYMBOL}: ${snapshotCount} bars loaded INSTANT!`);
+
+                // Gap fill di background
+                (async () => {
+                    try {
+                        const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
+                        if (existing.length > 0) {
+                            const latestTime = existing.reduce((max, c) => c.time > max ? c.time : max, 0);
+                            lastWasmTime = latestTime;
+                            const nowEpoch = Math.floor(Date.now() / 1000);
+                            const gapSeconds = nowEpoch - latestTime;
+
+                            if (gapSeconds > 30) {
+                                logWarn(`[SNAPSHOT-GAP] ${Math.floor(gapSeconds/60)}m gap → background fill`);
+                                const gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestTime);
+                                if (gapCandles.length > 0) {
+                                    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+                                    gapCandles.sort((a, b) => a.time - b.time);
+                                    for (const c of gapCandles) {
+                                        notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v || 1);
+                                        if (c.time > lastWasmTime) lastWasmTime = c.time;
+                                    }
+                                    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+                                    if (Module._wasm_trigger_goto_live) Module._wasm_trigger_goto_live();
+                                    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+                                    addToBuffer(CURRENT_SYMBOL, gapCandles);
+                                    await flushBuffer();
+                                    setTimeout(() => {
+                                        if (Module._wasm_save_snapshot) Module._wasm_save_snapshot(CURRENT_SYMBOL);
+                                    }, 1000);
+                                    logGood(`[SNAPSHOT-GAP] ✅ +${gapCandles.length} gap candles`);
+                                }
+                            }
+                        }
+                    } catch(e) {
+                        logWarn(`[SNAPSHOT-GAP] Error: ${e.message}`);
+                        if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+                    }
+                })();
+
+                // 🔥 RETURN EARLY — skip IDB/binary flow
+                return;
+            } else {
+                logWarn(`[SNAPSHOT] Load failed → fallback to IDB`);
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 🔥 ORIGINAL FLOW: IDB atau binary (kalau snapshot gak ada)
     // ════════════════════════════════════════════════════════════════
     const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
     const MIN = 500;
@@ -1874,7 +1950,6 @@ window.SetActiveSymbol = async function(newSym) {
         } else {
             logInfo(`[GAP] IDB fresh (gap ${gapSeconds}s) → no gap fill needed`);
         }
-
     } else {
         // ════════════════════════════════════════════════════════════
         // 🔥 SKENARIO 1: CACHE MISS (No IDB) — First time load
@@ -1984,6 +2059,13 @@ window.SetActiveSymbol = async function(newSym) {
                 hideLoadingOverlay();
                 saveToIDBBackground(CURRENT_SYMBOL, candles).then(() => {
                     logGood(`[FALLBACK] ✅ IDB background save selesai`);
+                    // 🔥 SNAPSHOT: Save snapshot untuk instant reload berikutnya
+                    if (Module._wasm_save_snapshot) {
+                        setTimeout(() => {
+                            const cnt = Module._wasm_save_snapshot(CURRENT_SYMBOL);
+                            if (cnt > 0) logGood(`[SNAPSHOT] 💾 Saved ${cnt} candles (for reload)`);
+                        }, 2000);
+                    }
                 });
             } else {
                 logErr(`[DOWNLOAD] Tidak ada data untuk ${CURRENT_SYMBOL}`);
@@ -2455,4 +2537,24 @@ Module.onRuntimeInitialized = async function() {
 window.addEventListener('beforeunload', () => flushBuffer());
 setInterval(() => { if (candleBuffer.length > 0) flushBuffer(); }, 10000);
 
-console.log("%c[WS] V18 Serverless Engine ready ✅", "color:#00FFAA;font-weight:bold");
+// ════════════════════════════════════════════════════════════════
+// 🔥 FIX CRASH FIRST LOAD: Auto-resume pending symbol
+//
+// Saat first load, C++ mungkin call SetActiveSymbol() sebelum websocket6.js
+// selesai load → crash "SetActiveSymbol is not defined".
+// C++ simpan symbol pending di window.__pendingSymbol.
+// Setelah websocket6.js load, cek & resume di sini.
+// ════════════════════════════════════════════════════════════════
+if (window.__pendingSymbol) {
+    const pending = window.__pendingSymbol;
+    window.__pendingSymbol = null;
+    logGood(`[AUTO-RESUME] Resuming pending symbol: ${pending}`);
+    // Beri delay 100ms supaya init lainnya selesai dulu
+    setTimeout(() => {
+        if (typeof window.SetActiveSymbol === 'function') {
+            window.SetActiveSymbol(pending);
+        }
+    }, 100);
+}
+
+console.log("%c[WS] V22 HYBRID + Snapshot Cache ready ✅", "color:#FF8C00;font-weight:bold");
