@@ -425,23 +425,102 @@
     <div class="modal-overlay" id="auth-modal">
         <div class="modal-content auth-form">
             <button class="close-modal" onclick="closeModal()">×</button>
-            <h2 id="form-title">Selamat Datang</h2>
-            <p class="subtitle" id="form-subtitle">Masuk untuk mengakses Platform</p>
-            
-            <form id="auth-form">
-                <div class="input-group">
-                    <label>Email</label>
-                    <input type="email" id="email" required placeholder="nama@email.com">
+
+            <!-- ── PANEL: LOGIN ── -->
+            <div id="panel-login">
+                <h2>Selamat Datang 👋</h2>
+                <p class="subtitle">Masuk untuk mengakses Platform</p>
+
+                <button id="btn-google" style="width:100%;padding:12px;background:#fff;color:#111;border:1px solid #e5e7eb;border-radius:8px;font-weight:700;font-size:0.95rem;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:16px;">
+                    <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.2l6.7-6.7C35.7 2.5 30.2 0 24 0 14.7 0 6.7 5.4 2.8 13.3l7.8 6.1C12.5 13 17.8 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h12.7c-.6 3-2.3 5.5-4.8 7.2l7.5 5.8C43.5 37.3 46.5 31.4 46.5 24.5z"/><path fill="#FBBC05" d="M10.6 28.6A14.8 14.8 0 0 1 9.5 24c0-1.6.3-3.2.8-4.6l-7.8-6.1A23.8 23.8 0 0 0 0 24c0 3.8.9 7.4 2.5 10.6l8.1-6z"/><path fill="#34A853" d="M24 48c6.2 0 11.4-2 15.2-5.5l-7.5-5.8c-2.1 1.4-4.8 2.3-7.7 2.3-6.2 0-11.4-4.2-13.3-9.9l-8.1 6C6.7 42.6 14.7 48 24 48z"/></svg>
+                    Masuk dengan Google
+                </button>
+
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+                    <div style="flex:1;height:1px;background:rgba(255,255,255,0.1)"></div>
+                    <span style="color:#6b7280;font-size:0.8rem">atau dengan email</span>
+                    <div style="flex:1;height:1px;background:rgba(255,255,255,0.1)"></div>
                 </div>
-                <div class="input-group">
-                    <label>Password</label>
-                    <input type="password" id="password" required placeholder="Minimal 6 karakter">
+
+                <form id="form-login">
+                    <div class="input-group">
+                        <label>Email</label>
+                        <input type="email" id="login-email" required placeholder="nama@email.com">
+                    </div>
+                    <div class="input-group">
+                        <label>Password</label>
+                        <input type="password" id="login-pass" required placeholder="Password Anda">
+                    </div>
+                    <div style="text-align:right;margin-top:-8px;margin-bottom:12px;">
+                        <span onclick="showPanel('forgot')" style="font-size:0.8rem;color:#34d399;cursor:pointer;font-weight:600;">Lupa Password?</span>
+                    </div>
+                    <button type="submit" class="btn-submit" id="btn-login-submit">Masuk ke Platform</button>
+                </form>
+                <p id="login-error" style="color:#ef4444;font-size:0.875rem;margin-top:12px;min-height:20px;text-align:center;"></p>
+                <div class="toggle-mode" onclick="showPanel('register')">Belum punya akun? <span>Daftar di sini</span></div>
+            </div>
+
+            <!-- ── PANEL: REGISTER ── -->
+            <div id="panel-register" style="display:none">
+                <h2>Buat Akun Baru 🚀</h2>
+                <p class="subtitle">Daftar gratis, tidak perlu kartu kredit</p>
+
+                <button id="btn-google-reg" style="width:100%;padding:12px;background:#fff;color:#111;border:1px solid #e5e7eb;border-radius:8px;font-weight:700;font-size:0.95rem;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:16px;">
+                    <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.2l6.7-6.7C35.7 2.5 30.2 0 24 0 14.7 0 6.7 5.4 2.8 13.3l7.8 6.1C12.5 13 17.8 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h12.7c-.6 3-2.3 5.5-4.8 7.2l7.5 5.8C43.5 37.3 46.5 31.4 46.5 24.5z"/><path fill="#FBBC05" d="M10.6 28.6A14.8 14.8 0 0 1 9.5 24c0-1.6.3-3.2.8-4.6l-7.8-6.1A23.8 23.8 0 0 0 0 24c0 3.8.9 7.4 2.5 10.6l8.1-6z"/><path fill="#34A853" d="M24 48c6.2 0 11.4-2 15.2-5.5l-7.5-5.8c-2.1 1.4-4.8 2.3-7.7 2.3-6.2 0-11.4-4.2-13.3-9.9l-8.1 6C6.7 42.6 14.7 48 24 48z"/></svg>
+                    Daftar dengan Google
+                </button>
+
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+                    <div style="flex:1;height:1px;background:rgba(255,255,255,0.1)"></div>
+                    <span style="color:#6b7280;font-size:0.8rem">atau dengan email</span>
+                    <div style="flex:1;height:1px;background:rgba(255,255,255,0.1)"></div>
                 </div>
-                <button type="submit" class="btn-submit" id="btn-submit">Masuk ke Platform</button>
-            </form>
-            
-            <p id="error-msg"></p>
-            <div class="toggle-mode" id="toggle-btn" onclick="toggleAuthMode()">Belum punya akun? <span>Daftar di sini</span></div>
+
+                <form id="form-register">
+                    <div class="input-group">
+                        <label>Email</label>
+                        <input type="email" id="reg-email" required placeholder="nama@email.com">
+                    </div>
+                    <div class="input-group">
+                        <label>Password</label>
+                        <input type="password" id="reg-pass" required placeholder="Minimal 6 karakter">
+                    </div>
+                    <div class="input-group">
+                        <label>Konfirmasi Password</label>
+                        <input type="password" id="reg-pass2" required placeholder="Ulangi password Anda">
+                    </div>
+                    <button type="submit" class="btn-submit" id="btn-reg-submit">Daftar Sekarang</button>
+                </form>
+                <p id="reg-error" style="color:#ef4444;font-size:0.875rem;margin-top:12px;min-height:20px;text-align:center;"></p>
+                <div class="toggle-mode" onclick="showPanel('login')">Sudah punya akun? <span>Masuk di sini</span></div>
+            </div>
+
+            <!-- ── PANEL: LUPA PASSWORD ── -->
+            <div id="panel-forgot" style="display:none">
+                <div onclick="showPanel('login')" style="display:flex;align-items:center;gap:6px;color:#34d399;font-size:0.85rem;font-weight:600;cursor:pointer;margin-bottom:20px;">← Kembali ke Login</div>
+                <h2>Reset Password 🔑</h2>
+                <p class="subtitle">Masukkan email Anda. Kami akan kirimkan link reset password.</p>
+                <form id="form-forgot">
+                    <div class="input-group">
+                        <label>Email Terdaftar</label>
+                        <input type="email" id="forgot-email" required placeholder="nama@email.com">
+                    </div>
+                    <button type="submit" class="btn-submit" id="btn-forgot-submit">Kirim Link Reset</button>
+                </form>
+                <p id="forgot-msg" style="font-size:0.875rem;margin-top:12px;min-height:20px;text-align:center;"></p>
+            </div>
+
+            <!-- ── PANEL: VERIFIKASI EMAIL ── -->
+            <div id="panel-verify" style="display:none;text-align:center;">
+                <div style="font-size:3rem;margin-bottom:15px;">📧</div>
+                <h2>Cek Email Anda!</h2>
+                <p class="subtitle" style="margin-bottom:20px;">Link verifikasi sudah dikirim ke:<br><strong id="verify-email-display" style="color:#34d399;"></strong></p>
+                <p style="color:#9ca3af;font-size:0.85rem;line-height:1.6;margin-bottom:20px;">Buka email Anda dan klik link verifikasi. Setelah itu, silakan masuk kembali.</p>
+                <button id="btn-resend" class="btn-submit" style="margin-bottom:12px;">Kirim Ulang Email</button>
+                <button onclick="showPanel('login')" style="width:100%;padding:12px;background:transparent;border:1px solid rgba(255,255,255,0.15);border-radius:8px;color:#9ca3af;font-size:0.9rem;cursor:pointer;">Kembali ke Login</button>
+                <p id="resend-msg" style="color:#34d399;font-size:0.8rem;margin-top:10px;min-height:18px;"></p>
+            </div>
+
         </div>
     </div>
 
@@ -452,14 +531,12 @@
         const mobMenu = document.getElementById('mobile-menu');
         mobToggle.addEventListener('click', () => {
             mobMenu.classList.toggle('active');
-            mobToggle.innerText = mobMenu.classList.contains('active') ? '✕' : '☰';
+            mobToggle.innerText = mobMenu.classList.contains('active') ? '\u2715' : '\u2630';
         });
-        
-        // Auto-close mobile menu on link click
         document.querySelectorAll('.mob-link').forEach(link => {
             link.addEventListener('click', () => {
                 mobMenu.classList.remove('active');
-                mobToggle.innerText = '☰';
+                mobToggle.innerText = '\u2630';
             });
         });
 
@@ -470,18 +547,28 @@
             else nav.classList.remove('scrolled');
         });
 
-        // Modal Logic
+        // Modal & Panel Logic
         const modal = document.getElementById('auth-modal');
-        function openModal() { modal.classList.add('active'); }
+        const allPanels = ['login','register','forgot','verify'];
+        function openModal(panel) { modal.classList.add('active'); showPanel(panel || 'login'); }
         function closeModal() { modal.classList.remove('active'); }
+        modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+        window.showPanel = function(name) {
+            allPanels.forEach(p => document.getElementById('panel-'+p).style.display = 'none');
+            document.getElementById('panel-'+name).style.display = 'block';
+        }
     </script>
 
     <!-- FIREBASE MODULE -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-        import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+                 sendEmailVerification, sendPasswordResetEmail,
+                 onAuthStateChanged, GoogleAuthProvider, signInWithPopup }
+                 from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, serverTimestamp }
+                 from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-        // FIREBASE CONFIG - TETAP MENGGUNAKAN YANG ASLI DARI USER
         const firebaseConfig = {
             apiKey: "AIzaSyAx20fXyKEgOYLXaKqV6N2luncaviY2DSs",
             authDomain: "markettradeweb.firebaseapp.com",
@@ -491,64 +578,148 @@
             appId: "1:125606231501:web:71caa059ad9dbd37acd884"
         };
 
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
+        const fireApp  = initializeApp(firebaseConfig);
+        const auth     = getAuth(fireApp);
+        const db       = getFirestore(fireApp);
+        const provider = new GoogleAuthProvider();
 
-        const form = document.getElementById('auth-form');
-        const emailInput = document.getElementById('email');
-        const passInput = document.getElementById('password');
-        const btnSubmit = document.getElementById('btn-submit');
-        const errorMsg = document.getElementById('error-msg');
-        const title = document.getElementById('form-title');
-        const subtitle = document.getElementById('form-subtitle');
-        const toggleBtn = document.getElementById('toggle-btn');
-        
-        let isRegister = false;
+        // ── Terjemahan error Firebase ke Bahasa Indonesia ──
+        function friendlyError(code) {
+            const map = {
+                'auth/user-not-found':        'Email tidak terdaftar. Silakan daftar terlebih dahulu.',
+                'auth/wrong-password':        'Password salah. Coba lagi atau klik "Lupa Password".',
+                'auth/invalid-credential':    'Email atau password tidak valid.',
+                'auth/email-already-in-use':  'Email ini sudah terdaftar. Silakan masuk.',
+                'auth/weak-password':         'Password terlalu lemah. Gunakan minimal 6 karakter.',
+                'auth/invalid-email':         'Format email tidak valid.',
+                'auth/too-many-requests':     'Terlalu banyak percobaan. Coba beberapa menit lagi.',
+                'auth/network-request-failed':'Koneksi internet bermasalah. Periksa jaringan Anda.',
+                'auth/popup-closed-by-user':  'Login Google dibatalkan.',
+            };
+            return map[code] || 'Terjadi kesalahan. Silakan coba lagi. (' + code + ')';
+        }
 
-        // Redirect to app.html if already logged in
-        onAuthStateChanged(auth, (user) => {
-            if (user) {
-                btnSubmit.innerText = "Memasukkan Anda...";
-                btnSubmit.disabled = true;
-                window.location.href = "app.html";
+        // ── Buat / Update profil user di Firestore ──
+        async function syncUserProfile(user, method) {
+            const ref  = doc(db, 'users', user.uid);
+            const snap = await getDoc(ref);
+            if (!snap.exists()) {
+                await setDoc(ref, {
+                    uid:          user.uid,
+                    email:        user.email,
+                    displayName:  user.displayName || '',
+                    photoURL:     user.photoURL    || '',
+                    status:       'free',
+                    premiumUntil: null,
+                    loginMethod:  method || 'email',
+                    createdAt:    serverTimestamp(),
+                    lastLogin:    serverTimestamp()
+                });
+            } else {
+                await setDoc(ref, { lastLogin: serverTimestamp() }, { merge: true });
+            }
+        }
+
+        // ── Monitor Auth State ──
+        onAuthStateChanged(auth, async (user) => {
+            if (user && user.emailVerified) {
+                await syncUserProfile(user);
+                window.location.href = 'app.html';
             }
         });
 
-        window.toggleAuthMode = function() {
-            isRegister = !isRegister;
-            if (isRegister) {
-                title.innerText = "Buat Akun Baru";
-                subtitle.innerText = "Daftar untuk mencoba platform Gratis";
-                btnSubmit.innerText = "Daftar Sekarang";
-                toggleBtn.innerHTML = "Sudah punya akun? <span>Masuk di sini</span>";
-            } else {
-                title.innerText = "Selamat Datang";
-                subtitle.innerText = "Masuk untuk mengakses Platform";
-                btnSubmit.innerText = "Masuk ke Platform";
-                toggleBtn.innerHTML = "Belum punya akun? <span>Daftar di sini</span>";
-            }
-            errorMsg.innerText = "";
+        // ── Google Sign In ──
+        async function handleGoogle() {
+            try {
+                const result = await signInWithPopup(auth, provider);
+                await syncUserProfile(result.user, 'google');
+                window.location.href = 'app.html';
+            } catch(err) { alert(friendlyError(err.code)); }
         }
+        document.getElementById('btn-google').onclick     = handleGoogle;
+        document.getElementById('btn-google-reg').onclick = handleGoogle;
 
-        form.addEventListener('submit', (e) => {
+        // ── Form Login ──
+        document.getElementById('form-login').addEventListener('submit', async (e) => {
             e.preventDefault();
-            const email = emailInput.value;
-            const password = passInput.value;
-            btnSubmit.disabled = true; btnSubmit.innerText = "Memproses..."; errorMsg.innerText = "";
-
-            if (isRegister) {
-                createUserWithEmailAndPassword(auth, email, password)
-                    .catch((error) => {
-                        errorMsg.innerText = error.message;
-                        btnSubmit.disabled = false; btnSubmit.innerText = "Daftar Sekarang";
-                    });
-            } else {
-                signInWithEmailAndPassword(auth, email, password)
-                    .catch((error) => {
-                        errorMsg.innerText = "Email atau Password salah!";
-                        btnSubmit.disabled = false; btnSubmit.innerText = "Masuk ke Platform";
-                    });
+            const email = document.getElementById('login-email').value.trim();
+            const pass  = document.getElementById('login-pass').value;
+            const errEl = document.getElementById('login-error');
+            const btn   = document.getElementById('btn-login-submit');
+            btn.disabled = true; btn.innerText = 'Memproses...'; errEl.innerText = '';
+            try {
+                const cred = await signInWithEmailAndPassword(auth, email, pass);
+                if (!cred.user.emailVerified) {
+                    document.getElementById('verify-email-display').innerText = email;
+                    window._pendingVerifyUser = cred.user;
+                    window.showPanel('verify');
+                    btn.disabled = false; btn.innerText = 'Masuk ke Platform';
+                    return;
+                }
+                await syncUserProfile(cred.user);
+                window.location.href = 'app.html';
+            } catch(err) {
+                errEl.innerText = friendlyError(err.code);
+                btn.disabled = false; btn.innerText = 'Masuk ke Platform';
             }
+        });
+
+        // ── Form Register ──
+        document.getElementById('form-register').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const email  = document.getElementById('reg-email').value.trim();
+            const pass   = document.getElementById('reg-pass').value;
+            const pass2  = document.getElementById('reg-pass2').value;
+            const errEl  = document.getElementById('reg-error');
+            const btn    = document.getElementById('btn-reg-submit');
+            errEl.innerText = '';
+            if (pass !== pass2) { errEl.innerText = 'Password dan konfirmasi tidak cocok!'; return; }
+            btn.disabled = true; btn.innerText = 'Membuat akun...';
+            try {
+                const cred = await createUserWithEmailAndPassword(auth, email, pass);
+                await sendEmailVerification(cred.user);
+                await syncUserProfile(cred.user, 'email');
+                document.getElementById('verify-email-display').innerText = email;
+                window._pendingVerifyUser = cred.user;
+                window.showPanel('verify');
+            } catch(err) {
+                errEl.innerText = friendlyError(err.code);
+            }
+            btn.disabled = false; btn.innerText = 'Daftar Sekarang';
+        });
+
+        // ── Form Lupa Password ──
+        document.getElementById('form-forgot').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const email = document.getElementById('forgot-email').value.trim();
+            const msgEl = document.getElementById('forgot-msg');
+            const btn   = document.getElementById('btn-forgot-submit');
+            btn.disabled = true; btn.innerText = 'Mengirim...'; msgEl.innerText = '';
+            try {
+                await sendPasswordResetEmail(auth, email);
+                msgEl.style.color = '#34d399';
+                msgEl.innerText = '\u2705 Link reset berhasil dikirim! Cek email Anda.';
+            } catch(err) {
+                msgEl.style.color = '#ef4444';
+                msgEl.innerText = friendlyError(err.code);
+            }
+            btn.disabled = false; btn.innerText = 'Kirim Link Reset';
+        });
+
+        // ── Kirim Ulang Verifikasi ──
+        document.getElementById('btn-resend').addEventListener('click', async () => {
+            const msgEl = document.getElementById('resend-msg');
+            const btn   = document.getElementById('btn-resend');
+            const user  = window._pendingVerifyUser || auth.currentUser;
+            if (!user) return;
+            btn.disabled = true; btn.innerText = 'Mengirim...';
+            try {
+                await sendEmailVerification(user);
+                msgEl.innerText = '\u2705 Email verifikasi sudah dikirim ulang!';
+            } catch(err) {
+                msgEl.innerText = '\u274C Gagal mengirim. Coba beberapa menit lagi.';
+            }
+            btn.disabled = false; btn.innerText = 'Kirim Ulang Email';
         });
     </script>
 </body>
