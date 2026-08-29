@@ -399,6 +399,12 @@ function pushCandlesToWASMDirect(symbol, candles) {
 
     candles.sort((a, b) => a.time - b.time);
 
+    // 🔥 DOUBLE BUFFER: Begin swap mode (candle push masuk ke staging buffer)
+    if (Module._wasm_begin_swap) {
+        Module._wasm_begin_swap();
+        logInfo(`[SWAP] Begin swap mode — staging ${candles.length} candles`);
+    }
+
     // 🔥 HYBRID V21: Render LANGSUNG ke WASM — INSTANT (gak tunggu IDB write)
     logGood(`[HYBRID-DIRECT] ${candles.length} bars → push WASM (instant render)...`);
     isRendering = true;
@@ -409,7 +415,15 @@ function pushCandlesToWASMDirect(symbol, candles) {
         if (c.time > lastWasmTime) lastWasmTime = c.time;
     }
 
+    // 🔥 DOUBLE BUFFER: Commit swap (atomic replace g_allCandles["M1"])
+    if (Module._wasm_commit_swap) {
+        Module._wasm_commit_swap(0);  // 0 = skip HTF rebuild di commit (kita rebuild di bawah)
+        logGood(`[SWAP] ✅ Atomic swap committed`);
+    }
+
     if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+    if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+    if (Module._wasm_trigger_goto_live) Module._wasm_trigger_goto_live();
     if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
     isRendering = false;
     downloadedSymbols.add(symbol);
@@ -431,9 +445,59 @@ function pushCandlesToWASMDirect(symbol, candles) {
 // Save candle ke IDB dengan chunking (5000 per transaction)
 // + yield ke UI tiap chunk supaya gak block
 // ════════════════════════════════════════════════════════════════
-async function saveToIDBBackgroundChunked(symbol, candles) {
-    if (!db || !candles.length) return;
+let idbWorker = null;
 
+// 🔥 Init Web Worker untuk IDB background write (anti FPS drop)
+function initIDBWorker() {
+    if (idbWorker) return;
+    try {
+        idbWorker = new Worker('web/idb_worker.js');
+        idbWorker.onmessage = function(e) {
+            const msg = e.data;
+            if (msg.type === 'ready') {
+                logGood('[IDB-WORKER] ✅ Background writer ready (anti FPS drop)');
+            } else if (msg.type === 'progress') {
+                logInfo(`[IDB-WORKER] ${msg.symbol}: ${msg.saved}/${msg.total} (chunk ${msg.chunk}/${msg.totalChunks})`);
+            } else if (msg.type === 'done') {
+                logGood(`[IDB-WORKER] ✅ ${msg.symbol}: ${msg.saved} candles saved (background, non-blocking)`);
+            } else if (msg.type === 'error') {
+                logWarn(`[IDB-WORKER] ${msg.symbol || ''} error: ${msg.error}`);
+            }
+        };
+        idbWorker.onerror = function(e) {
+            logWarn(`[IDB-WORKER] Worker error: ${e.message}`);
+            idbWorker = null;  // Fallback ke main thread
+        };
+        // Init DB di worker
+        idbWorker.postMessage({ type: 'init' });
+        logInfo('[IDB-WORKER] Spawning background writer...');
+    } catch (e) {
+        logWarn(`[IDB-WORKER] Failed to spawn worker: ${e.message} → fallback to main thread`);
+        idbWorker = null;
+    }
+}
+
+async function saveToIDBBackgroundChunked(symbol, candles) {
+    if (!candles.length) return 0;
+
+    // 🔥 PRIORITY 1: Pakai Web Worker (TRUE background, gak block render loop)
+    if (idbWorker) {
+        return new Promise((resolve) => {
+            const handler = (e) => {
+                if (e.data.type === 'done' || e.data.type === 'error') {
+                    if (e.data.symbol === symbol) {
+                        idbWorker.removeEventListener('message', handler);
+                        resolve(e.data.saved || 0);
+                    }
+                }
+            };
+            idbWorker.addEventListener('message', handler);
+            idbWorker.postMessage({ type: 'save', symbol, candles });
+        });
+    }
+
+    // 🔥 FALLBACK: Main thread chunked (kalau worker gak available)
+    if (!db) return 0;
     const CHUNK_SIZE = 5000;
     const totalChunks = Math.ceil(candles.length / CHUNK_SIZE);
     let savedCount = 0;
@@ -443,7 +507,6 @@ async function saveToIDBBackgroundChunked(symbol, candles) {
         const end = Math.min(start + CHUNK_SIZE, candles.length);
         const chunk = candles.slice(start, end);
 
-        // Prepare data untuk IDB
         const data = chunk.map(c => ({
             symbol,
             time: c.time,
@@ -452,7 +515,6 @@ async function saveToIDBBackgroundChunked(symbol, candles) {
             footprint: c.footprint || null
         }));
 
-        // Single transaction per chunk
         try {
             await new Promise((resolve, reject) => {
                 const tx = db.transaction([STORE], 'readwrite');
@@ -464,12 +526,9 @@ async function saveToIDBBackgroundChunked(symbol, candles) {
                 tx.onerror = () => reject(tx.error);
             });
             savedCount += chunk.length;
-
-            // Yield ke UI supaya gak block (penting untuk 100K+ candle)
             await new Promise(r => setTimeout(r, 0));
         } catch (e) {
-            logWarn(`[HYBRID-IDB-BG] Chunk ${chunkIdx + 1}/${totalChunks} error: ${e.message}`);
-            // Continue ke chunk berikutnya (gak fatal)
+            logWarn(`[IDB-BG] Chunk ${chunkIdx + 1}/${totalChunks} error: ${e.message}`);
         }
     }
     return savedCount;
@@ -486,9 +545,24 @@ async function evictOldIDBCandles(maxAgeDays = 30) {
     let deletedCount = 0;
 
     try {
+        // 🔥 FIX: Cek apakah object store + index 'time' ada dulu
+        // Tanpa ini: "The operation failed because the requested database object could not be found"
+        const storeNames = Array.from(db.objectStoreNames);
+        if (!storeNames.includes(STORE)) {
+            logInfo(`[HYBRID-EVICT] Store '${STORE}' belum ada → skip eviction`);
+            return;
+        }
+
         const tx = db.transaction([STORE], 'readwrite');
         const store = tx.objectStore(STORE);
-        const idx = store.index('time');  // index by time
+
+        // Cek apakah index 'time' ada
+        if (!store.indexNames.contains('time')) {
+            logInfo(`[HYBRID-EVICT] Index 'time' belum ada → skip eviction (IDB schema lama)`);
+            return;
+        }
+
+        const idx = store.index('time');
         const range = IDBKeyRange.upperBound(cutoffTime);
 
         await new Promise((resolve, reject) => {
@@ -510,7 +584,7 @@ async function evictOldIDBCandles(maxAgeDays = 30) {
             logGood(`[HYBRID-EVICT] 🗑️ Deleted ${deletedCount} candles older than ${maxAgeDays} days`);
         }
     } catch (e) {
-        logWarn(`[HYBRID-EVICT] Eviction error: ${e.message}`);
+        logWarn(`[HYBRID-EVICT] Eviction skipped: ${e.message}`);
     }
 }
 
@@ -1759,6 +1833,12 @@ window.SetActiveSymbol = async function(newSym) {
     }
 
     if (CURRENT_SYMBOL && CURRENT_SYMBOL === newSym && isWasmReady) return;
+
+    // 🔥 FIX: Skip loading overlay kalau ini startup auto-load (oldSym kosong)
+    //   - Startup reload: C++ sudah tau symbol → oldSym="" → skip overlay
+    //   - User switch via picker: oldSym="BTCUSDT" → show overlay
+    const isStartupAutoLoad = (!CURRENT_SYMBOL || CURRENT_SYMBOL === "");
+
     logInfo(`[UI] Switching: ${CURRENT_SYMBOL} → ${newSym}`);
     await flushBuffer();
 
@@ -1776,7 +1856,12 @@ window.SetActiveSymbol = async function(newSym) {
     g_tabSymbolMap.set(0, newSym);
     resetTabLazy(0);
 
-    showLoadingOverlay(`Switching to ${newSym}...`, 0);
+    // 🔥 FIX: Hanya show overlay kalau user explicit switch (bukan startup reload)
+    if (!isStartupAutoLoad) {
+        showLoadingOverlay(`Switching to ${newSym}...`, 0);
+    } else {
+        logInfo(`[STARTUP] Auto-load detected, skip "Switching" overlay`);
+    }
 
     if (Module && Module._wasm_clear_chart) {
         Module._wasm_clear_chart();
@@ -1897,7 +1982,10 @@ window.SetActiveSymbol = async function(newSym) {
         const gapSeconds = nowEpoch - latestTime;
         const gapMinutes = Math.floor(gapSeconds / 60);
 
-        if (gapSeconds > 30) {
+        // 🔥 FIX: Skip gap fill kalau gap ≤ 30 detik (data fresh) atau latestTime invalid
+        //   Sebelumnya: gapSeconds > 30 → tapi kalau latestTime=0, gapSeconds=nowEpoch (huge)
+        //   Sekarang: cek latestTime > 0 dulu, baru cek gap
+        if (latestTime > 0 && gapSeconds > 30 && gapMinutes > 0) {
             logWarn(`[GAP-BG] ${gapMinutes}m gap → background fill dari HL REST`);
             // Gap fill async — tidak block UI
             (async () => {
@@ -2409,6 +2497,10 @@ Module.onRuntimeInitialized = async function() {
     if (Module._wasm_on_login_success) Module._wasm_on_login_success();
 
     await initIndexedDB();
+
+    // 🔥 HYBRID V21: Init Web Worker untuk IDB background write (anti FPS drop)
+    // Worker jalan di thread terpisah → gak block render loop WASM
+    initIDBWorker();
 
     // 🔥 HYBRID V21: Evict candle > 30 hari di background (hemat storage)
     // Non-blocking — gak nungguin, jalan paralel sama init lainnya
