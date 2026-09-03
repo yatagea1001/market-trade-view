@@ -2035,6 +2035,18 @@ public:
 
     // ── Render grafik ──
     virtual void Render(int global_offset, int count) = 0;
+
+    // ════════════════════════════════════════════════════════════════
+    //  🔥 RENDER OVERLAY — dipanggil SETELAH EndPlot() (di luar ImPlot context)
+    //
+    //  Dipakai untuk render dashboard, info panel, atau UI overlay lain
+    //  yang butuh ImGui window (bisa di-move, di-resize, dll).
+    //
+    //  Default: no-op (backward compatible)
+    // ════════════════════════════════════════════════════════════════
+    virtual void RenderOverlay() {
+        // Default: do nothing (override di child class yang perlu dashboard)
+    }
     
     // Render tombol setting
     virtual bool RenderSettings(const std::vector<Candle>& candles) = 0;
@@ -5392,6 +5404,7 @@ using ExecutionResult = ToolExecutionResult;
 #include "GlobalShapeManager.h"
 #include "GPUCandleRenderer.h"   // ← tiap tab punya renderer sendiri
 #include "OrderFlowRenderer.h"  // ← tiap tab punya OF renderer sendiri
+#include "TPOProfileRenderer.h" // ← tiap tab punya TPO renderer sendiri
 #include "CrosshairRenderer.h"  // ← tiap tab punya crosshair state sendiri
 
 enum CandleRenderStyle {
@@ -5406,6 +5419,10 @@ enum CandleRenderStyle {
     // Footprint bar (proportional bar kiri=sell, kanan=buy)
     // Paling informatif, default utama untuk order flow
     RENDER_FP_BAR,
+    // ── TPO PROFILE (Time Price Opportunity) ──────────────────
+    // Histogram horizontal: price level → count candle yang visit level itu
+    // + POC (Point of Control) + VA (Value Area 70%) + HVN/LVN
+    RENDER_TPO,
 
     RENDER_STYLE_COUNT  // sentinel untuk cycling
 };
@@ -5418,6 +5435,7 @@ static inline const char* CandleStyleName(CandleRenderStyle s) {
         case RENDER_FP_OVERLAY: return "FP Overlay";
         case RENDER_FP_PROFILE: return "FP Profile";
         case RENDER_FP_BAR:     return "FP Bar";
+        case RENDER_TPO:        return "TPO Profile";
         default:                return "Candle";
     }
 }
@@ -5427,6 +5445,16 @@ static inline bool IsFootprintStyle(CandleRenderStyle s) {
     return s == RENDER_FP_OVERLAY
         || s == RENDER_FP_PROFILE
         || s == RENDER_FP_BAR;
+}
+
+// Apakah style ini TPO Profile?
+static inline bool IsTPOStyle(CandleRenderStyle s) {
+    return s == RENDER_TPO;
+}
+
+// Apakah style ini butuh hollow body (FP + TPO)?
+static inline bool IsHollowBodyStyle(CandleRenderStyle s) {
+    return IsFootprintStyle(s) || IsTPOStyle(s);
 }
 
 // ─────────────────────────────────────────────
@@ -5490,6 +5518,10 @@ struct ChartTab {
     // Tab BTCUSDT M15 tidak akan pakai tickSize XAUUSD, dan sebaliknya.
     // fpZoom per-tab (Ctrl+Scroll) juga disimpan di sini, bukan di ChartTab.
     OrderFlowRenderer orderFlowRenderer;
+
+    // 🔥 TPO PROFILE RENDERER PER-TAB
+    // Sama seperti OrderFlowRenderer — tiap tab punya instance sendiri
+    TPOProfileRenderer tpoRenderer;
 
     CandleRenderStyle renderStyle = RENDER_CANDLE;
     ImVec4 lineColor = {0.2f, 0.7f, 1.f, 1.f};
