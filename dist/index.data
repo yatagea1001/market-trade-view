@@ -2942,6 +2942,82 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 //  Deteksi Market Structure lengkap dengan Premium/Discount + Entry/SL/TP
 // ==========================================================
 #include "TrendSignal_Indicator.h"
+
+// ==========================================================
+// 🔥 INDICATOR FACTORY — bikin indicator dari name + period
+//
+// Dipakai buat auto-recreate indicator dari JSON saat reload.
+// Pattern: IndicatorFactory::Create(name, period) → Indicator*
+//
+// Yang di-support (case-insensitive):
+//   sma, ema, rsi, bb/bollinger, macd, stochastic/stoch,
+//   atr, adx, cci, williams/williamsr, supertrend, mfi, roc, obv, volume,
+//   smc, sniperpro/sniper pro, stc cross/stc, flag pattern/flag,
+//   trend signal/trendsignal
+// ==========================================================
+class IndicatorFactory {
+public:
+    static Indicator* Create(const std::string& name, int period = 0) {
+        // Normalize: lowercase
+        std::string n = name;
+        for (auto& c : n) c = (char)std::tolower(c);
+
+        // Default period kalau 0
+        if (period <= 0) {
+            if (n == "sma" || n == "ema") period = 21;
+            else if (n == "rsi") period = 14;
+            else if (n == "bb" || n == "bollinger") period = 20;
+            else if (n == "volume") period = 0;
+            else period = 14;  // generic default
+        }
+
+        // Standard TA indicators
+        if (n == "sma")        return new SMAIndicator(period, ImVec4(1, 0.8f, 0.2f, 1));
+        if (n == "ema")        return new EMAIndicator(period, ImVec4(1, 0.5f, 0.1f, 1));
+        if (n == "rsi")        return new RSIIndicator(period, ImVec4(0, 1, 1, 1));
+        if (n == "bb" || n == "bollinger")
+                              return new BollingerIndicator(period, 2.0);
+        if (n == "macd")       return new MACDIndicator();
+        if (n == "stochastic" || n == "stoch")
+                              return new StochIndicator();
+        if (n == "atr")        return new ATRIndicator();
+        if (n == "adx")        return new ADXIndicator();
+        if (n == "cci")        return new CCIIndicator();
+        if (n == "williams" || n == "williamsr")
+                              return new WilliamsRIndicator();
+        if (n == "supertrend") return new SupertrendIndicator();
+        if (n == "mfi")        return new MFIIndicator();
+        if (n == "roc")        return new ROCIndicator();
+        if (n == "obv")        return new OBVIndicator();
+        if (n == "volume")     return new VolumeIndicator(0, ImVec4(0.2f, 0.8f, 0.2f, 0.6f));
+
+        // Custom overlay indicators (port dari MQL5)
+        if (n == "smc")        return new SMCIndicator();
+        if (n == "sniperpro" || n == "sniper pro" || n == "sniper")
+                              return new SniperProIndicator();
+        if (n == "stc cross" || n == "stccross" || n == "stc")
+                              return new STC_CrossIndicator();
+        if (n == "flag pattern" || n == "flagpattern" || n == "flag")
+                              return new FlagPatternIndicator();
+        if (n == "trend signal" || n == "trendsignal" || n == "trend")
+                              return new TrendSignalIndicator();
+
+        return nullptr;
+    }
+
+    // List semua nama indicator yang di-support (untuk UI/debug)
+    static std::vector<std::string> GetSupportedNames() {
+        return {
+            "sma", "ema", "rsi", "bb", "bollinger",
+            "macd", "stochastic", "stoch",
+            "atr", "adx", "cci", "williams", "williamsr",
+            "supertrend", "mfi", "roc", "obv", "volume",
+            "smc", "sniperpro", "stc cross",
+            "flag pattern", "trend signal"
+        };
+    }
+};
+
 // ============================================================
 // JarvisBridge.h — Bridge antara Jarvis AI dan Chart Engine
 // Phase 6: Swing + Key Levels + Auto-Context + DRAW TOOLS
@@ -5531,6 +5607,20 @@ struct ChartTab {
     // Toggle via tombol "VP" di toolbar — amber kalau ON.
     // Render: DrawVolumeProfile() dipanggil SETELAH switch(renderStyle)
     bool showVolumeProfile = false;
+
+    // 🔥 TPO OVERLAY — layer tambahan, sama seperti VP
+    // Bisa aktif di atas SEMUA style: Candle, Line, Area, OHLC, FP, TPO, dll.
+    // Saat ON + renderStyle == RENDER_TPO → hybrid mode:
+    //    - Candle jadi hollow + TPO histogram di kanan (default TPO Profile)
+    //    - TPO Overlay squares JUGA aktif di atas chart
+    // Saat ON + renderStyle == RENDER_CANDLE/Line/Area/OHLC → combo mode:
+    //    - Candle tetap solid (gak hollow)
+    //    - TPO squares di-render di atas chart
+    // User pilih Visual Mode di settings popup TPO:
+    //    - Histogram (Phase 1 bars) — default
+    //    - Square/Circle/Alphabet (right panel)
+    //    - Overlay on Chart (GOMSBR style — squares di chart)
+    bool showTPOOverlay = false;
 
     // ── SMART SYNC (Zero Copy Per Frame) ──────────────────────
     // Buffer candle milik tab ini — tidak di-copy ulang tiap frame
