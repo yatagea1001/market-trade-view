@@ -2944,6 +2944,20 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 #include "TrendSignal_Indicator.h"
 
 // ==========================================================
+// SESSION SWEEP INDICATOR — Dynamic Session Sweep Detector
+//  Port dari MQL5 "Dynamic_Session_Sweep_Detector.mq5"
+//  by Gbadebo Adedayo David
+//
+//  Fitur:
+//    - Track Asian / London / New York session ranges (Kill Zone style)
+//    - Auto-backfill historical sessions (lookback hingga 90 hari)
+//    - Detect liquidity sweep (wick beyond level, close back inside)
+//    - Draw session boxes confined to session hours
+//    - Pakai ChartDrawKit → MTF + replay + clipping otomatis
+// ==========================================================
+#include "SessionSweep_Indicator.h"
+
+// ==========================================================
 // 🔥 INDICATOR FACTORY — bikin indicator dari name + period
 //
 // Dipakai buat auto-recreate indicator dari JSON saat reload.
@@ -3001,6 +3015,8 @@ public:
                               return new FlagPatternIndicator();
         if (n == "trend signal" || n == "trendsignal" || n == "trend")
                               return new TrendSignalIndicator();
+        if (n == "session sweep" || n == "sessionsweep" || n == "session")
+                              return new SessionSweepIndicator();
 
         return nullptr;
     }
@@ -3013,7 +3029,8 @@ public:
             "atr", "adx", "cci", "williams", "williamsr",
             "supertrend", "mfi", "roc", "obv", "volume",
             "smc", "sniperpro", "stc cross",
-            "flag pattern", "trend signal"
+            "flag pattern", "trend signal",
+            "session sweep"
         };
     }
 };
@@ -5508,7 +5525,7 @@ static inline const char* CandleStyleName(CandleRenderStyle s) {
         case RENDER_CANDLE:     return "Candle";
         case RENDER_LINE:       return "Line";
         case RENDER_AREA:       return "Area";
-        case RENDER_FP_OVERLAY: return "FP Overlay";
+        case RENDER_FP_OVERLAY: return "Footprint X-Ray";
         case RENDER_FP_PROFILE: return "FP Profile";
         case RENDER_FP_BAR:     return "FP Bar";
         case RENDER_TPO:        return "TPO Profile";
