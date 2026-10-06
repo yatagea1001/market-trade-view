@@ -80,6 +80,262 @@ function logGood(m) { console.log ("%c" + m, "color:#0f0;font-weight:bold"); }
 function logWarn(m) { console.warn("%c" + m, "color:orange;font-weight:bold"); }
 function logErr (m) { console.error("%c"+ m, "color:red;font-weight:bold"); }
 
+// =========================================================
+// 1b. SERVER MODE — Auto-detect localhost vs Serverless
+// =========================================================
+
+// Flag mode aktif: 'server' atau 'serverless'
+let g_serverMode = 'serverless';
+// Reference ke server WebSocket (ws://localhost:8765)
+let serverWS = null;
+
+/**
+ * Cek apakah server Python (candle_server_v18max6.py) aktif di localhost.
+ * Coba buka WebSocket ke WS_SERVER_URL.
+ * Jika berhasil connect dalam WS_DETECT_TIMEOUT_MS ms → return 'server'
+ * Jika timeout / error → return 'serverless'
+ */
+async function detectServerMode() {
+    const mode = PLATFORM.MODE || 'auto';
+
+    // Mode dipaksa (bukan auto)
+    if (mode === 'server')      { logGood('[MODE] Forced: server (localhost)');    return 'server'; }
+    if (mode === 'serverless')  { logGood('[MODE] Forced: serverless (internet)'); return 'serverless'; }
+
+    // MODE === 'auto': coba konek ke localhost server
+    logInfo(`[MODE] Auto-detect: coba ${PLATFORM.WS_SERVER_URL}...`);
+
+    return new Promise((resolve) => {
+        let resolved = false;
+        const timeout = setTimeout(() => {
+            if (resolved) return;
+            resolved = true;
+            logWarn(`[MODE] ⚠️ Timeout ${PLATFORM.WS_DETECT_TIMEOUT_MS}ms → Serverless mode`);
+            try { testWS.close(); } catch(e) {}
+            resolve('serverless');
+        }, PLATFORM.WS_DETECT_TIMEOUT_MS);
+
+        const testWS = new WebSocket(PLATFORM.WS_SERVER_URL);
+
+        testWS.onopen = () => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timeout);
+            testWS.close();
+            logGood('[MODE] ✅ Server detected → Server mode (localhost)');
+            resolve('server');
+        };
+        testWS.onerror = () => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timeout);
+            logWarn('[MODE] ❌ Server tidak ada → Serverless mode (Hyperliquid/Binance)');
+            resolve('serverless');
+        };
+    });
+}
+
+/**
+ * Badge indikator mode — dinonaktifkan (silent detection only).
+ */
+function updateServerModeBadge(mode) {
+    // Badge disembunyikan — mode tetap terdeteksi di background
+    // logGood(`[MODE] Active: ${mode}`);
+}
+
+/**
+ * Connect ke server Python WebSocket (ws://localhost:8765).
+ * Menerima: history, candle_page, gap_data, bar, tick, footprint_data.
+ * Auto-reconnect setiap 5 detik jika putus.
+ */
+function connectServerWS() {
+    if (serverWS && serverWS.readyState === WebSocket.OPEN) return;
+    logInfo(`[SERVER-WS] Connecting ${PLATFORM.WS_SERVER_URL}...`);
+
+    serverWS = new WebSocket(PLATFORM.WS_SERVER_URL);
+
+    serverWS.onopen = () => {
+        logGood('[SERVER-WS] ✅ Connected to localhost server!');
+        // Minta history untuk symbol aktif
+        if (CURRENT_SYMBOL) {
+            serverWS.send(JSON.stringify({ type: 'request_sync', symbol: CURRENT_SYMBOL }));
+        }
+    };
+
+    serverWS.onmessage = (evt) => {
+        try {
+            const msg = JSON.parse(evt.data);
+            handleServerMessage(msg);
+        } catch(e) { logErr('[SERVER-WS] Parse error: ' + e.message); }
+    };
+
+    serverWS.onerror = (e) => { logErr('[SERVER-WS] Error'); };
+
+    serverWS.onclose = (e) => {
+        logWarn(`[SERVER-WS] Disconnected (${e.code}) → reconnect 5s...`);
+        serverWS = null;
+        if (g_serverMode === 'server') setTimeout(connectServerWS, 5000);
+    };
+}
+
+/**
+ * Handle semua pesan dari server Python (candle_server_v18max6.py).
+ * Format sama persis dengan yang dikirim server.
+ */
+function handleServerMessage(msg) {
+    const type = msg.type;
+
+    // ── Welcome / ack ────────────────────────────────────────
+    if (type === 'welcome') {
+        logGood(`[SERVER-WS] ${msg.msg}`);
+        return;
+    }
+
+    // ── History (initial load) ────────────────────────────────
+    if (type === 'history') {
+        const sym = msg.symbol;
+        const candles = (msg.candles || []).map(c => ({
+            time: c.time, o: c.o, h: c.h, l: c.l, c: c.c, v: c.v || 1
+        }));
+        if (!candles.length) return;
+        logGood(`[SERVER-WS] History: ${candles.length} candles for ${sym}`);
+        hideLoadingOverlay();
+        pushCandlesDirectToWASM(sym, candles);
+        return;
+    }
+
+    // ── Candle page (lazy scroll kiri) ───────────────────────
+    if (type === 'candle_page') {
+        const sym     = msg.symbol;
+        const candles = (msg.candles || []).map(c => ({
+            time: c.time, o: c.o, h: c.h, l: c.l, c: c.c, v: c.v || 1
+        }));
+        if (candles.length) {
+            if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+            for (const c of candles) notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v);
+            if (Module._wasm_rebuild_all_htfs)  Module._wasm_rebuild_all_htfs();
+            if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+            logGood(`[SERVER-WS] Page: +${candles.length} older candles for ${sym}`);
+        }
+        return;
+    }
+
+    // ── Gap fill (reconnect / tab switch) ────────────────────
+    if (type === 'gap_data') {
+        const sym     = msg.symbol;
+        const candles = (msg.candles || []).map(c => ({
+            time: c.time, o: c.o, h: c.h, l: c.l, c: c.c, v: c.v || 1
+        }));
+        if (candles.length) {
+            for (const c of candles) notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v);
+            if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+            logGood(`[SERVER-WS] Gap fill: +${candles.length} candles for ${sym}`);
+        }
+        return;
+    }
+
+    // ── Live bar close ────────────────────────────────────────
+    if (type === 'bar') {
+        notifyWASM_candle(msg.open, msg.high, msg.low, msg.close, msg.time, msg.v || 1);
+        sendTickToWasm(msg.symbol, msg.close, msg.v || 1, msg.time);
+        return;
+    }
+
+    // ── Live tick (harga bergerak) ───────────────────────────
+    if (type === 'tick') {
+        sendTickToWasm(msg.symbol, msg.price, msg.v || 1, msg.time);
+        notifyWASM_candle(msg.price, msg.h || msg.price, msg.l || msg.price, msg.price, msg.bar_time || msg.time, msg.v || 1);
+        return;
+    }
+
+    // ── Footprint data ───────────────────────────────────────
+    if (type === 'footprint_data') {
+        const sym = msg.symbol;
+        for (const bar of (msg.data || [])) {
+            for (const lvl of (bar.levels || [])) {
+                notifyWASM_footprint(sym, bar.time, lvl.p, lvl.b, lvl.s);
+            }
+        }
+        return;
+    }
+}
+
+/**
+ * Minta history / sync ulang ke server WS untuk symbol tertentu.
+ * Dipanggil saat user ganti symbol di server mode.
+ */
+function serverRequestSync(symbol) {
+    if (!serverWS || serverWS.readyState !== WebSocket.OPEN) return;
+    showLoadingOverlay(`Loading ${symbol}...`, 10);
+    serverWS.send(JSON.stringify({ type: 'request_sync', symbol }));
+    logInfo(`[SERVER-WS] request_sync → ${symbol}`);
+}
+
+/**
+ * Minta candle lebih lama (lazy load / scroll kiri) dari server.
+ */
+function serverRequestPage(symbol, beforeTime, limit = 5000) {
+    if (!serverWS || serverWS.readyState !== WebSocket.OPEN) return;
+    serverWS.send(JSON.stringify({
+        type: 'request_candles',
+        symbol,
+        before_time: beforeTime,
+        limit
+    }));
+}
+
+/**
+ * connectWS — Entry point saat WASM siap.
+ * Dipanggil dari app.html: if (typeof connectWS === 'function') connectWS();
+ *
+ * Alur:
+ *   1. detectServerMode() → tunggu hasilnya
+ *   2. Kalau 'server' → connectServerWS() (ambil data dari Python)
+ *   3. Kalau 'serverless' → connectHLWebSocket() + Binance WS (ambil langsung internet)
+ */
+async function connectWS() {
+    // ── GUARD: Pastikan hanya berjalan sekali ──────────────────────
+    if (window._connectWSCalled) {
+        logWarn('[CONN] connectWS() already called — skip duplicate');
+        return;
+    }
+    window._connectWSCalled = true;
+    // ──────────────────────────────────────────────────────────────
+
+    logInfo('[CONN] Starting connection...');
+
+    await initIndexedDB();
+    evictOldIDBCandles(30);   // hapus candle > 30 hari di background
+    initIDBWorker();
+
+    // 1. Tentukan mode
+    g_serverMode = await detectServerMode();
+    updateServerModeBadge(g_serverMode);
+
+    if (g_serverMode === 'server') {
+        // ── SERVER MODE: Semua data dari Python localhost ────────
+        logGood('[CONN] 🟢 SERVER MODE — data dari localhost VPS Python');
+        connectServerWS();
+        // Hyperliquid WS tetap connect untuk footprint & live tick (opsional)
+        // Komentari baris di bawah jika ingin PURE server mode:
+        // connectHLWebSocket();
+    } else {
+        // ── SERVERLESS MODE: Hyperliquid + Binance langsung ─────
+        logGood('[CONN] 🔵 SERVERLESS MODE — data dari Hyperliquid + Binance');
+        connectHLWebSocket();
+        connectBinanceWebSocket();
+        startForexPolling();
+    }
+
+    isWasmReady = true;
+    logGood(`[CONN] ✅ connectWS() done — mode: ${g_serverMode}`);
+}
+
+
+
+// =========================================================
+// 1c. HELPERS
+// =========================================================
 function isCryptoSymbol(sym) {
     return SYMBOLS_CRYPTO.includes(sym) || sym.includes("USDT") || sym === "BTC" || sym === "ETH";
 }
@@ -2496,95 +2752,25 @@ Module.onRuntimeInitialized = async function() {
     if (cv) { cv.style.opacity = '1'; cv.focus(); }
     if (Module._wasm_on_login_success) Module._wasm_on_login_success();
 
-    await initIndexedDB();
-
-    // 🔥 HYBRID V21: Init Web Worker untuk IDB background write (anti FPS drop)
-    // Worker jalan di thread terpisah → gak block render loop WASM
-    initIDBWorker();
-
     // 🔥 HYBRID V21: Evict candle > 30 hari di background (hemat storage)
-    // Non-blocking — gak nungguin, jalan paralel sama init lainnya
     setTimeout(() => {
         evictOldIDBCandles(30).catch(e => {
             logWarn(`[HYBRID-EVICT] Startup eviction skipped: ${e.message}`);
         });
-    }, 5000);  // delay 5 detik supaya gak ganggu first load
+    }, 5000);
 
-    const MIN = 500;
-    // Scan IDB untuk mengetahui symbol yang sudah pernah di-cache
-    const allKeys = await getAllSymbolsInDB();
-    for (const sym of allKeys) {
-        downloadedSymbols.add(sym);
-        try {
-            const candles = await getAllCandlesFromDB(sym);
-            if (candles.length > 0) {
-                const oldest    = candles.reduce((min, c) => c.time < min ? c.time : min, candles[0].time);
-                const latest    = candles.reduce((max, c) => c.time > max ? c.time : max, 0);
-                const gapSec    = Math.floor(Date.now()/1000) - latest;
-                const gapMin    = Math.floor(gapSec / 60);
-                const oldestStr = new Date(oldest * 1000).toISOString().slice(0,16).replace('T',' ');
-                const latestStr = new Date(latest * 1000).toISOString().slice(0,16).replace('T',' ');
-                if (gapMin > 1) {
-                    logWarn(`[STARTUP] ${sym}: ${candles.length} candles | ${oldestStr} ~ ${latestStr} | gap: ~${gapMin}m ⚠️`);
-                } else {
-                    logGood(`[STARTUP] ${sym}: ${candles.length} candles | ${oldestStr} ~ ${latestStr} | gap: fresh ✅`);
-                }
-            }
-        } catch(e) {
-            logInfo(`[STARTUP] ${sym}: IDB ✓ (scan error)`);
-        }
-    }
-
-    // Connect ke Hyperliquid WebSocket (untuk live data Crypto)
-    connectHLWebSocket();
-    
-    // Connect ke Binance WebSocket (untuk live data Forex/Gold)
-    connectBinanceWebSocket();
-    
-    // Connect ke Finnhub WebSocket (untuk live data Forex — legacy, kalau ada API key)
-    connectFinnhubWebSocket();
-
-    // ─────────────────────────────────────────────────────────────────
-    // 🔄 SYNC SYMBOL DARI C++ (single source of truth)
-    //
-    // BUG LAMA (sudah fix):
-    //   Sebelumnya WebSocket baca localStorage "MyTradingApp_ChartState"
-    //   untuk dapat symbol terakhir. Tapi kadang race condition dengan
-    //   C++ → CURRENT_SYMBOL tetap kosong → chart tampil label saja,
-    //   tanpa history & tanpa subscribe HL WS live. Baru lengkap kalau
-    //   user pindah simbol via picker (SetActiveSymbol ter-trigger).
-    //
-    // FIX:
-    //   Ambil langsung dari C++ via wasm_nav_get_symbol(). C++ sudah
-    //   LoadWebLayout() di main() dan set g_symbol sebelum JS init.
-    //   Setelah dapat symbol → panggil SetActiveSymbol penuh, yg akan
-    //   handle:
-    //     1. Clear chart di C++ (Module._wasm_clear_chart)
-    //     2. Load history dari IDB (rebuildFullFromDB) atau download fresh
-    //     3. Gap fill dari HL REST (kalau IDB ada gap)
-    //     4. Subscribe HL WebSocket live stream (subscribeCandleStream)
-    //   → chart lengkap: history + live. Sama seperti user pindah via picker.
-    // ─────────────────────────────────────────────────────────────────
+    // Sync symbol dari C++ dulu sebelum connectWS
     let initialSym = "";
-
-    // 1. Prioritas: ambil dari C++ (paling akurat — sesuai chart C++)
     try {
         if (Module._wasm_nav_get_symbol) {
-            const symFromCpp = Module.ccall(
-                'wasm_nav_get_symbol', 'string', [], []
-            );
+            const symFromCpp = Module.ccall('wasm_nav_get_symbol', 'string', [], []);
             if (symFromCpp && symFromCpp.trim().length > 0) {
                 initialSym = symFromCpp.trim();
                 logGood(`[STARTUP] Symbol aktif dari C++: ${initialSym}`);
             }
-        } else {
-            logWarn(`[STARTUP] wasm_nav_get_symbol tidak tersedia di Module`);
         }
-    } catch(e) {
-        logWarn(`[STARTUP] Gagal ambil symbol dari C++: ${e.message}`);
-    }
+    } catch(e) { logWarn(`[STARTUP] Gagal ambil symbol dari C++: ${e.message}`); }
 
-    // 2. Fallback: baca dari localStorage (kalau C++ belum set / bridge gagal)
     if (!initialSym) {
         try {
             const savedState = localStorage.getItem("MyTradingApp_ChartState");
@@ -2595,36 +2781,34 @@ Module.onRuntimeInitialized = async function() {
                     logInfo(`[STARTUP] Symbol dari localStorage (fallback): ${initialSym}`);
                 }
             }
-        } catch(e) {
-            logWarn(`[STARTUP] localStorage parse error: ${e.message}`);
-        }
+        } catch(e) { logWarn(`[STARTUP] localStorage parse error: ${e.message}`); }
     }
 
-    // 3. Auto-load via SetActiveSymbol — handle history + gap fill + live
-    //
-    //    PENTING: JANGAN set CURRENT_SYMBOL dulu sebelum panggil SetActiveSymbol!
-    //    SetActiveSymbol punya early-return guard:
-    //        if (CURRENT_SYMBOL && CURRENT_SYMBOL === newSym) return;
-    //    Kalau CURRENT_SYMBOL sudah di-set == newSym, guard akan return early
-    //    dan chart gak ke-load. Biarkan SetActiveSymbol yg set CURRENT_SYMBOL
-    //    di dalamnya (line 1095).
-    //
-    //    Race condition dgn connectHLWebSocket() di atas aman:
-    //    - Kalau HL WS sudah open → SetActiveSymbol panggil subscribeCandleStream
-    //      langsung (line 1118).
-    //    - Kalau HL WS belum open → onopen trigger nanti, cek CURRENT_SYMBOL
-    //      (sudah di-set oleh SetActiveSymbol), lalu subscribe (line 768-770).
+    // ── AUTO-DETECT + CONNECT ──────────────────────────────────────
+    // connectWS() sudah menangani: detectServerMode → connectServerWS ATAU
+    // connectHLWebSocket + connectBinanceWebSocket + startForexPolling
+    await connectWS();
+
+    // Setelah connect, load symbol aktif
     if (initialSym) {
         logInfo(`[STARTUP] Auto-load ${initialSym} via SetActiveSymbol...`);
-        await window.SetActiveSymbol(initialSym);
-        logGood(`[STARTUP] ✅ ${initialSym} ready (history + live subscribed)`);
+        if (g_serverMode === 'server') {
+            // Server mode: minta data dari Python
+            CURRENT_SYMBOL = initialSym;
+            serverRequestSync(initialSym);
+        } else {
+            // Serverless: load dari IDB / HL REST seperti biasa
+            await window.SetActiveSymbol(initialSym);
+        }
+        logGood(`[STARTUP] ✅ ${initialSym} ready`);
     } else {
-        // Tidak ada simbol tersimpan → user pertama kali → tampilkan picker
         logInfo("[STARTUP] Menunggu user pilih symbol dari picker...");
         hideLoadingOverlay();
     }
 
 };
+
+
 
 window.addEventListener('beforeunload', () => flushBuffer());
 setInterval(() => { if (candleBuffer.length > 0) flushBuffer(); }, 10000);

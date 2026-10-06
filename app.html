@@ -365,8 +365,11 @@ button:hover { background: #008ccb; }
                 if (cv) { cv.focus(); }
 
                 if (Module._wasm_on_login_success) Module._wasm_on_login_success();
-                if (typeof connectWS === 'function') connectWS();
+                // connectWS() dipanggil oleh Module.onRuntimeInitialized di websocket.js
+                // Jangan panggil di sini juga — akan double-connect
+                // if (typeof connectWS === 'function') connectWS();
             }, 500);
+
         },
         onRuntimeInitialized: function() { 
             Module.hideBootScreen();
@@ -837,6 +840,67 @@ button:hover { background: #008ccb; }
         });
     }
 </script>
+
+<!-- ======================================================= -->
+<!-- SIGNATURE: by Yata_gea                                  -->
+<!-- ======================================================= -->
+<style>
+#yg-sig {
+    position:fixed; bottom:10px; left:14px; z-index:9990;
+    display:flex; align-items:center; gap:6px;
+    pointer-events:none; user-select:none; -webkit-user-select:none;
+    opacity:0;
+    animation: yg-in 2s ease 3.5s forwards;
+}
+@keyframes yg-in {
+    from { opacity:0; transform:translateY(5px); }
+    to   { opacity:1; transform:translateY(0); }
+}
+.yg-icon { display:flex; align-items:flex-end; gap:2px; }
+.yg-c    { display:flex; flex-direction:column; align-items:center; gap:1px; }
+.yg-w    { width:1px; background:currentColor; }
+.yg-b    { width:3px; border-radius:1px; }
+.yg-label {
+    font-family:'Consolas','Monaco',monospace;
+    font-size:10px; letter-spacing:0.8px; line-height:1;
+    display:flex; align-items:center; gap:3px;
+}
+.yg-by   { color:rgba(255,255,255,0.18); }
+.yg-name {
+    background:linear-gradient(90deg,#10b981,#34d399,#0af,#10b981);
+    background-size:200% auto;
+    -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+    background-clip:text; font-weight:700; font-size:11px;
+    animation: yg-sh 4s linear infinite;
+}
+@keyframes yg-sh {
+    from { background-position:0% center; }
+    to   { background-position:200% center; }
+}
+</style>
+<div id="yg-sig">
+    <div class="yg-icon">
+        <div class="yg-c" style="color:#10b981;">
+            <div class="yg-w" style="height:4px;"></div>
+            <div class="yg-b" style="height:7px;background:#10b981;"></div>
+            <div class="yg-w" style="height:2px;"></div>
+        </div>
+        <div class="yg-c" style="color:#ef4444;">
+            <div class="yg-w" style="height:6px;"></div>
+            <div class="yg-b" style="height:10px;background:#ef4444;"></div>
+            <div class="yg-w" style="height:2px;"></div>
+        </div>
+        <div class="yg-c" style="color:#10b981;">
+            <div class="yg-w" style="height:3px;"></div>
+            <div class="yg-b" style="height:6px;background:#10b981;"></div>
+            <div class="yg-w" style="height:4px;"></div>
+        </div>
+    </div>
+    <div class="yg-label">
+        <span class="yg-by">by</span>
+        <span class="yg-name">Yata_gea</span>
+    </div>
+</div>
 
 </body>
 </html>
