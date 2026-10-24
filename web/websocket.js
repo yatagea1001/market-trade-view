@@ -88,6 +88,8 @@ function logErr (m) { console.error("%c"+ m, "color:red;font-weight:bold"); }
 let g_serverMode = 'serverless';
 // Reference ke server WebSocket (ws://localhost:8765)
 let serverWS = null;
+// 🔥 FIX RACE CONDITION: Pending symbol untuk dikirim saat serverWS.onopen
+let g_pendingServerSync = null;
 
 /**
  * Cek apakah server Python (candle_server_v18max6.py) aktif di localhost.
@@ -156,9 +158,14 @@ function connectServerWS() {
 
     serverWS.onopen = () => {
         logGood('[SERVER-WS] ✅ Connected to localhost server!');
-        // Minta history untuk symbol aktif
-        if (CURRENT_SYMBOL) {
-            serverWS.send(JSON.stringify({ type: 'request_sync', symbol: CURRENT_SYMBOL }));
+        // 🔥 FIX: Flush g_pendingServerSync (dikirim sebelum WS open → race condition)
+        //   Priority: pending > CURRENT_SYMBOL (keduanya harusnya sama)
+        const toSync = g_pendingServerSync || CURRENT_SYMBOL;
+        if (toSync) {
+            g_pendingServerSync = null;
+            showLoadingOverlay(`Loading ${toSync}...`, 10);
+            serverWS.send(JSON.stringify({ type: 'request_sync', symbol: toSync }));
+            logInfo(`[SERVER-WS] ✅ onopen → request_sync → ${toSync}`);
         }
     };
 
@@ -265,7 +272,13 @@ function handleServerMessage(msg) {
  * Dipanggil saat user ganti symbol di server mode.
  */
 function serverRequestSync(symbol) {
-    if (!serverWS || serverWS.readyState !== WebSocket.OPEN) return;
+    if (!serverWS || serverWS.readyState !== WebSocket.OPEN) {
+        // 🔥 FIX: WS belum open → queue, bukan silent return!
+        logWarn(`[SERVER-WS] serverRequestSync(${symbol}) — WS belum open, queued`);
+        g_pendingServerSync = symbol;
+        return;
+    }
+    g_pendingServerSync = null;
     showLoadingOverlay(`Loading ${symbol}...`, 10);
     serverWS.send(JSON.stringify({ type: 'request_sync', symbol }));
     logInfo(`[SERVER-WS] request_sync → ${symbol}`);
@@ -1291,6 +1304,208 @@ async function downloadBinaryHistory(uiSymbol) {
 }
 
 // =========================================================
+// 6b. BINARY CHUNK STREAMING SYSTEM
+// =========================================================
+// Memuat history dari file .bin yang dipecah per 50k candle:
+//   data/BTCUSDT_index.json  → metadata (parts, range)
+//   data/BTCUSDT_part1.bin   → 50k candle terlama
+//   data/BTCUSDT_part2.bin   → 50k candle berikutnya
+//   data/BTCUSDT_part3.bin   → candle terbaru (load pertama)
+//
+// Alur saat simbol dipilih:
+//   1. loadBinaryChunkNewest() → ambil part terbaru
+//   2. Chart muncul instan, gap fill via API di background
+//   3. User scroll kiri → loadBinaryChunkOlder() → part lebih tua
+// =========================================================
+
+// State per-symbol: part mana yang sudah di-load
+const g_binChunkState = {};
+
+/**
+ * Parse buffer MTVC (format binary candle) → array candle objects.
+ * Header: 12 bytes (4 magic + 4 version uint32 + 4 count uint32)
+ * Body:   count × 24 bytes (time uint32 + o/h/l/c/v float32 each)
+ */
+function parseMTVCBuffer(buffer, label) {
+    const view = new DataView(buffer);
+    if (buffer.byteLength < 12) {
+        logErr(`[BIN-CHUNK] ${label}: terlalu kecil (${buffer.byteLength} bytes)`);
+        return null;
+    }
+    const magic = String.fromCharCode(
+        view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)
+    );
+    if (magic !== 'MTVC') {
+        logErr(`[BIN-CHUNK] ${label}: invalid magic "${magic}"`);
+        return null;
+    }
+    const version = view.getUint32(4, true);
+    const count   = view.getUint32(8, true);
+    const HEADER  = 12;
+    const STRIDE  = 24;
+    if (buffer.byteLength < HEADER + count * STRIDE) {
+        logErr(`[BIN-CHUNK] ${label}: ukuran tidak sesuai`);
+        return null;
+    }
+    const candles = new Array(count);
+    for (let i = 0; i < count; i++) {
+        const off = HEADER + i * STRIDE;
+        candles[i] = {
+            time: view.getUint32 (off,      true),
+            o:    view.getFloat32(off +  4, true),
+            h:    view.getFloat32(off +  8, true),
+            l:    view.getFloat32(off + 12, true),
+            c:    view.getFloat32(off + 16, true),
+            v:    view.getFloat32(off + 20, true)
+        };
+    }
+    logGood(`[BIN-CHUNK] ✅ ${label}: ${count.toLocaleString()} candles (MTVC v${version})`);
+    return candles;
+}
+
+/**
+ * Ambil index JSON untuk sebuah symbol.
+ * Format: { symbol, parts, total_candles, oldest_epoch, newest_epoch, ... }
+ * Returns: object index atau null jika tidak ada.
+ */
+async function fetchBinIndex(uiSymbol) {
+    try {
+        const resp = await fetch(`data/${uiSymbol}_index.json`);
+        if (!resp.ok) return null;
+        return await resp.json();
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Download satu part binary dan parse.
+ * @param {string} uiSymbol  - misal "BTCUSDT"
+ * @param {number} partNum   - nomor part (1-based)
+ * @param {number} totalParts
+ * @returns {Array|null}
+ */
+async function fetchBinPart(uiSymbol, partNum, totalParts) {
+    const fname = `data/${uiSymbol}_part${partNum}.bin`;
+    logInfo(`[BIN-CHUNK] ⬇️ Fetching ${fname} (part ${partNum}/${totalParts})...`);
+    try {
+        const resp = await fetch(fname);
+        if (!resp.ok) {
+            logWarn(`[BIN-CHUNK] ${fname} — HTTP ${resp.status}`);
+            return null;
+        }
+        const buffer = await resp.arrayBuffer();
+        return parseMTVCBuffer(buffer, fname);
+    } catch (e) {
+        logErr(`[BIN-CHUNK] Error fetching ${fname}: ${e.message}`);
+        return null;
+    }
+}
+
+/**
+ * Load part TERBARU (newest) saat symbol pertama kali dibuka.
+ * Init g_binChunkState[uiSymbol] dengan info dari index.
+ * @returns {Array|null} candles dari part terbaru
+ */
+async function loadBinaryChunkNewest(uiSymbol) {
+    const idx = await fetchBinIndex(uiSymbol);
+    if (!idx) {
+        logWarn(`[BIN-CHUNK] ${uiSymbol}_index.json tidak ada → skip chunk`);
+        return null;
+    }
+
+    const { parts, oldest_epoch, newest_epoch } = idx;
+    logGood(`[BIN-CHUNK] 📋 ${uiSymbol}: ${parts} part(s), total ${idx.total_candles.toLocaleString()} candles`);
+    logInfo(`[BIN-CHUNK]    Range: ${idx.oldest_date} → ${idx.newest_date}`);
+
+    // Init tracking state untuk symbol ini
+    g_binChunkState[uiSymbol] = {
+        totalParts:  parts,
+        loadedParts: [parts],       // sudah load part terbaru
+        oldestLoaded: oldest_epoch, // akan diupdate setelah parse
+        newestLoaded: newest_epoch,
+        allDone: (parts === 1)      // kalau hanya 1 part, sudah habis
+    };
+
+    showLoadingOverlay(`Loading ${uiSymbol} history...`, 10);
+    const candles = await fetchBinPart(uiSymbol, parts, parts);
+    if (!candles || candles.length === 0) return null;
+
+    // Update oldest yang sudah di-load
+    g_binChunkState[uiSymbol].oldestLoaded = candles[0].time;
+
+    return candles;
+}
+
+/**
+ * Load part LEBIH LAMA saat user scroll kiri.
+ * Cari part yang belum di-load dan lebih tua dari oldestTime.
+ * @param {string} uiSymbol
+ * @param {number} oldestTime - epoch seconds dari candle tertua di chart
+ * @returns {Array} candles dari part lebih tua, atau [] jika habis
+ */
+async function loadBinaryChunkOlder(uiSymbol, oldestTime) {
+    const state = g_binChunkState[uiSymbol];
+    if (!state) {
+        // Belum pernah load dari chunk → fetch index dulu
+        const idx = await fetchBinIndex(uiSymbol);
+        if (!idx) return [];
+        g_binChunkState[uiSymbol] = {
+            totalParts:  idx.parts,
+            loadedParts: [],
+            oldestLoaded: idx.newest_epoch,
+            newestLoaded: idx.newest_epoch,
+            allDone: false
+        };
+        return loadBinaryChunkOlder(uiSymbol, oldestTime);
+    }
+
+    if (state.allDone) return [];
+
+    // Cari part tertinggi yang belum di-load
+    const loaded = new Set(state.loadedParts);
+    let targetPart = null;
+    for (let p = state.totalParts; p >= 1; p--) {
+        if (!loaded.has(p)) { targetPart = p; break; }
+    }
+
+    if (targetPart === null) {
+        state.allDone = true;
+        logInfo(`[BIN-CHUNK] ${uiSymbol}: semua ${state.totalParts} part sudah di-load`);
+        return [];
+    }
+
+    const candles = await fetchBinPart(uiSymbol, targetPart, state.totalParts);
+    if (!candles || candles.length === 0) {
+        state.allDone = true;
+        return [];
+    }
+
+    state.loadedParts.push(targetPart);
+    state.oldestLoaded = candles[0].time;
+    if (targetPart === 1) state.allDone = true;
+
+    logGood(`[BIN-CHUNK] ✅ ${uiSymbol} part ${targetPart}: +${candles.length.toLocaleString()} candles`);
+    return candles;
+}
+
+/**
+ * Cek apakah masih ada binary chunk lebih tua yang belum di-load.
+ * @param {string} uiSymbol
+ * @returns {boolean}
+ */
+function hasBinaryOlderChunks(uiSymbol) {
+    const state = g_binChunkState[uiSymbol];
+    if (!state) return false;  // belum pernah load dari chunk → tidak tahu
+    if (state.allDone) return false;
+    const loaded = new Set(state.loadedParts);
+    for (let p = 1; p <= state.totalParts; p++) {
+        if (!loaded.has(p)) return true;
+    }
+    return false;
+}
+
+// =========================================================
 // 7. HYPERLIQUID WEBSOCKET ADAPTER (BARU)
 // =========================================================
 
@@ -2297,18 +2512,24 @@ window.SetActiveSymbol = async function(newSym) {
     } else {
         // ════════════════════════════════════════════════════════════
         // 🔥 SKENARIO 1: CACHE MISS (No IDB) — First time load
-        //   - Binary TURBO: download .bin → parse → push langsung ke WASM
-        //   - Gap fill paralel: mulai fetch gap SEBELUM binary selesai
-        //   - IDB save di background (tidak block chart)
+        //   PRIORITAS LOAD:
+        //   A) Chunked binary (BTCUSDT_part3.bin) ← PALING CEPAT
+        //   B) Single binary lama (BTCUSDT.bin)   ← fallback lama
+        //   C) HL REST API                         ← fallback terakhir
         // ════════════════════════════════════════════════════════════
         logWarn(`[CACHE MISS] ${CURRENT_SYMBOL} → sync...`);
         showLoadingOverlay(`Synchronizing ${CURRENT_SYMBOL}...`, 0);
         isDownloading = true;
 
-        // ═══════════════════════════════════════════════════════════
-        // TAHAP 1: Coba download binary file (.bin) dari folder data/
-        // ═══════════════════════════════════════════════════════════
-        let candles = await downloadBinaryHistory(CURRENT_SYMBOL);
+        // ── A) Coba CHUNKED binary dulu (sistem baru) ───────────────
+        let candles = await loadBinaryChunkNewest(CURRENT_SYMBOL);
+
+        // ── B) Fallback: single .bin lama (tanpa index) ─────────────
+        if (!candles || candles.length === 0) {
+            logInfo(`[CACHE MISS] Chunked tidak ada → coba single .bin lama...`);
+            candles = await downloadBinaryHistory(CURRENT_SYMBOL);
+        }
+
         let usedBinary = false;
         let allCandles = [];  // semua candle (binary + gap) untuk IDB save
 
@@ -2480,7 +2701,38 @@ window.onNearLeftEdge = async function(oldestTime) {
         return;
     }
 
-    // TAHAP 2: IDB habis → fetch dari Hyperliquid REST
+    // TAHAP 2: IDB habis → coba Binary Chunk lebih tua dulu! 🔥
+    //   BTCUSDT_part2.bin → BTCUSDT_part1.bin → dst
+    //   Lebih cepat dari REST API + tidak kena rate limit!
+    if (hasBinaryOlderChunks(CURRENT_SYMBOL)) {
+        logInfo(`[LAZY] IDB habis → coba older binary chunk...`);
+        if (window._spinnerShow) window._spinnerShow();
+
+        const chunkCandles = await loadBinaryChunkOlder(CURRENT_SYMBOL, oldestTime);
+
+        if (chunkCandles.length > 0) {
+            // Simpan chunk ke IDB supaya lazy load berikutnya langsung dari IDB
+            addToBuffer(CURRENT_SYMBOL, chunkCandles);
+            await flushBuffer();
+
+            // Rebuild chart dengan data baru
+            if (Module._wasm_save_view_anchor)    Module._wasm_save_view_anchor();
+            if (Module._wasm_clear_chart)         Module._wasm_clear_chart();
+            await rebuildFullFromDB(CURRENT_SYMBOL);
+            if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
+            if (Module._wasm_force_vbo_refresh)   Module._wasm_force_vbo_refresh();
+            if (Module._wasm_set_lazy_load_done)  Module._wasm_set_lazy_load_done();
+
+            logGood(`[LAZY] ✅ +${chunkCandles.length.toLocaleString()} candles dari binary chunk`);
+            g_lazyLoadInProgress = false;
+            if (window._spinnerHide) window._spinnerHide();
+            return;
+        }
+        // Chunk habis semua → lanjut ke REST API
+        logInfo(`[LAZY] Semua binary chunk habis → fallback HL REST`);
+    }
+
+    // TAHAP 3: Binary chunk habis / tidak ada → fetch dari Hyperliquid REST
     logInfo(`[LAZY] IDB habis → fetch dari HL REST before=${new Date(oldestTime*1000).toISOString().slice(0,10)}`);
     if (window._spinnerShow) window._spinnerShow();
 
