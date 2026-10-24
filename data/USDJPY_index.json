@@ -1,0 +1,12 @@
+{
+  "symbol": "USDJPY",
+  "timeframe": "M1",
+  "parts": 3,
+  "total_candles": 143856,
+  "chunk_size": 50000,
+  "oldest_epoch": 1780464420,
+  "newest_epoch": 1792789080,
+  "oldest_date": "2026-06-03T05:27:00+00:00",
+  "newest_date": "2026-10-23T20:58:00+00:00",
+  "generated_at": "2026-10-24T19:41:22.452122+00:00"
+}

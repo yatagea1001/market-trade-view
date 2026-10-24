@@ -1,0 +1,12 @@
+{
+  "symbol": "XAUUSD",
+  "timeframe": "M1",
+  "parts": 6,
+  "total_candles": 252403,
+  "chunk_size": 50000,
+  "oldest_epoch": 1770090300,
+  "newest_epoch": 1792789020,
+  "oldest_date": "2026-02-03T03:45:00+00:00",
+  "newest_date": "2026-10-23T20:57:00+00:00",
+  "generated_at": "2026-10-24T19:41:16.230090+00:00"
+}

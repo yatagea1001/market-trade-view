@@ -1,0 +1,12 @@
+{
+  "symbol": "BTCUSDT",
+  "timeframe": "M1",
+  "parts": 5,
+  "total_candles": 203007,
+  "chunk_size": 50000,
+  "oldest_epoch": 1777985999,
+  "newest_epoch": 1792870680,
+  "oldest_date": "2026-05-05T12:59:59+00:00",
+  "newest_date": "2026-10-24T19:38:00+00:00",
+  "generated_at": "2026-10-24T19:41:10.697802+00:00"
+}

@@ -1,0 +1,12 @@
+{
+  "symbol": "EURUSD",
+  "timeframe": "M1",
+  "parts": 6,
+  "total_candles": 259604,
+  "chunk_size": 50000,
+  "oldest_epoch": 1770592980,
+  "newest_epoch": 1792789080,
+  "oldest_date": "2026-02-08T23:23:00+00:00",
+  "newest_date": "2026-10-23T20:58:00+00:00",
+  "generated_at": "2026-10-24T19:41:18.589628+00:00"
+}

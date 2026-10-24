@@ -1,0 +1,12 @@
+{
+  "symbol": "AUDUSD",
+  "timeframe": "M1",
+  "parts": 3,
+  "total_candles": 143936,
+  "chunk_size": 50000,
+  "oldest_epoch": 1780463160,
+  "newest_epoch": 1792789020,
+  "oldest_date": "2026-06-03T05:06:00+00:00",
+  "newest_date": "2026-10-23T20:57:00+00:00",
+  "generated_at": "2026-10-24T19:41:23.862249+00:00"
+}
