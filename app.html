@@ -591,6 +591,13 @@ button:hover { background: #008ccb; }
         if (!Module._wasm_send_key) return;
         
         if (e.keyCode === 8 || e.keyCode === 9) e.preventDefault(); 
+
+        // Sinkronkan modifier tombol (Ctrl, Shift, Alt, Meta)
+        if (Module._wasm_set_modifiers) {
+            Module.ccall('wasm_set_modifiers', null, ['number', 'number', 'number', 'number'],
+                [e.ctrlKey ? 1 : 0, e.shiftKey ? 1 : 0, e.altKey ? 1 : 0, e.metaKey ? 1 : 0]);
+        }
+
         Module.ccall('wasm_send_key', null, ['number', 'number'], [e.keyCode, 1]);
         if (e.ctrlKey) Module.ccall('wasm_send_key', null, ['number', 'number'], [17, 1]); 
     });
@@ -605,8 +612,23 @@ button:hover { background: #008ccb; }
 
         if (!Module.ccall || !Module._wasm_send_key) return;
         
+        // Sinkronkan modifier tombol (Ctrl, Shift, Alt, Meta)
+        if (Module._wasm_set_modifiers) {
+            Module.ccall('wasm_set_modifiers', null, ['number', 'number', 'number', 'number'],
+                [e.ctrlKey ? 1 : 0, e.shiftKey ? 1 : 0, e.altKey ? 1 : 0, e.metaKey ? 1 : 0]);
+        }
+
         Module.ccall('wasm_send_key', null, ['number', 'number'], [e.keyCode, 0]);
         if (e.keyCode === 17) Module.ccall('wasm_send_key', null, ['number', 'number'], [17, 0]); 
+    });
+
+    // --- CLIPBOARD SYNC ---
+    window.addEventListener('paste', function(e) {
+        if (isHtmlInputFocused()) return;
+        var text = (e.clipboardData || window.clipboardData) ? (e.clipboardData || window.clipboardData).getData('text') : '';
+        if (text) {
+            window.__imguiClipboard = text;
+        }
     });
 
     // ====================================================================
@@ -806,7 +828,8 @@ button:hover { background: #008ccb; }
 
 <script src="web/my_dev_logic.js"></script>
 <script src="web/ob_tutorial.js"></script>
-
+<script src="web/script_editor_bridge.js"></script>
+<script src="web/clipboard_fix.js"></script>
 <!-- FIREBASE GATEKEEPER MODULE -->
 <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
@@ -878,28 +901,6 @@ button:hover { background: #008ccb; }
     to   { background-position:200% center; }
 }
 </style>
-<div id="yg-sig">
-    <div class="yg-icon">
-        <div class="yg-c" style="color:#10b981;">
-            <div class="yg-w" style="height:4px;"></div>
-            <div class="yg-b" style="height:7px;background:#10b981;"></div>
-            <div class="yg-w" style="height:2px;"></div>
-        </div>
-        <div class="yg-c" style="color:#ef4444;">
-            <div class="yg-w" style="height:6px;"></div>
-            <div class="yg-b" style="height:10px;background:#ef4444;"></div>
-            <div class="yg-w" style="height:2px;"></div>
-        </div>
-        <div class="yg-c" style="color:#10b981;">
-            <div class="yg-w" style="height:3px;"></div>
-            <div class="yg-b" style="height:6px;background:#10b981;"></div>
-            <div class="yg-w" style="height:4px;"></div>
-        </div>
-    </div>
-    <div class="yg-label">
-        <span class="yg-by">by</span>
-        <span class="yg-name">Yata_gea</span>
-    </div>
 </div>
 
 </body>

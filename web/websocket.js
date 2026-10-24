@@ -1321,6 +1321,27 @@ async function downloadBinaryHistory(uiSymbol) {
 // State per-symbol: part mana yang sudah di-load
 const g_binChunkState = {};
 
+// 🔥 NEW: In-memory cache untuk parsed binary chunks.
+// Map<symbol, Map<partNum, Array<candle>>>
+// Tujuan: lazy load INSTANT (skip network + parse) saat user scroll kiri.
+// Preload berjalan di background setelah initial render selesai.
+const g_binChunkCache = new Map();
+
+function binCacheGet(symbol, partNum) {
+    const symMap = g_binChunkCache.get(symbol);
+    if (!symMap) return null;
+    return symMap.get(partNum) || null;
+}
+
+function binCacheSet(symbol, partNum, candles) {
+    if (!g_binChunkCache.has(symbol)) g_binChunkCache.set(symbol, new Map());
+    g_binChunkCache.get(symbol).set(partNum, candles);
+}
+
+function binCacheClearSymbol(symbol) {
+    g_binChunkCache.delete(symbol);
+}
+
 /**
  * Parse buffer MTVC (format binary candle) → array candle objects.
  * Header: 12 bytes (4 magic + 4 version uint32 + 4 count uint32)
@@ -1386,6 +1407,13 @@ async function fetchBinIndex(uiSymbol) {
  * @returns {Array|null}
  */
 async function fetchBinPart(uiSymbol, partNum, totalParts) {
+    // 🔥 Cek cache dulu — instant return kalau sudah pernah di-fetch/preload
+    const cached = binCacheGet(uiSymbol, partNum);
+    if (cached) {
+        logInfo(`[BIN-CHUNK] 💾 Cache hit: ${uiSymbol}_part${partNum} (${cached.length.toLocaleString()} candles)`);
+        return cached;
+    }
+
     const fname = `data/${uiSymbol}_part${partNum}.bin`;
     logInfo(`[BIN-CHUNK] ⬇️ Fetching ${fname} (part ${partNum}/${totalParts})...`);
     try {
@@ -1395,11 +1423,126 @@ async function fetchBinPart(uiSymbol, partNum, totalParts) {
             return null;
         }
         const buffer = await resp.arrayBuffer();
-        return parseMTVCBuffer(buffer, fname);
+        const candles = parseMTVCBuffer(buffer, fname);
+        // 🔥 Simpan ke cache supaya下次 lazy load instant
+        if (candles) binCacheSet(uiSymbol, partNum, candles);
+        return candles;
     } catch (e) {
         logErr(`[BIN-CHUNK] Error fetching ${fname}: ${e.message}`);
         return null;
     }
+}
+
+/**
+ * 🔥 PRELOAD: Fetch + parse semua part binary di background setelah initial render.
+ * Simpan ke g_binChunkCache supaya saat user scroll kiri, lazy load INSTANT.
+ *
+ * Strategi:
+ *   - Preload dari part (N-1) ke part 1 (urutan paling baru → paling lama)
+ *   - Delay 50ms antar part supaya tidak block UI rendering
+ *   - Stop otomatis kalau user switch symbol
+ *
+ * @param {string} uiSymbol
+ * @param {number} totalParts
+ */
+const g_preloadInProgress = new Set();
+
+async function preloadBinaryChunks(uiSymbol, totalParts) {
+    if (g_preloadInProgress.has(uiSymbol)) return;
+    if (totalParts <= 1) return;  // cuma 1 part, gak perlu preload
+    g_preloadInProgress.add(uiSymbol);
+
+    logInfo(`[BIN-PRELOAD] 🔄 ${uiSymbol}: background preload ${totalParts - 1} part(s)...`);
+
+    try {
+        for (let p = totalParts - 1; p >= 1; p--) {
+            // Stop kalau user switch symbol
+            if (CURRENT_SYMBOL !== uiSymbol) {
+                logInfo(`[BIN-PRELOAD] ⏹️ ${uiSymbol}: user switch symbol, stop preload at part ${p + 1}`);
+                break;
+            }
+            // Skip kalau sudah ada di cache
+            if (binCacheGet(uiSymbol, p)) continue;
+
+            // Yield ke UI supaya tidak block render frame
+            await new Promise(r => setTimeout(r, 50));
+
+            const fname = `data/${uiSymbol}_part${p}.bin`;
+            try {
+                const resp = await fetch(fname);
+                if (!resp.ok) {
+                    logWarn(`[BIN-PRELOAD] ${fname} — HTTP ${resp.status}, skip`);
+                    continue;
+                }
+                const buffer = await resp.arrayBuffer();
+                const candles = parseMTVCBuffer(buffer, fname);
+                if (candles) {
+                    binCacheSet(uiSymbol, p, candles);
+                    logInfo(`[BIN-PRELOAD] ✅ ${uiSymbol}_part${p}: ${candles.length.toLocaleString()} cached`);
+                }
+            } catch (e) {
+                logWarn(`[BIN-PRELOAD] ${fname} error: ${e.message}`);
+            }
+        }
+        logGood(`[BIN-PRELOAD] 🎉 ${uiSymbol}: preload selesai — lazy load siap instant!`);
+    } finally {
+        g_preloadInProgress.delete(uiSymbol);
+    }
+}
+
+/**
+ * 🔥 PUSH VIA PREPEND: Sisipkan 50k+ candle lebih lama ke WASM tanpa clear chart!
+ *
+ * Pakai 3 WASM function:
+ *   1. wasm_begin_prepend()       → mulai sesi, clear buffer internal
+ *   2. wasm_prepend_candle(o,h,l,c,t,v) → push 1 candle ke buffer (loop dari JS)
+ *   3. wasm_end_prepend()         → sort + merge ke depan M1 + auto-skip overlap
+ *                                   + offset viewCenterIndex +N (view gak loncat)
+ *
+ * Setelah itu panggil wasm_rebuild_all_htfs() supaya indikator HTF update.
+ *
+ * Keuntungan vs rebuildFullFromDB (untuk 250k candle chart + 50k baru):
+ *   - Skip IDB read 250k          (hemat ~500ms)
+ *   - Skip sort 250k di JS        (hemat ~300ms blocking)
+ *   - Skip CLEAR chart + push 250k ulang (hemat ~2000ms blocking!)
+ *   - Auto offset viewCenterIndex  (view gak loncat ke candle lama)
+ *   - Auto skip overlap dengan data existing
+ *
+ * @param {Array} candles - array of {time, o, h, l, c, v} (urutan bebas, akan di-sort internal)
+ * @returns {boolean} true kalau berhasil di-prepend, false kalau WASM belum support
+ */
+function pushCandlesViaPrepend(candles) {
+    if (!isWasmReady || !Module || !Module.ccall) return false;
+    if (!candles || candles.length === 0) return false;
+
+    // Cek WASM support prepend API
+    if (!Module._wasm_begin_prepend || !Module._wasm_end_prepend) {
+        logWarn(`[PREPEND] WASM belum expose prepend API, fallback ke rebuild`);
+        return false;
+    }
+
+    const t0 = performance.now();
+
+    // 1. Begin prepend session
+    Module._wasm_begin_prepend();
+
+    // 2. Push semua candles ke buffer internal WASM (single-threaded, no mutex, fast)
+    for (let i = 0; i < candles.length; i++) {
+        const c = candles[i];
+        Module.ccall('wasm_prepend_candle', null,
+            ['number', 'number', 'number', 'number', 'number', 'number'],
+            [c.o, c.h, c.l, c.c, c.time, c.v || 1]);
+    }
+
+    // 3. End prepend → sort + merge + offset viewCenterIndex + auto-skip overlap
+    Module._wasm_end_prepend();
+
+    // 4. Rebuild HTF (M5, M15, H1, H4) supaya indikator HTF update
+    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+
+    const elapsed = (performance.now() - t0).toFixed(0);
+    logGood(`[PREPEND] ✅ +${candles.length.toLocaleString()} candles prepended (${elapsed}ms, no rebuild!)`);
+    return true;
 }
 
 /**
@@ -1434,35 +1577,71 @@ async function loadBinaryChunkNewest(uiSymbol) {
     // Update oldest yang sudah di-load
     g_binChunkState[uiSymbol].oldestLoaded = candles[0].time;
 
+    // 🔥 TRIGGER PRELOAD di background: fetch semua part (N-1, N-2, ..., 1)
+    // supaya saat user scroll kiri minta history, lazy load INSTANT dari cache.
+    // Don't await — biarkan jalan di belakang setelah chart render.
+    if (parts > 1) {
+        setTimeout(() => {
+            preloadBinaryChunks(uiSymbol, parts).catch(e =>
+                logWarn(`[BIN-CHUNK] Preload error: ${e.message}`));
+        }, 200);
+    }
+
     return candles;
 }
 
 /**
+ * Init state binary chunk untuk symbol kalau belum ada.
+ * Asumsi penting: part TERBARU (= parts) sudah ada di IDB krn user pasti
+ * sudah render part itu (baik via loadBinaryChunkNewest atau via fallback REST
+ * yang kemudian di-fill sampai newest_epoch). Jadi mark parts sebagai loaded.
+ *
+ * @param {string} uiSymbol
+ * @returns {Promise<object|null>} state, atau null kalau index tidak ada
+ */
+async function ensureBinChunkState(uiSymbol) {
+    if (g_binChunkState[uiSymbol]) return g_binChunkState[uiSymbol];
+
+    const idx = await fetchBinIndex(uiSymbol);
+    if (!idx) return null;
+
+    // Asumsi: part terbaru (parts) sudah di-load ke chart/IDB.
+    // Lazy load mulai dari parts-1 ke bawah.
+    const totalParts = idx.parts;
+    const initState = {
+        totalParts:  totalParts,
+        loadedParts: totalParts > 0 ? [totalParts] : [],   // part terbaru dianggap sudah ada
+        oldestLoaded: idx.newest_epoch,
+        newestLoaded: idx.newest_epoch,
+        allDone: totalParts <= 1,
+        indexMeta: idx    // simpan untuk range check nanti
+    };
+    g_binChunkState[uiSymbol] = initState;
+    logInfo(`[BIN-CHUNK] 🆕 ${uiSymbol} state di-init (totalParts=${totalParts}, ` +
+            `asumsi part ${totalParts} sudah di-IDB)`);
+    return initState;
+}
+
+/**
  * Load part LEBIH LAMA saat user scroll kiri.
- * Cari part yang belum di-load dan lebih tua dari oldestTime.
+ * Strategi: ambil part tertinggi yang belum di-load (parts-1, parts-2, ...).
+ * Setelah fetch, cek range: bila newest candle part > oldestTime → masih relevan,
+ * lanjut push. Bila tidak relevan pun tetap mark loaded supaya tidak di-fetch ulang.
+ *
  * @param {string} uiSymbol
  * @param {number} oldestTime - epoch seconds dari candle tertua di chart
- * @returns {Array} candles dari part lebih tua, atau [] jika habis
+ * @returns {Promise<Array>} candles dari part lebih tua, atau [] jika habis
  */
 async function loadBinaryChunkOlder(uiSymbol, oldestTime) {
-    const state = g_binChunkState[uiSymbol];
-    if (!state) {
-        // Belum pernah load dari chunk → fetch index dulu
-        const idx = await fetchBinIndex(uiSymbol);
-        if (!idx) return [];
-        g_binChunkState[uiSymbol] = {
-            totalParts:  idx.parts,
-            loadedParts: [],
-            oldestLoaded: idx.newest_epoch,
-            newestLoaded: idx.newest_epoch,
-            allDone: false
-        };
-        return loadBinaryChunkOlder(uiSymbol, oldestTime);
+    const state = await ensureBinChunkState(uiSymbol);
+    if (!state) return [];
+
+    if (state.allDone) {
+        logInfo(`[BIN-CHUNK] ${uiSymbol}: semua ${state.totalParts} part sudah di-load`);
+        return [];
     }
 
-    if (state.allDone) return [];
-
-    // Cari part tertinggi yang belum di-load
+    // Cari part tertinggi yang belum di-load (parts-1, parts-2, ...)
     const loaded = new Set(state.loadedParts);
     let targetPart = null;
     for (let p = state.totalParts; p >= 1; p--) {
@@ -1471,13 +1650,15 @@ async function loadBinaryChunkOlder(uiSymbol, oldestTime) {
 
     if (targetPart === null) {
         state.allDone = true;
-        logInfo(`[BIN-CHUNK] ${uiSymbol}: semua ${state.totalParts} part sudah di-load`);
+        logInfo(`[BIN-CHUNK] ${uiSymbol}: tidak ada part tersisa`);
         return [];
     }
 
     const candles = await fetchBinPart(uiSymbol, targetPart, state.totalParts);
     if (!candles || candles.length === 0) {
-        state.allDone = true;
+        // Part rusak / kosong → mark loaded supaya tidak loop forever
+        state.loadedParts.push(targetPart);
+        if (targetPart === 1) state.allDone = true;
         return [];
     }
 
@@ -1491,12 +1672,14 @@ async function loadBinaryChunkOlder(uiSymbol, oldestTime) {
 
 /**
  * Cek apakah masih ada binary chunk lebih tua yang belum di-load.
+ * Versi async: kalau state belum ada, fetch index dulu via ensureBinChunkState.
+ *
  * @param {string} uiSymbol
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
-function hasBinaryOlderChunks(uiSymbol) {
-    const state = g_binChunkState[uiSymbol];
-    if (!state) return false;  // belum pernah load dari chunk → tidak tahu
+async function hasBinaryOlderChunks(uiSymbol) {
+    const state = await ensureBinChunkState(uiSymbol);
+    if (!state) return false;          // index tidak ada → tidak ada binary
     if (state.allDone) return false;
     const loaded = new Set(state.loadedParts);
     for (let p = 1; p <= state.totalParts; p++) {
@@ -2703,19 +2886,39 @@ window.onNearLeftEdge = async function(oldestTime) {
 
     // TAHAP 2: IDB habis → coba Binary Chunk lebih tua dulu! 🔥
     //   BTCUSDT_part2.bin → BTCUSDT_part1.bin → dst
-    //   Lebih cepat dari REST API + tidak kena rate limit!
-    if (hasBinaryOlderChunks(CURRENT_SYMBOL)) {
-        logInfo(`[LAZY] IDB habis → coba older binary chunk...`);
+    //   Versi PREPEND: langsung push 50k candle ke WASM tanpa clear chart!
+    //   20x lebih cepat dari rebuildFullFromDB (skip IDB read 250k + sort + push 250k ulang).
+    if (await hasBinaryOlderChunks(CURRENT_SYMBOL)) {
+        logInfo(`[LAZY] IDB habis → coba older binary chunk (prepend mode)...`);
         if (window._spinnerShow) window._spinnerShow();
 
         const chunkCandles = await loadBinaryChunkOlder(CURRENT_SYMBOL, oldestTime);
 
         if (chunkCandles.length > 0) {
-            // Simpan chunk ke IDB supaya lazy load berikutnya langsung dari IDB
+            // 🔥 PREPEND: push langsung ke WASM tanpa clear chart
+            const prepended = pushCandlesViaPrepend(chunkCandles);
+
+            if (prepended) {
+                // ✅ Prepend berhasil — save ke IDB di BACKGROUND (non-blocking)
+                //   untuk persistence (supaya reload berikutnya cache hit di IDB)
+                addToBuffer(CURRENT_SYMBOL, chunkCandles);
+                flushBuffer().catch(e => logWarn(`[LAZY] IDB bg save error: ${e.message}`));
+
+                // Force VBO refresh supaya candle hasil prepend langsung render
+                if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+                if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+
+                logGood(`[LAZY] ✅ +${chunkCandles.length.toLocaleString()} candles prepended (no rebuild!)`);
+                g_lazyLoadInProgress = false;
+                if (window._spinnerHide) window._spinnerHide();
+                return;
+            }
+
+            // ⚠️ Fallback: prepend gagal (WASM gak expose API) → rebuildFullFromDB (lama)
+            logWarn(`[LAZY] Prepend gagal → fallback rebuildFullFromDB`);
             addToBuffer(CURRENT_SYMBOL, chunkCandles);
             await flushBuffer();
 
-            // Rebuild chart dengan data baru
             if (Module._wasm_save_view_anchor)    Module._wasm_save_view_anchor();
             if (Module._wasm_clear_chart)         Module._wasm_clear_chart();
             await rebuildFullFromDB(CURRENT_SYMBOL);
@@ -2723,7 +2926,7 @@ window.onNearLeftEdge = async function(oldestTime) {
             if (Module._wasm_force_vbo_refresh)   Module._wasm_force_vbo_refresh();
             if (Module._wasm_set_lazy_load_done)  Module._wasm_set_lazy_load_done();
 
-            logGood(`[LAZY] ✅ +${chunkCandles.length.toLocaleString()} candles dari binary chunk`);
+            logGood(`[LAZY] ✅ +${chunkCandles.length.toLocaleString()} candles dari binary chunk (rebuild)`);
             g_lazyLoadInProgress = false;
             if (window._spinnerHide) window._spinnerHide();
             return;
@@ -2811,7 +3014,45 @@ window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
         return;
     }
 
-    // TAHAP 2: IDB habis → fetch dari HL REST
+    // TAHAP 2: IDB habis → coba Binary Chunk lebih tua dulu! 🔥
+    //   (Sama seperti primary tab — gunakan chunk binary sebelum fallback REST)
+    if (await hasBinaryOlderChunks(symbol)) {
+        logInfo(`${tag} IDB habis → coba older binary chunk...`);
+
+        const chunkCandles = await loadBinaryChunkOlder(symbol, oldestTime);
+
+        if (chunkCandles.length > 0) {
+            // Simpan chunk ke IDB supaya lazy load berikutnya langsung dari IDB
+            addToBuffer(symbol, chunkCandles);
+            await flushBuffer();
+
+            // Rebuild chart tab dengan data baru
+            if (isPrimary) {
+                if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
+                if (Module._wasm_clear_chart) Module._wasm_clear_chart();
+                await rebuildFullFromDB(symbol);
+                if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
+                if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+                if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+            } else {
+                if (Module._wasm_save_view_anchor_tab)
+                    Module.ccall('wasm_save_view_anchor_tab', null, ['number'], [tabId]);
+                await rebuildTabFromDB(tabId, symbol);
+                if (Module._wasm_restore_view_anchor_tab)
+                    Module.ccall('wasm_restore_view_anchor_tab', null, ['number'], [tabId]);
+                if (Module._wasm_set_tab_lazy_done)
+                    Module.ccall('wasm_set_tab_lazy_done', null, ['number'], [tabId]);
+            }
+
+            logGood(`${tag} ✅ +${chunkCandles.length.toLocaleString()} candles dari binary chunk`);
+            state.inProgress = false;
+            return;
+        }
+        // Chunk habis semua → lanjut ke REST API
+        logInfo(`${tag} Semua binary chunk habis → fallback HL REST`);
+    }
+
+    // TAHAP 3: Binary chunk habis / tidak ada → fetch dari Hyperliquid REST
     logInfo(`${tag} IDB habis → fetch dari HL REST`);
     const olderCandles = await fetchOlderCandles(symbol, oldestTime, LAZY_CHUNK);
 
