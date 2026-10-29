@@ -71,6 +71,13 @@ let bnValidSymbols = null;       // Set of valid Binance Futures symbols (from e
 let bnValidUISymbols = [];       // UI symbols yang valid di Binance (filtered BN_SYMBOLS)
 let bnInvalidUISymbols = [];     // UI symbols yang TIDAK valid di Binance (untuk forex-poll)
 
+// 🔥 FIX: Throttle counter untuk BN-WS reconnect (max 5 retry).
+//   Tanpa declare ini, onclose handler crash: "g_bnReconnectCount is not defined".
+let g_bnReconnectCount = 0;
+
+// Reset counter saat berhasil connect (di onopen)
+function _resetBnReconnect() { g_bnReconnectCount = 0; }
+
 // 💱 Forex Polling state (untuk EURUSD/GBPUSD yang tidak ada di Binance)
 let forexPollInterval = null;
 let forexPollSymbols = [];       // symbols yang di-poll dari free API
@@ -512,8 +519,10 @@ async function getAllSymbolsInDB() {
 
 async function saveBufferToDB(data) {
     if (!db || !data.length) return;
-    const bigWrite = data.length > 500;
-    if (bigWrite && window._spinnerShow) window._spinnerShow();
+    // 🔥 FIX: Hapus spinner show/hide — background write gak perlu visual indicator.
+    //   Spinner (3 dots animation infinite + z-index 9997 compositing layer) bikin FPS drop
+    //   saat paralel dengan CPU-heavy task (prepend, IDB upgrade).
+    //   Chart sudah muncul, user gak perlu tau ada background save.
     const BATCH = 3000;
     for (let i = 0; i < data.length; i += BATCH) {
         const chunk = data.slice(i, i + BATCH);
@@ -527,7 +536,6 @@ async function saveBufferToDB(data) {
         if (i + BATCH < data.length)
             await new Promise(r => setTimeout(r, 0));
     }
-    if (bigWrite && window._spinnerHide) window._spinnerHide();
 }
 
 function addToBuffer(symbol, candles) {
@@ -603,15 +611,25 @@ async function saveToIDBBackground(symbol, candles) {
 async function getOlderCandlesFromDB(symbol, beforeTime, limit = 10000) {
     if (!db) return [];
     return new Promise(res => {
+        // 🔥 FIX: Cursor 'prev' + stop setelah `limit` record (bukan getAll SEMUA lalu sort+slice).
+        //   Konteks ON-DEMAND: IDB bisa punya 200k+ candle lebih tua dari beforeTime.
+        //   getAll(200k) + sort di main thread = jank besar TIAP kali mesin minta data lama.
+        //   Cursor descending: mulai persis dari candle sebelum beforeTime, ambil
+        //   `limit` record saja (5k) → lazy load mulus, baca 5k bukan 200k.
         const t = db.transaction([STORE], 'readonly');
         const range = IDBKeyRange.bound([symbol, 0], [symbol, beforeTime], false, true);
-        const req = t.objectStore(STORE).getAll(range);
+        const req = t.objectStore(STORE).openCursor(range, 'prev');
+        const out = [];
         req.onsuccess = () => {
-            let r = req.result || [];
-            r.sort((a, b) => b.time - a.time);
-            r = r.slice(0, limit);
-            r.reverse();
-            res(r);
+            const cursor = req.result;
+            if (cursor && out.length < limit) {
+                out.push(cursor.value);
+                cursor.continue();
+            } else {
+                // Cursor 'prev' = urutan baru→lama; chart butuh lama→baru → reverse
+                out.reverse();
+                res(out);
+            }
         };
         req.onerror = () => res([]);
     });
@@ -933,6 +951,32 @@ async function rebuildFullFromDB(symbol) {
                 console.warn('[HYBRID-IDB-BG] Delete corrupt error:', e);
             }
         }, 0);
+    }
+}
+
+// 🔥 NEW: Helper untuk save snapshot + trigger IDBFS sync ke IndexedDB.
+//   Dipakai di 3 tempat: binary TURBO path, snapshot gap path, REST fallback path.
+//   Snapshot di-save ke /data/ (IDBFS) di main.cpp, tapi perlu FS.syncfs(false)
+//   untuk flush ke IndexedDB. Tanpa ini, snapshot hilang saat reload.
+function saveSnapshotWithSync(symbol, label = '') {
+    if (!Module._wasm_save_snapshot) return;
+    try {
+        const cnt = Module._wasm_save_snapshot(symbol);
+        if (cnt > 0) {
+            logGood(`[SNAPSHOT] 💾 Saved ${cnt} candles ${label ? '(' + label + ')' : ''} — instant reload ready!`);
+            // Trigger IDBFS sync ke IndexedDB
+            if (Module.FS && Module.FS.syncfs) {
+                Module.FS.syncfs(false, (err) => {
+                    if (!err) {
+                        logGood(`[SNAPSHOT] ✅ Synced to IndexedDB — snapshot persist!`);
+                    } else {
+                        logWarn(`[SNAPSHOT] Sync error: ${err}`);
+                    }
+                });
+            }
+        }
+    } catch(e) {
+        logWarn(`[SNAPSHOT] Save error: ${e.message}`);
     }
 }
 
@@ -1445,6 +1489,17 @@ async function fetchBinPart(uiSymbol, partNum, totalParts) {
  * @param {string} uiSymbol
  * @param {number} totalParts
  */
+// 🔥 ON-DEMAND MODE (engine-driven lazy load) — toggle di config.js:
+//   PLATFORM.BIN_PRELOAD = true  → aktifkan lagi background preload semua part
+//   PLATFORM.IDB_UPGRADE = true  → aktifkan lagi auto-prepend IDB pasca-reload
+//   Default: false (ON-DEMAND) — reload hanya render part terbaru.
+//   Data lama (bin part 1..N-1 / IDB 200k) HANYA diambil saat mesin minta:
+//   user scroll kiri → C++ fire onNearLeftEdge → lazy load (IDB → bin → REST).
+//   Ini eliminasi freeze pasca-reload (dulu: parse 200k + prepend 200k +
+//   rebuild semua HTF + GoToLive — semua jalan diam-diam tanpa request mesin).
+const g_binPreloadEnabled = (typeof PLATFORM !== 'undefined' && PLATFORM.BIN_PRELOAD === true);
+const g_idbUpgradeEnabled = (typeof PLATFORM !== 'undefined' && PLATFORM.IDB_UPGRADE === true);
+
 const g_preloadInProgress = new Set();
 
 async function preloadBinaryChunks(uiSymbol, totalParts) {
@@ -1461,11 +1516,27 @@ async function preloadBinaryChunks(uiSymbol, totalParts) {
                 logInfo(`[BIN-PRELOAD] ⏹️ ${uiSymbol}: user switch symbol, stop preload at part ${p + 1}`);
                 break;
             }
+            // 🔥 SKIP kalau IDB upgrade sudah mark all parts as loaded.
+            //   IDB punya semua data → lazy load ambil dari IDB, gak perlu preload binary.
+            const state = g_binChunkState[uiSymbol];
+            if (state && state.allDone) {
+                logInfo(`[BIN-PRELOAD] ⏹️ ${uiSymbol}: state.allDone=true (IDB has full data), skip preload`);
+                break;
+            }
             // Skip kalau sudah ada di cache
             if (binCacheGet(uiSymbol, p)) continue;
 
-            // Yield ke UI supaya tidak block render frame
-            await new Promise(r => setTimeout(r, 50));
+            // 🔥 FIX: Yield 50ms → 200ms antar part supaya gak CPU burst.
+            //   Parsing MTVC buffer (50k candle × DataView loop) = CPU heavy.
+            //   Dengan 200ms yield, render frame bisa jalan di sela-sela parse.
+            await new Promise(r => setTimeout(r, 200));
+
+            // 🔥 RE-CHECK state.allDone setelah yield (mungkin IDB upgrade selesai saat yield)
+            const stateAfter = g_binChunkState[uiSymbol];
+            if (stateAfter && stateAfter.allDone) {
+                logInfo(`[BIN-PRELOAD] ⏹️ ${uiSymbol}: state.allDone=true setelah yield, skip preload`);
+                break;
+            }
 
             const fname = `data/${uiSymbol}_part${p}.bin`;
             try {
@@ -1577,14 +1648,19 @@ async function loadBinaryChunkNewest(uiSymbol) {
     // Update oldest yang sudah di-load
     g_binChunkState[uiSymbol].oldestLoaded = candles[0].time;
 
-    // 🔥 TRIGGER PRELOAD di background: fetch semua part (N-1, N-2, ..., 1)
-    // supaya saat user scroll kiri minta history, lazy load INSTANT dari cache.
-    // Don't await — biarkan jalan di belakang setelah chart render.
-    if (parts > 1) {
+    // 🔥 ON-DEMAND MODE: data lama TIDAK di-preload di background.
+    //   Reload → render part terbaru (instant) → SELESAI. Gak ada fetch diam-diam
+    //   yang bikin freeze. Part 1..N-1 baru di-fetch saat mesin minta:
+    //   user scroll kiri → onNearLeftEdge → loadBinaryChunkOlder → fetchBinPart.
+    //   Tetap cepat krn Service Worker sudah cache-kan file .bin (fetch = local disk).
+    //   Balikin ke warm-cache mode: set PLATFORM.BIN_PRELOAD = true di config.js.
+    if (g_binPreloadEnabled && parts > 1) {
         setTimeout(() => {
             preloadBinaryChunks(uiSymbol, parts).catch(e =>
                 logWarn(`[BIN-CHUNK] Preload error: ${e.message}`));
-        }, 200);
+        }, 3000);
+    } else if (parts > 1) {
+        logInfo(`[BIN-CHUNK] ⏭️ ${uiSymbol}: preload OFF (on-demand) — ${parts - 1} part lama tunggu mesin minta (scroll kiri)`);
     }
 
     return candles;
@@ -1660,6 +1736,22 @@ async function loadBinaryChunkOlder(uiSymbol, oldestTime) {
         state.loadedParts.push(targetPart);
         if (targetPart === 1) state.allDone = true;
         return [];
+    }
+
+    // 🔥 FIX: Skip part yang range-nya TIDAK lebih tua dari oldestTime.
+    //   Skenario: IDB sudah punya semua part (dari session sebelumnya),
+    //   user scroll kiri → oldestTime = 2026-05-05 (paling tua di IDB).
+    //   loadBinaryChunkOlder coba part4 (range 2026-09 → 2026-10, LEBIH BARU!) → useless.
+    //   Fix: cek range part. Kalau newest >= oldestTime → skip (sudah ada di chart/IDB).
+    if (oldestTime && candles.length > 0) {
+        const partNewest = candles[candles.length - 1].time;
+        if (partNewest >= oldestTime) {
+            state.loadedParts.push(targetPart);
+            if (targetPart === 1) state.allDone = true;
+            const partOldest = candles[0].time;
+            logInfo(`[BIN-CHUNK] ${uiSymbol} part ${targetPart}: skipped (range ${new Date(partOldest*1000).toISOString().slice(0,10)} → ${new Date(partNewest*1000).toISOString().slice(0,10)} not older than oldestTime ${new Date(oldestTime*1000).toISOString().slice(0,10)})`);
+            return [];
+        }
     }
 
     state.loadedParts.push(targetPart);
@@ -2181,6 +2273,7 @@ async function connectBinanceWebSocket() {
     bnWS = new WebSocket(streamUrl);
 
     bnWS.onopen = () => {
+        _resetBnReconnect();  // 🔥 Reset throttle counter saat berhasil connect
         logGood(`[BN-WS] ✅ Connected! Streams: ${streams.length} (kline + bookTicker + aggTrade)`);
         logGood(`[BN-WS] Symbols: ${symbolsToSubscribe.join(', ')}`);
         bnSubscribedStreams = new Set(streams);
@@ -2210,7 +2303,17 @@ async function connectBinanceWebSocket() {
     };
 
     bnWS.onclose = (e) => {
-        logWarn(`[BN-WS] Disconnected (${e.code}) → reconnect 3s`);
+        // 🔥 THROTTLE: Max 5 retry, lalu give up. Avoid spam reconnect yang boros CPU/network.
+        //   Skenario: user gak punya cert Binance / di balik firewall → WS selalu fail.
+        //   Tanpa throttle: reconnect tiap 3 detik forever → log spam + CPU waste.
+        g_bnReconnectCount = (g_bnReconnectCount || 0) + 1;
+        if (g_bnReconnectCount > 5) {
+            logWarn(`[BN-WS] Disconnected (${e.code}) → give up after 5 retries (cert/network issue)`);
+            bnWS = null;
+            bnSubscribedStreams.clear();
+            return;
+        }
+        logWarn(`[BN-WS] Disconnected (${e.code}) → reconnect 3s (retry ${g_bnReconnectCount}/5)`);
         bnWS = null;
         bnSubscribedStreams.clear();
         setTimeout(connectBinanceWebSocket, 3000);
@@ -2507,6 +2610,10 @@ window.SetActiveSymbol = async function(newSym) {
     g_lazyLoadInProgress = false;
     g_initialLoadDone = false;
 
+    // 🔥 RESET scroll guard — supaya lazy load gak fire sebelum user scroll symbol baru
+    g_userHasScrolled = false;
+    window.__userHasScrolled = false;  // sync C++ gate (EM_ASM_INT) juga
+
     g_tabSymbolMap.set(0, newSym);
     resetTabLazy(0);
 
@@ -2587,7 +2694,7 @@ window.SetActiveSymbol = async function(newSym) {
                                     addToBuffer(CURRENT_SYMBOL, gapCandles);
                                     await flushBuffer();
                                     setTimeout(() => {
-                                        if (Module._wasm_save_snapshot) Module._wasm_save_snapshot(CURRENT_SYMBOL);
+                                        saveSnapshotWithSync(CURRENT_SYMBOL, 'after gap fill');
                                     }, 1000);
                                     logGood(`[SNAPSHOT-GAP] ✅ +${gapCandles.length} gap candles`);
                                 }
@@ -2608,17 +2715,30 @@ window.SetActiveSymbol = async function(newSym) {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // 🔥 ORIGINAL FLOW: IDB atau binary (kalau snapshot gak ada)
+    // 🔥 SKIP IDB CHECK — langsung binary path (instant via Service Worker cache)
+    //   Strategi: "binary as source of truth" — IDB cuma write-only untuk persistence.
+    //
+    //   Alasan skip IDB:
+    //     1. IDB read 50k+ rows = 500ms-2s blocking (slow!)
+    //     2. Binary via SW cache = ~50ms (instant!)
+    //     3. Gap fill background tetap jalan → data tetap fresh
+    //     4. IDB save tetap jalan di background → lazy load persistence OK
+    //
+    //   Trade-off: kalau IDB ada data lebih baru dari binary (user live trading
+    //   di session sebelumnya), data tersebut di-fetch ulang via gap fill REST.
+    //   Delay 1-2 detik untuk data terbaru, tapi reload jadi INSTANT.
     // ════════════════════════════════════════════════════════════════
-    const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
+    logInfo(`[INIT] ${CURRENT_SYMBOL}: skip IDB check → langsung binary (instant via SW cache)`);
+    const existing = [];  // ← skip IDB read (gak di-baca sama sekali)
     const MIN = 500;
 
-    if (existing.length >= MIN) {
+    if (false /* existing.length >= MIN — SKENARIO 2 disabled */) {
         // ════════════════════════════════════════════════════════════
-        // 🔥 SKENARIO 2: IDB CACHE HIT — Optimasi utama
-        //   - Push LANGSUNG ke WASM dari data di memori (existing)
-        //   - TIDAK baca IDB lagi di rebuildFullFromDB (hemat 50-300ms)
-        //   - Gap fill JALAN DI BACKGROUND (chart sudah muncul)
+        // 🔥 SKENARIO 2: IDB CACHE HIT — DINONAKTIFKAN
+        //   Alasan: baca 50k dari IDB + push 50k ke WASM = 500ms-2s blocking.
+        //   Binary path (SKENARIO 1) lebih cepat krn pakai Service Worker HTTP cache.
+        //   Untuk re-enable: ganti `if (false)` jadi `if (existing.length >= MIN)`
+        //   + uncomment `const existing = await getAllCandlesFromDB(...)` di atas.
         // ════════════════════════════════════════════════════════════
         logGood(`[CACHE HIT] ${CURRENT_SYMBOL}: ${existing.length} bars`);
 
@@ -2734,6 +2854,123 @@ window.SetActiveSymbol = async function(newSym) {
                 logGood(`[TURBO] ✅ IDB background save selesai — lazy load siap!`);
             });
 
+            // 🔥 SAVE SNAPSHOT — supaya reload berikutnya INSTANT (~50ms via snapshot)
+            //   Snapshot = save internal WASM state (candles + HTF) ke IDBFS file system.
+            //   Load snapshot = restore internal state, gak perlu push ulang 50k candle.
+            //   Delay 1.5s supaya IDB save & gap fill selesai dulu (avoid race condition).
+            setTimeout(() => {
+                saveSnapshotWithSync(CURRENT_SYMBOL, 'binary TURBO');
+            }, 1500);
+
+            // ═══════════════════════════════════════════════════════════════
+            // 🔥 NEW: IDB UPGRADE via PREPEND — NO CLEAR, NO FULL REBUILD!
+            //
+            //   Arsitektur lama: CLEAR_CHART + rebuildFullFromDB (push 200k ulang, GPU rebuild VBO 200k)
+            //     → FPS drop parah ~3-4 detik, padahal chart sudah punya 5834 candle
+            //
+            //   Arsitektur baru: PREPEND hanya candle LEBIH LAMA yang belum ada di chart
+            //     1. Get IDB candles (200k)
+            //     2. Get chart's oldest time via wasm_get_oldest_loaded_time (5834)
+            //     3. Filter: only IDB candles dengan time < chart's oldest (~197k)
+            //     4. pushCandlesViaPrepend(filtered) — NO CLEAR, NO GPU REBUILD!
+            //     5. GPU auto-appends to VBO (incremental, fast)
+            //
+            //   Skenario: user pernah lazy load sampai 200k candle di session sebelumnya.
+            //   IDB punya 200k. Tapi snapshot gak persist (WASM belum rebuild).
+            //   Tanpa fix ini: reload mulai dari binary part5 (3k) → user harus scroll manual.
+            //   Dengan fix ini: reload mulai dari binary (instant) → background prepend older.
+            //
+            //   Delay 800ms supaya binary render + initial IDB save selesai dulu.
+            // ═══════════════════════════════════════════════════════════════
+            // 🔥 ON-DEMAND MODE: IDB-UPGRADE default OFF.
+            //   Auto-prepend 200k candle pasca-reload = sumber freeze (IDB read
+            //   200k + filter + prepend 200k + rebuild SEMUA HTF + VBO refresh
+            //   + GoToLive yang bikin view loncat).
+            //   Data lama sekarang via lazy load saat mesin minta (scroll kiri →
+            //   onNearLeftEdge → TAHAP 1 IDB, 5k candle/blok, mulus no-clear).
+            //   Balikin: set PLATFORM.IDB_UPGRADE = true di config.js.
+            if (g_idbUpgradeEnabled) {
+            setTimeout(() => {
+                (async () => {
+                    try {
+                        const idbCandles = await getAllCandlesFromDB(CURRENT_SYMBOL);
+                        const binaryCount = allCandles.length;
+
+                        if (idbCandles.length > binaryCount + 5000) {
+                            // IDB punya significantly lebih banyak data → PREPEND older candles
+                            logInfo(`[IDB-UPGRADE] IDB has ${idbCandles.length.toLocaleString()} vs chart ${binaryCount.toLocaleString()} → prepend older candles (no clear)`);
+
+                            // 🔥 Get chart's oldest time via WASM
+                            let chartOldestTime = 0;
+                            if (Module._wasm_get_oldest_loaded_time) {
+                                chartOldestTime = Module._wasm_get_oldest_loaded_time();
+                            }
+
+                            // 🔥 Filter: only IDB candles OLDER than chart's oldest
+                            let olderCandles;
+                            if (chartOldestTime > 0) {
+                                olderCandles = idbCandles.filter(c => c.time < chartOldestTime);
+                                logInfo(`[IDB-UPGRADE] Chart oldest=${new Date(chartOldestTime*1000).toISOString().slice(0,10)}, IDB older candles: ${olderCandles.length.toLocaleString()}`);
+                            } else {
+                                // Chart empty (edge case) → use all IDB
+                                olderCandles = idbCandles;
+                            }
+
+                            if (olderCandles.length === 0) {
+                                logInfo(`[IDB-UPGRADE] No older candles to prepend (chart already has all IDB data) → skip`);
+                            } else {
+                                // 🔥 PREPEND via WASM API — NO CLEAR, NO GPU REBUILD!
+                                //   pushCandlesViaPrepend handles:
+                                //   1. wasm_begin_prepend()
+                                //   2. loop wasm_prepend_candle (only ~197k, not 200k!)
+                                //   3. wasm_end_prepend() → sort + merge + offset viewCenterIndex
+                                //   4. wasm_rebuild_all_htfs()
+                                const prepended = pushCandlesViaPrepend(olderCandles);
+
+                                if (prepended) {
+                                    // ✅ Prepend berhasil — NO CLEAR, NO FULL REBUILD!
+                                    if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+                                    logGood(`[IDB-UPGRADE] ✅ Prepended ${olderCandles.length.toLocaleString()} older candles (no clear, no rebuild!)`);
+                                } else {
+                                    // ⚠️ Fallback: prepend gagal (WASM gak expose API) → rebuildFullFromDB
+                                    logWarn(`[IDB-UPGRADE] Prepend gagal → fallback rebuildFullFromDB`);
+                                    if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
+                                    if (Module._wasm_clear_chart) Module._wasm_clear_chart();
+                                    await rebuildFullFromDB(CURRENT_SYMBOL);
+                                    if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
+                                    if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+                                    logGood(`[IDB-UPGRADE] ✅ Rebuilt ${idbCandles.length.toLocaleString()} candles from IDB (fallback)`);
+                                }
+                            }
+
+                            // 🔥 Update g_binChunkState: kalau IDB punya ~all parts, mark all as loaded
+                            const state = g_binChunkState[CURRENT_SYMBOL];
+                            if (state && state.indexMeta) {
+                                const idx = state.indexMeta;
+                                if (idbCandles.length >= idx.total_candles * 0.9) {
+                                    state.loadedParts = Array.from({length: idx.parts}, (_, i) => i + 1);
+                                    state.allDone = true;
+                                    state.oldestLoaded = idbCandles[0]?.time || state.oldestLoaded;
+                                    logGood(`[IDB-UPGRADE] ✅ Marked all ${idx.parts} parts as loaded (IDB has full data) — lazy load skip binary`);
+                                }
+                            }
+
+                            // Save snapshot setelah upgrade supaya reload berikutnya instant (kalau WASM sudah rebuild)
+                            setTimeout(() => {
+                                saveSnapshotWithSync(CURRENT_SYMBOL, 'after IDB upgrade');
+                            }, 500);
+                        } else {
+                            logInfo(`[IDB-UPGRADE] IDB has ${idbCandles.length} vs binary ${binaryCount} → no upgrade needed`);
+                        }
+                    } catch(e) {
+                        logWarn(`[IDB-UPGRADE] Error: ${e.message}`);
+                    }
+                })();
+            }, 800);
+            } else {
+                logInfo(`[IDB-UPGRADE] ⏭️ OFF (on-demand) — chart keep ${allCandles.length.toLocaleString()} candle dari binary; data lama via lazy load saat mesin minta`);
+            }
+
             // ═══════════════════════════════════════════════════════
             // 🔥 OPTIMASI: Gap fill di BACKGROUND
             //   Chart sudah muncul dari binary, gap fill jalan di belakang
@@ -2810,8 +3047,7 @@ window.SetActiveSymbol = async function(newSym) {
                     // 🔥 SNAPSHOT: Save snapshot untuk instant reload berikutnya
                     if (Module._wasm_save_snapshot) {
                         setTimeout(() => {
-                            const cnt = Module._wasm_save_snapshot(CURRENT_SYMBOL);
-                            if (cnt > 0) logGood(`[SNAPSHOT] 💾 Saved ${cnt} candles (for reload)`);
+                            saveSnapshotWithSync(CURRENT_SYMBOL, 'REST fallback');
                         }, 2000);
                     }
                 });
@@ -2842,23 +3078,86 @@ const LAZY_CHUNK = PLATFORM.LAZY_CHUNK || 5000;
 let g_lazyLoadInProgress = false;
 let g_noMoreHistory      = new Set();
 
+// 🔥 NEW: Guard "user has scrolled" — supaya lazy load gak fire saat chart baru render.
+//   Akar masalah: main.cpp line 7506 `if (start_idx <= 80) fire onNearLeftEdge`.
+//   Setelah binary render 3007 candle, chart menampilkan SEMUA 3007 di viewport.
+//   start_idx = 0 (bar kiri terlihat) → fire lazy load padahal user belum scroll!
+//   Fix: track user interaction (wheel/mousedown/touch/keydown). Hanya allow lazy
+//   load setelah user explicitly scroll. Reset saat switch symbol.
+let g_userHasScrolled = false;
+// 🔥 Expose ke window — supaya C++ (EM_ASM_INT di LAZY LOAD TRIGGER, main.cpp)
+//   bisa cek "user sudah scroll?" SEBELUM set lazyPending & fire callback.
+//   Tanpa gate ini: fire → JS skip (user belum scroll) → lazyPending nyangkut
+//   true → lazy load LOCKED selamanya (mode on-demand jadi fatal).
+window.__userHasScrolled = false;
+
+function _markUserScrolled() {
+    g_userHasScrolled = true;
+    // Sync ke window untuk C++ gate (EM_ASM_INT di main.cpp LAZY LOAD TRIGGER)
+    window.__userHasScrolled = true;
+}
+
+// 🔥 FIX: Pasang listener di window + document + canvas.emscripten.
+//   Akar masalah: canvas.emscripten intercept wheel event (krn ImGui handle untuk zoom).
+//   Listener di window saja gak ke-trigger krn event di-stop di canvas.
+//   Solusi: pasang di window + document + canvas (capture phase supaya intercept sebelum ImGui).
+function _installScrollListeners() {
+    const opts = { passive: true, capture: true };
+    window.addEventListener('wheel',     _markUserScrolled, opts);
+    window.addEventListener('mousedown',  _markUserScrolled, opts);
+    window.addEventListener('touchstart', _markUserScrolled, opts);
+    window.addEventListener('keydown',    _markUserScrolled, opts);
+    document.addEventListener('wheel',     _markUserScrolled, opts);
+    document.addEventListener('mousedown',  _markUserScrolled, opts);
+    document.addEventListener('touchstart', _markUserScrolled, opts);
+    document.addEventListener('keydown',    _markUserScrolled, opts);
+    // Canvas emscripten khusus (krn chart render di sini)
+    const canvas = document.querySelector('canvas.emscripten') || document.querySelector('canvas');
+    if (canvas) {
+        canvas.addEventListener('wheel',     _markUserScrolled, opts);
+        canvas.addEventListener('mousedown',  _markUserScrolled, opts);
+        canvas.addEventListener('touchstart', _markUserScrolled, opts);
+    } else {
+        // Canvas belum ready, retry 1 detik lagi
+        setTimeout(_installScrollListeners, 1000);
+    }
+}
+
+// Pasang listener saat DOM ready (atau langsung kalau sudah ready)
+if (typeof window !== 'undefined') {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', _installScrollListeners);
+    } else {
+        _installScrollListeners();
+    }
+}
+
 // Per-tab lazy state
 const g_tabLazy      = new Map();
 const g_tabSymbolMap = new Map();
 
 function getTabLazy(tabId) {
     if (!g_tabLazy.has(tabId)) {
-        g_tabLazy.set(tabId, { inProgress: false, noMoreHistory: false });
+        g_tabLazy.set(tabId, { inProgress: false, noMoreHistory: false, skipLogged: false });
     }
     return g_tabLazy.get(tabId);
 }
 
 function resetTabLazy(tabId) {
-    g_tabLazy.set(tabId, { inProgress: false, noMoreHistory: false });
+    g_tabLazy.set(tabId, { inProgress: false, noMoreHistory: false, skipLogged: false });
 }
 
 window.onNearLeftEdge = async function(oldestTime) {
     if (g_lazyLoadInProgress) return;
+
+    // 🔥 GUARD: Skip lazy load kalau user belum scroll.
+    //   Tanpa ini, chart baru render 3007 candle (semua visible di viewport)
+    //   → WASM fire onNearLeftEdge (start_idx <= 80) → lazy load jalan padahal
+    //   user masih di live view!
+    if (!g_userHasScrolled) {
+        logInfo(`[LAZY] ${CURRENT_SYMBOL}: skip (user belum scroll, chart masih di initial view)`);
+        return;
+    }
     if (g_noMoreHistory.has(CURRENT_SYMBOL)) return;
     if (!g_initialLoadDone) {
         logInfo(`[LAZY] ${CURRENT_SYMBOL}: initial load belum selesai, skip`);
@@ -2869,16 +3168,29 @@ window.onNearLeftEdge = async function(oldestTime) {
     logInfo(`[LAZY] ${CURRENT_SYMBOL} oldest: ${new Date(oldestTime * 1000).toISOString().slice(0,10)}`);
 
     // TAHAP 1: cek IDB dulu
+    //   🔥 FIX: Pakai PREPEND (no clear), BUKAN CLEAR+REBUILD!
+    //   Sebelumnya: wasm_clear_chart + rebuildFullFromDB → chart hilang + FPS drop + render ulang 200k.
+    //   Sekarang: pushCandlesViaPrepend(older) → hanya tambah candle lebih lama, chart tetap kelihatan.
     const older = await getOlderCandlesFromDB(CURRENT_SYMBOL, oldestTime, LAZY_CHUNK);
     if (older.length > 0) {
-        logInfo(`[LAZY] IDB +${older.length} → rebuild`);
+        logInfo(`[LAZY] IDB +${older.length} → prepend (no clear)`);
+        const prepended = pushCandlesViaPrepend(older);
+        if (prepended) {
+            // ✅ Prepend berhasil — NO CLEAR, NO FULL REBUILD!
+            if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+            if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+            logGood(`[LAZY] ✅ +${older.length} candles prepended from IDB (no clear!)`);
+            g_lazyLoadInProgress = false;
+            return;
+        }
+        // ⚠️ Fallback: prepend gagal → rebuildFullFromDB (lama, chart hilang)
+        logWarn(`[LAZY] Prepend gagal → fallback rebuildFullFromDB`);
         if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
         if (Module._wasm_clear_chart) Module._wasm_clear_chart();
         await rebuildFullFromDB(CURRENT_SYMBOL);
         if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
-        // 🔥 FIX v6: Force VBO refresh supaya candle hasil lazy load langsung render
         if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
-        logGood(`[LAZY] ✅ rebuilt from IDB (+${older.length})`);
+        logGood(`[LAZY] ✅ rebuilt from IDB (+${older.length}, fallback)`);
         if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
         g_lazyLoadInProgress = false;
         return;
@@ -2890,7 +3202,8 @@ window.onNearLeftEdge = async function(oldestTime) {
     //   20x lebih cepat dari rebuildFullFromDB (skip IDB read 250k + sort + push 250k ulang).
     if (await hasBinaryOlderChunks(CURRENT_SYMBOL)) {
         logInfo(`[LAZY] IDB habis → coba older binary chunk (prepend mode)...`);
-        if (window._spinnerShow) window._spinnerShow();
+        // 🔥 FIX: Hapus _spinnerShow — lazy load pakai prepend (364ms), gak perlu spinner.
+        //   Spinner animation + compositing layer bikin FPS drop saat paralel dengan prepend.
 
         const chunkCandles = await loadBinaryChunkOlder(CURRENT_SYMBOL, oldestTime);
 
@@ -2910,7 +3223,7 @@ window.onNearLeftEdge = async function(oldestTime) {
 
                 logGood(`[LAZY] ✅ +${chunkCandles.length.toLocaleString()} candles prepended (no rebuild!)`);
                 g_lazyLoadInProgress = false;
-                if (window._spinnerHide) window._spinnerHide();
+                // 🔥 FIX: Hapus _spinnerHide (gak ada show lagi)
                 return;
             }
 
@@ -2928,7 +3241,7 @@ window.onNearLeftEdge = async function(oldestTime) {
 
             logGood(`[LAZY] ✅ +${chunkCandles.length.toLocaleString()} candles dari binary chunk (rebuild)`);
             g_lazyLoadInProgress = false;
-            if (window._spinnerHide) window._spinnerHide();
+            // 🔥 FIX: Hapus _spinnerHide (gak ada show lagi)
             return;
         }
         // Chunk habis semua → lanjut ke REST API
@@ -2937,7 +3250,7 @@ window.onNearLeftEdge = async function(oldestTime) {
 
     // TAHAP 3: Binary chunk habis / tidak ada → fetch dari Hyperliquid REST
     logInfo(`[LAZY] IDB habis → fetch dari HL REST before=${new Date(oldestTime*1000).toISOString().slice(0,10)}`);
-    if (window._spinnerShow) window._spinnerShow();
+    // 🔥 FIX: Hapus _spinnerShow — REST fetch gak perlu spinner (chart masih kelihatan).
 
     const olderCandles = await fetchOlderCandles(CURRENT_SYMBOL, oldestTime, LAZY_CHUNK);
 
@@ -2949,7 +3262,7 @@ window.onNearLeftEdge = async function(oldestTime) {
             Module.ccall('wasm_set_tab_no_more_history', null, ['number'], [0]);
         if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
         g_lazyLoadInProgress = false;
-        if (window._spinnerHide) window._spinnerHide();
+        // 🔥 FIX: Hapus _spinnerHide (gak ada show lagi)
         return;
     }
 
@@ -2966,18 +3279,42 @@ window.onNearLeftEdge = async function(oldestTime) {
 
     if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
     g_lazyLoadInProgress = false;
-    if (window._spinnerHide) window._spinnerHide();
+    // 🔥 FIX: Hapus _spinnerHide (gak ada show lagi)
 };
 
 // Per-tab lazy load
 window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
     const state = getTabLazy(tabId);
     if (state.inProgress || state.noMoreHistory) return;
+
+    // 🔥 GUARD: Skip lazy load kalau user belum scroll (sama seperti primary tab).
+    if (!g_userHasScrolled) {
+        if (!state.skipLogged) {
+            logInfo(`[LAZY TAB${tabId}] skip (user belum scroll) — release lazyPending, engine re-fire sampai user scroll`);
+            state.skipLogged = true;
+        }
+        // 🔥 FIX: RELEASE C++ lazyPending! C++ set tab->lazyPending=true SEBELUM
+        //   panggil callback ini. Return tanpa release → lazyPending nyangkut true
+        //   → engine gak akan pernah fire lagi → lazy load LOCKED selamanya.
+        //   Di mode ON-DEMAND (BIN-PRELOAD + IDB-UPGRADE OFF) ini fatal: user
+        //   scroll kiri tapi chart gak nambah data. Release → engine re-fire
+        //   tiap ~0.5s; begitu user scroll, fire berikutnya langsung eksekusi.
+        //   (Setelah rebuild WASM, gate C++ (__userHasScrolled) mencegah fire
+        //   ini sama sekali — release ini jadi defense-in-depth.)
+        if (Module && Module._wasm_set_tab_lazy_done)
+            Module.ccall('wasm_set_tab_lazy_done', null, ['number'], [tabId]);
+        return;
+    }
+    state.skipLogged = false;  // user sudah scroll → reset log skip untuk tab ini
+
     state.inProgress = true;
 
     const symbol = g_tabSymbolMap.get(tabId);
     if (!symbol) {
         logWarn(`[LAZY TAB${tabId}] symbol unknown, skip`);
+        // 🔥 FIX: Release lazyPending juga (sama alasannya dengan guard di atas)
+        if (Module && Module._wasm_set_tab_lazy_done)
+            Module.ccall('wasm_set_tab_lazy_done', null, ['number'], [tabId]);
         state.inProgress = false;
         return;
     }
@@ -2987,28 +3324,41 @@ window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
     logInfo(`${tag} ${symbol} oldest: ${new Date(oldestTime*1000).toISOString().slice(0,10)}`);
 
     // TAHAP 1: cek IDB dulu
+    //   🔥 FIX: Primary tab pakai PREPEND (no clear), BUKAN CLEAR+REBUILD!
+    //   Non-primary tab tetap rebuildTabFromDB (prepend API hardcoded ke g_allCandles["M1"], gak support tab).
     const older = await getOlderCandlesFromDB(symbol, oldestTime, LAZY_CHUNK);
     if (older.length > 0) {
-        logInfo(`${tag} IDB +${older.length} → rebuild`);
         if (isPrimary) {
+            logInfo(`${tag} IDB +${older.length} → prepend (no clear)`);
+            const prepended = pushCandlesViaPrepend(older);
+            if (prepended) {
+                // ✅ Prepend berhasil — NO CLEAR, NO FULL REBUILD!
+                if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+                if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+                logGood(`${tag} ✅ +${older.length} candles prepended from IDB (no clear!)`);
+                state.inProgress = false;
+                return;
+            }
+            // ⚠️ Fallback: prepend gagal → rebuildFullFromDB
+            logWarn(`${tag} Prepend gagal → fallback rebuildFullFromDB`);
             if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
             if (Module._wasm_clear_chart) Module._wasm_clear_chart();
             await rebuildFullFromDB(symbol);
             if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
-            // 🔥 FIX v6: Force VBO refresh (lazy load tab primary)
             if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
             if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+            logGood(`${tag} ✅ rebuilt from IDB (+${older.length}, fallback)`);
         } else {
+            // Non-primary tab: tetap pakai rebuildTabFromDB (prepend API gak support tab)
+            logInfo(`${tag} IDB +${older.length} → rebuild (non-primary tab)`);
             if (Module._wasm_save_view_anchor_tab)
                 Module.ccall('wasm_save_view_anchor_tab', null, ['number'], [tabId]);
             await rebuildTabFromDB(tabId, symbol);
             if (Module._wasm_restore_view_anchor_tab)
                 Module.ccall('wasm_restore_view_anchor_tab', null, ['number'], [tabId]);
-            // 🔥 FIX v6: Force VBO refresh (lazy load tab non-primary — ClearInstances di-tab itu saja)
-            // Catatan: wasm_force_vbo_refresh cuma clear primary tabs. Untuk tab non-primary,
-            // VBO akan di-update otomatis di next frame karena UpdateData() original selalu upload.
             if (Module._wasm_set_tab_lazy_done)
                 Module.ccall('wasm_set_tab_lazy_done', null, ['number'], [tabId]);
+            logGood(`${tag} ✅ rebuilt from IDB (+${older.length})`);
         }
         state.inProgress = false;
         return;
@@ -3018,6 +3368,7 @@ window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
     //   (Sama seperti primary tab — gunakan chunk binary sebelum fallback REST)
     if (await hasBinaryOlderChunks(symbol)) {
         logInfo(`${tag} IDB habis → coba older binary chunk...`);
+        // 🔥 FIX: Hapus _spinnerShow — lazy load pakai prepend, gak perlu spinner.
 
         const chunkCandles = await loadBinaryChunkOlder(symbol, oldestTime);
 

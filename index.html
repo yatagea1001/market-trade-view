@@ -765,5 +765,22 @@
             btn.disabled = false; btn.innerText = 'Kirim Ulang Email';
         });
     </script>
+
+<!-- ======================================================= -->
+<!-- 🔥 SERVICE WORKER REGISTRATION — HTTP-level cache       -->
+<!--     Register SW juga di index.html supaya activate      -->
+<!--     sebelum user navigate ke app.html.                  -->
+<!-- ======================================================= -->
+<script>
+(function() {
+    if (!('serviceWorker' in navigator)) return;
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js', { scope: './' })
+            .then(reg => console.log('[SW] ✅ Registered on index, scope:', reg.scope))
+            .catch(err => console.warn('[SW] ❌ Register failed:', err.message));
+    });
+})();
+</script>
+
 </body>
 </html>

@@ -2958,6 +2958,11 @@ void RecalculateAllIndicators(const std::vector<Candle>& currentCandles);
 #include "SessionSweep_Indicator.h"
 
 // ==========================================================
+// CUSTOM SCRIPT INDICATOR — User-defined formula via DSL
+// ==========================================================
+#include "CustomScript_Indicator.h"
+
+// ==========================================================
 // 🔥 INDICATOR FACTORY — bikin indicator dari name + period
 //
 // Dipakai buat auto-recreate indicator dari JSON saat reload.
@@ -3017,6 +3022,8 @@ public:
                               return new TrendSignalIndicator();
         if (n == "session sweep" || n == "sessionsweep" || n == "session")
                               return new SessionSweepIndicator();
+        if (n == "custom script" || n == "customscript" || n == "custom")
+                              return new CustomScriptIndicator();
 
         return nullptr;
     }
@@ -3030,7 +3037,8 @@ public:
             "supertrend", "mfi", "roc", "obv", "volume",
             "smc", "sniperpro", "stc cross",
             "flag pattern", "trend signal",
-            "session sweep"
+            "session sweep",
+            "custom script"
         };
     }
 };

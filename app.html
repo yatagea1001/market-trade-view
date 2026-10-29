@@ -903,5 +903,53 @@ button:hover { background: #008ccb; }
 </style>
 </div>
 
+<!-- ======================================================= -->
+<!-- 🔥 SERVICE WORKER REGISTRATION — HTTP-level cache       -->
+<!--     Setelah reload pertama, .bin & .js di-serve dari    -->
+<!--     browser cache → reload berikutnya = ZERO network!   -->
+<!--     Update file: ganti CACHE_VERSION di sw.js (v1 → v2) -->
+<!-- ======================================================= -->
+<script>
+(function() {
+    if (!('serviceWorker' in navigator)) {
+        console.warn('[SW] Browser gak support Service Worker, skip');
+        return;
+    }
+    // Register setelah window load supaya ganggu first paint
+    window.addEventListener('load', () => {
+        // scope: './' supaya cover root + semua subdirectory
+        navigator.serviceWorker.register('./sw.js', { scope: './' })
+            .then(reg => {
+                console.log('[SW] ✅ Registered, scope:', reg.scope);
+                // Listen for update
+                reg.addEventListener('updatefound', () => {
+                    const newWorker = reg.installing;
+                    if (!newWorker) return;
+                    newWorker.addEventListener('statechange', () => {
+                        if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                            console.log('[SW] 🔄 New version installed, reload page to activate');
+                            // Optional: auto-reload untuk activekan SW baru
+                            // window.location.reload();
+                        }
+                    });
+                });
+            })
+            .catch(err => console.warn('[SW] ❌ Register failed:', err.message));
+
+        // Listen for messages from SW (untuk purge confirmation, dll)
+        navigator.serviceWorker.addEventListener('message', (event) => {
+            console.log('[SW → Page]', event.data);
+        });
+
+        // Expose API global untuk manual purge dari console
+        window.mtvSW = {
+            purgeAll: () => navigator.serviceWorker.controller?.postMessage({ type: 'PURGE_ALL_CACHE' }),
+            purgeBinary: () => navigator.serviceWorker.controller?.postMessage({ type: 'PURGE_BINARY_CACHE' }),
+            skipWaiting: () => navigator.serviceWorker.controller?.postMessage({ type: 'SKIP_WAITING' })
+        };
+    });
+})();
+</script>
+
 </body>
 </html>
