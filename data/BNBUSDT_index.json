@@ -1,12 +1,12 @@
 {
   "symbol": "BNBUSDT",
   "timeframe": "M1",
-  "parts": 2,
-  "total_candles": 81808,
-  "chunk_size": 50000,
+  "parts": 5,
+  "total_candles": 86057,
+  "chunk_size": 20000,
   "oldest_epoch": 1786588380,
-  "newest_epoch": 1792870680,
+  "newest_epoch": 1793388240,
   "oldest_date": "2026-08-13T02:33:00+00:00",
-  "newest_date": "2026-10-24T19:38:00+00:00",
-  "generated_at": "2026-10-24T19:41:13.807546+00:00"
+  "newest_date": "2026-10-30T19:24:00+00:00",
+  "generated_at": "2026-10-30T19:32:20.895712+00:00"
 }
