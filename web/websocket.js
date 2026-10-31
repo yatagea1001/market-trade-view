@@ -365,9 +365,15 @@ function isCryptoSymbol(sym) {
 // =========================================================
 function sendTickToWasm(symbol, price, vol, time) {
     if (!isWasmReady || !Module || !Module.ccall) return;
-    Module.ccall('wasm_push_tick', null,
-        ['string', 'number', 'number', 'number'],
-        [symbol,   price,    vol,      time]);
+    // 🔥 V30 GAP-SENSOR: tick utk CURRENT_SYMBOL DITAHAN saat gap fill jalan
+    //   (wasm_push_tick bisa bikin M1 bar live → nempel SEBELUM gap candle → array kacau)
+    //   Market Watch (registry di bawah) tetap jalan normal.
+    const holdTick = (typeof g_gapSensor !== 'undefined' && g_gapSensor.holdLive && symbol === CURRENT_SYMBOL);
+    if (!holdTick) {
+        Module.ccall('wasm_push_tick', null,
+            ['string', 'number', 'number', 'number'],
+            [symbol,   price,    vol,      time]);
+    }
 
     // 🔥 TAHAP 2: Simpan harga terbaru ke global registry untuk ticker bar
     if (!window.g_tickerPrices) window.g_tickerPrices = {};
@@ -1232,6 +1238,176 @@ async function fetchGapCandles(uiSymbol, fromTimeSec) {
     return await fetchCandlesFromHL(uiSymbol, startMs, endMs);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 🔥 V30 GAP SENSOR — sensor "chart belum lengkap sampai sekarang?"
+// (merge ke base ON-DEMAND V29: lazy load tetap engine-driven, TANPA
+//  background preload semua part — preload hanya kalau PLATFORM.BIN_PRELOAD=true)
+//
+// MASALAH (log 2026-10-31, first visit lewat picker):
+//   binary part11 render 7.250 candle (OK) → BIN-GAP-BG fire-and-forget
+//   fetch gap 850m → HL REST 504 (network) → TIDAK ADA YANG CEK ULANG
+//   → chart stale 14 jam sampai user reload. Reload "kok benar"?
+//   Karena reload me-run ulang seluruh alur load → gap fill percobaan
+//   ke-2 berhasil. Bukan karena ada sensor yang cek.
+//
+// SENSOR (blok ini):
+//   Loop 5 detik: kalau candle terakhir chart (lastWasmTime) masih
+//   > 3 menit dari now → fill gap (auto-route provider) → gagal?
+//   retry backoff 2s→5s→10s→20s→40s→60s sampai fresh.
+//   First visit jadi sama benarnya dengan reload — TANPA perlu reload.
+//
+//   + holdLive: candle/tick live DITAHAN di buffer selama gap fill jalan
+//     (cegah race KASUS 3A: gap candle push_back SETELAH candle live
+//     → array nggak urut → HTF/render kacau). Setelah gap masuk, buffer
+//     di-flush urut → array selalu sorted.
+// ═══════════════════════════════════════════════════════════════════
+const g_gapSensor = {
+    timer:        null,
+    inFlight:     false,     // shared: sensor + BIN-GAP-BG + SNAPSHOT-GAP (jangan dobel fetch)
+    holdLive:     false,     // true → tahan push candle/tick live utk CURRENT_SYMBOL
+    liveBuffer:   new Map(), // time(sec) → {time,o,h,l,c,v} (revisi terakhir per menit menang)
+    attempt:      0,
+    nextTryAt:    0,
+    staleSec:     180,       // candle terakhir harus <= 3 menit dari now (crypto/gold 24/7)
+    pollMs:       5000,
+    maxBackoffMs: 60000
+};
+
+function gapSensorShouldSkip() {
+    // Forex/ECB poll: tidak ada candle history — stale itu normal, JANGAN fill
+    try {
+        if (typeof getProvider === 'function' && getProvider(CURRENT_SYMBOL) === 'forex-poll') return true;
+    } catch (_) {}
+    // Replay aktif: live feed memang diputus (gate) — jangan buang fetch
+    try {
+        if (typeof Module !== 'undefined' && Module && Module._wasm_get_replay_gate
+            && Module._wasm_get_replay_gate() === 1) return true;
+    } catch (_) {}
+    return false;
+}
+
+function gapSensorBackoffMs() {
+    // 2s → 5s → 10s → 20s → 40s → 60s (max)
+    const ladder = [2000, 5000, 10000, 20000, 40000, 60000];
+    return ladder[Math.min(Math.max(g_gapSensor.attempt - 1, 0), ladder.length - 1)];
+}
+
+function gapSensorFlushLive() {
+    if (g_gapSensor.liveBuffer.size === 0) return;
+    const arr = [...g_gapSensor.liveBuffer.values()].sort((a, b) => a.time - b.time);
+    g_gapSensor.liveBuffer.clear();
+    for (const c of arr) {
+        notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v || 1);
+        if (c.time > lastWasmTime) lastWasmTime = c.time;
+    }
+    logInfo(`[GAP-SENSOR] ⏩ +${arr.length} live candle (yang tertahan) di-flush urut`);
+}
+
+function gapSensorCheck() {
+    if (!g_initialLoadDone || isDownloading || isRendering) return;
+    if (g_gapSensor.inFlight) return;
+    if (Date.now() < g_gapSensor.nextTryAt) return;
+    if (gapSensorShouldSkip()) return;
+
+    const lastT = lastWasmTime;
+    if (lastT <= 0) return; // belum ada data sama sekali
+    const nowT = Math.floor(Date.now() / 1000);
+    if (nowT - lastT <= g_gapSensor.staleSec) { // fresh ✅
+        if (g_gapSensor.attempt > 0)
+            logGood(`[GAP-SENSOR] ✅ ${CURRENT_SYMBOL} fresh lagi (lag ${nowT - lastT}s) — reset backoff`);
+        g_gapSensor.attempt = 0;
+        return;
+    }
+
+    const lagMin = Math.floor((nowT - lastT) / 60);
+    logInfo(`[GAP-SENSOR] 👁️ ${CURRENT_SYMBOL}: candle terakhir ${lagMin}m lalu → belum lengkap → fill (attempt ${g_gapSensor.attempt + 1})`);
+    gapFillUnified(lastT, `SENSOR#${g_gapSensor.attempt + 1}`);
+}
+
+async function gapFillUnified(fromTimeSec, tag) {
+    if (g_gapSensor.inFlight) return;
+    const sym = CURRENT_SYMBOL; // 🔥 capture — kalau user ganti symbol mid-fetch, jangan push candle simbol lama ke chart baru
+    g_gapSensor.inFlight = true;
+    g_gapSensor.holdLive  = true;
+    try {
+        const gapMin = Math.max(1, Math.floor((Date.now() / 1000 - fromTimeSec) / 60));
+        let candles;
+        if (gapMin > 4500) {
+            // Gap gede (>3 hari) → pagination (alur lama BIN-GAP-BG)
+            candles = await fetchHistoryPaginated(sym, gapMin);
+        } else if (typeof fetchCandles === 'function') {
+            // 🔥 Auto-route provider: Gold→Binance | Crypto→Hyperliquid | Forex→[] (skip)
+            candles = await fetchCandles(sym, (fromTimeSec + 60) * 1000, Date.now());
+        } else {
+            candles = await fetchGapCandles(sym, fromTimeSec);
+        }
+
+        // Symbol berubah saat fetch jalan → hasil tidak valid lagi → drop
+        if (sym !== CURRENT_SYMBOL) {
+            g_gapSensor.liveBuffer.clear();
+            logWarn(`[GAP-SENSOR] ⏭️ ${tag}: symbol ganti mid-fill (${sym}→${CURRENT_SYMBOL}) → buang hasil`);
+            return;
+        }
+
+        if (candles && candles.length > 0) {
+            if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
+            isRendering = true;
+
+            // Sort oldest→newest (supaya KASUS 1 jalan di wasm_push_candle)
+            candles.sort((a, b) => a.time - b.time);
+
+            for (const c of candles) {
+                notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v || 1);
+                if (c.time > lastWasmTime) lastWasmTime = c.time;
+            }
+
+            // 🔥 Live candle yang tertahan masuk SETELAH gap (urut waktu — race KASUS 3A aman)
+            gapSensorFlushLive();
+
+            if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
+            if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+            if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+            isRendering = false;
+            if (Module._wasm_trigger_goto_live) Module._wasm_trigger_goto_live();
+
+            // Simpan ke IDB background
+            addToBuffer(sym, candles);
+            flushBuffer();
+
+            g_gapSensor.attempt = 0;
+            logGood(`[GAP-SENSOR] ✅ ${tag}: +${candles.length.toLocaleString()} candle — chart fresh sampai sekarang!`);
+        } else {
+            // Response kosong (provider gak punya data / pasar sepi) → backoff ringan, jangan spam
+            g_gapSensor.attempt++;
+            const backoff = gapSensorBackoffMs();
+            g_gapSensor.nextTryAt = Date.now() + backoff;
+            logWarn(`[GAP-SENSOR] ${tag}: response kosong → cek lagi ${Math.round(backoff / 1000)}s`);
+            if (sym === CURRENT_SYMBOL) gapSensorFlushLive();
+        }
+    } catch (e) {
+        g_gapSensor.attempt++;
+        const backoff = gapSensorBackoffMs();
+        g_gapSensor.nextTryAt = Date.now() + backoff;
+        logWarn(`[GAP-SENSOR] ❌ ${tag}: ${e.message} → retry ${Math.round(backoff / 1000)}s (attempt ${g_gapSensor.attempt})`);
+        // Jangan tahan live terlalu lama — flush dulu (symbol masih sama = aman)
+        if (sym === CURRENT_SYMBOL) gapSensorFlushLive();
+        if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
+        isRendering = false;
+    } finally {
+        g_gapSensor.holdLive = false;
+        g_gapSensor.inFlight = false;
+    }
+}
+
+function startGapSensor() {
+    if (g_gapSensor.timer) clearInterval(g_gapSensor.timer);
+    g_gapSensor.attempt = 0;
+    g_gapSensor.nextTryAt = 0;
+    g_gapSensor.liveBuffer.clear();
+    g_gapSensor.timer = setInterval(gapSensorCheck, g_gapSensor.pollMs);
+    logInfo(`[GAP-SENSOR] 👁️ aktif utk ${CURRENT_SYMBOL} — pantau right-edge tiap ${g_gapSensor.pollMs / 1000}s`);
+}
+
 /**
  * Lazy load: fetch candle lebih lama dari beforeTime
  */
@@ -1562,15 +1738,47 @@ async function preloadBinaryChunks(uiSymbol, totalParts) {
 }
 
 /**
- * 🔥 PUSH VIA PREPEND: Sisipkan 50k+ candle lebih lama ke WASM tanpa clear chart!
+ * 🔥 PUSH VIA PREPEND (V30.1 CHUNKED): Sisipkan 50k+ candle lebih lama ke WASM
+ *    tanpa clear chart — sekarang per-CHUNK dengan yield ke render loop!
  *
  * Pakai 3 WASM function:
- *   1. wasm_begin_prepend()       → mulai sesi, clear buffer internal
- *   2. wasm_prepend_candle(o,h,l,c,t,v) → push 1 candle ke buffer (loop dari JS)
+ *   1. wasm_begin_prepend()       → mulai sesi, clear buffer internal (SEKALI)
+ *   2. wasm_prepend_candle(o,h,l,c,t,v) → push 1 candle ke buffer (loop dari JS,
+ *      dipecah chunk PREPEND_CHUNK_SIZE candle → yield rAF antar chunk)
  *   3. wasm_end_prepend()         → sort + merge ke depan M1 + auto-skip overlap
  *                                   + offset viewCenterIndex +N (view gak loncat)
  *
  * Setelah itu panggil wasm_rebuild_all_htfs() supaya indikator HTF update.
+ *
+ * 🔥 V30.1 SMOOTH PREPEND (Opsi C — pure JS, tanpa rebuild WASM):
+ *   Dulu: 20k candle = 20.000× ccall TANPA yield = 45-50ms border-crossing
+ *         + sort/merge + HTF rebuild → TOTAL ~76ms BLOCKING = 4-5 frame drop.
+ *   Sekarang: pecah jadi chunk 5.000 candle (~12.5ms per chunk), antar chunk
+ *         di-yield via rAF → browser tetap PAINT frame selama prepend jalan.
+ *         Wall-clock total mirip (~90-100ms), tapi frame drop ≈ 0 — chart
+ *         terasa responsif (scroll/crosshair tetap hidup saat lazy load).
+ *
+ *   Kenapa aman yield di tengah sesi prepend (buffer TERPISAH dari M1):
+ *   - g_prependBuffer di engine = vector sendiri; M1 utama tidak tersentuh
+ *     sampai end_prepend → render loop tetap konsisten tiap frame.
+ *   - Candle LIVE yang masuk mid-session (KASUS 1: t > lastTime) append di
+ *     BELAKANG M1; filter overlap end_prepend pakai m1.front() (paling tua)
+ *     → tidak berubah → merge tetap menghasilkan array sorted. (Anti-KASUS 3A
+ *     tetap dijaga holdLive utk gap fill; jalur ini aman by-construction.)
+ *   - lazyPending masih true sampai caller me-release SETELAH promise ini
+ *     selesai → engine tidak akan fire onNearLeftEdge dobel mid-session.
+ *
+ *   Guard yang WAJIB (dua race yang dibuka oleh yield window):
+ *   - SERIALISASI: sesi prepend tidak boleh tumpang tindih (begin_prepend
+ *     session#2 akan CLEAR buffer session#1 mid-flight → data hilang).
+ *     → _prependChain: setiap call di-chain setelah sesi sebelumnya.
+ *   - SYMBOL ABORT: kalau user ganti symbol mid-session (clear_chart jalan
+ *     di yield window), buffer masih berisi candle symbol LAMA → merge ke
+ *     M1 symbol BARU = korupsi. → cek sym !== CURRENT_SYMBOL sebelum TIAP
+ *     chunk; kalau berubah: abort bersih (begin_prepend = clear buffer,
+ *     end_prepend = no-op karena buffer kosong) + return true (supaya
+ *     caller SKIP fallback rebuildFullFromDB yang justru bahaya saat load
+ *     symbol baru sedang berjalan).
  *
  * Keuntungan vs rebuildFullFromDB (untuk 250k candle chart + 50k baru):
  *   - Skip IDB read 250k          (hemat ~500ms)
@@ -1578,11 +1786,36 @@ async function preloadBinaryChunks(uiSymbol, totalParts) {
  *   - Skip CLEAR chart + push 250k ulang (hemat ~2000ms blocking!)
  *   - Auto offset viewCenterIndex  (view gak loncat ke candle lama)
  *   - Auto skip overlap dengan data existing
+ *   - V30.1: zero frame drop (chunked + yield)
  *
  * @param {Array} candles - array of {time, o, h, l, c, v} (urutan bebas, akan di-sort internal)
- * @returns {boolean} true kalau berhasil di-prepend, false kalau WASM belum support
+ * @param {string} [sym]  - symbol pemilik data (default CURRENT_SYMBOL, di-capture
+ *                          saat call). Dipakai abort-guard ganti symbol mid-session.
+ * @returns {Promise<boolean>} true kalau berhasil di-prepend (atau abort bersih
+ *                          karena ganti symbol), false kalau WASM belum support.
+ *                          ⚠️ Sekarang ASYNC — caller WAJIB await.
  */
-function pushCandlesViaPrepend(candles) {
+const PREPEND_CHUNK_SIZE = (typeof PLATFORM !== 'undefined' && PLATFORM && PLATFORM.PREPEND_CHUNK)
+    ? PLATFORM.PREPEND_CHUNK : 5000;   // ~12.5ms ccall per chunk (border-crossing)
+
+let _prependChain = Promise.resolve();   // serialisasi sesi prepend (anti tumpang tindih)
+
+function _yieldToRender() {
+    // Yield ke render loop: rAF (frame ke-paint) + setTimeout(0) (resume pasca-paint).
+    // Guard 250ms: kalau tab di-background (rAF paused/throttled), JANGAN hang —
+    // setTimeout tetap jalan → sesi prepend selesai juga (lambat tapi pasti).
+    return new Promise(resolve => {
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        try {
+            if (typeof requestAnimationFrame === 'function')
+                requestAnimationFrame(() => setTimeout(finish, 0));
+        } catch (_) { /* rAF unavailable → fallback setTimeout */ }
+        setTimeout(finish, 250);
+    });
+}
+
+async function _prependCandlesChunked(candles, sym) {
     if (!isWasmReady || !Module || !Module.ccall) return false;
     if (!candles || candles.length === 0) return false;
 
@@ -1593,27 +1826,62 @@ function pushCandlesViaPrepend(candles) {
     }
 
     const t0 = performance.now();
+    const nChunks = Math.ceil(candles.length / PREPEND_CHUNK_SIZE);
 
-    // 1. Begin prepend session
+    // 1. Begin prepend session (SEKALI untuk seluruh batch)
     Module._wasm_begin_prepend();
 
-    // 2. Push semua candles ke buffer internal WASM (single-threaded, no mutex, fast)
-    for (let i = 0; i < candles.length; i++) {
-        const c = candles[i];
-        Module.ccall('wasm_prepend_candle', null,
-            ['number', 'number', 'number', 'number', 'number', 'number'],
-            [c.o, c.h, c.l, c.c, c.time, c.v || 1]);
+    // 2. Push candle per-CHUNK ke buffer internal WASM, yield antar chunk
+    for (let ch = 0; ch < nChunks; ch++) {
+        // 🔥 ABORT GUARD: symbol berubah di yield window (user switch mid-session)?
+        //    begin_prepend() = clear buffer (buang candle symbol lama),
+        //    end_prepend()   = no-op (buffer kosong → early return di engine).
+        if (sym !== undefined && sym !== CURRENT_SYMBOL) {
+            Module._wasm_begin_prepend();
+            Module._wasm_end_prepend();
+            logWarn(`[PREPEND] ⏭️ symbol ganti mid-session (${sym}→${CURRENT_SYMBOL}) → abort prepend (buffer dibersihkan)`);
+            return true;   // true = caller SKIP fallback rebuild (lebih aman)
+        }
+
+        const start = ch * PREPEND_CHUNK_SIZE;
+        const end   = Math.min(start + PREPEND_CHUNK_SIZE, candles.length);
+        for (let i = start; i < end; i++) {
+            const c = candles[i];
+            Module.ccall('wasm_prepend_candle', null,
+                ['number', 'number', 'number', 'number', 'number', 'number'],
+                [c.o, c.h, c.l, c.c, c.time, c.v || 1]);
+        }
+
+        // Yield antar chunk → render loop paint frame (anti freeze 76ms)
+        if (ch < nChunks - 1) await _yieldToRender();
     }
 
     // 3. End prepend → sort + merge + offset viewCenterIndex + auto-skip overlap
+    //    (dipanggil TEPAT setelah chunk terakhir — TANPA yield di antaranya,
+    //     jadi tidak ada window bagi clear_chart masuk di sini)
     Module._wasm_end_prepend();
 
     // 4. Rebuild HTF (M5, M15, H1, H4) supaya indikator HTF update
     if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
 
     const elapsed = (performance.now() - t0).toFixed(0);
-    logGood(`[PREPEND] ✅ +${candles.length.toLocaleString()} candles prepended (${elapsed}ms, no rebuild!)`);
+    if (nChunks > 1) {
+        logGood(`[PREPEND] ✅ +${candles.length.toLocaleString()} candles prepended (${elapsed}ms, ${nChunks}×${PREPEND_CHUNK_SIZE.toLocaleString()} chunk smooth, no rebuild!)`);
+    } else {
+        logGood(`[PREPEND] ✅ +${candles.length.toLocaleString()} candles prepended (${elapsed}ms, no rebuild!)`);
+    }
     return true;
+}
+
+function pushCandlesViaPrepend(candles, sym) {
+    // 🔥 SERIALISASI: sesi prepend TIDAK BOLEH tumpang tindih — kalau session#2
+    //    begin_prepend() saat session#1 masih jalan, buffer#1 di-CLEAR → data hilang.
+    //    Semua call di-chain; caller menerima Promise<boolean> (WAJIB await).
+    const owner = (sym !== undefined) ? sym : CURRENT_SYMBOL;   // capture SAAT call
+    const run = () => _prependCandlesChunked(candles, owner);
+    const p = _prependChain.then(run, run);
+    _prependChain = p.then(() => {}, () => {});
+    return p;
 }
 
 /**
@@ -2464,9 +2732,14 @@ function handleBinanceCandle(data) {
 
     // Push ke chart utama (WASM) — candle forming tick-by-tick + bar close
     // Binance @kline_1m update ~100ms → candle XAUUSD bergerak real-time!
+    // 🔥 V30 GAP-SENSOR: saat gap fill jalan → tahan di buffer (race KASUS 3A)
     if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
-        notifyWASM_candle(o, h, l, c, openTime, v);
-        if (openTime > lastWasmTime) lastWasmTime = openTime;
+        if (typeof g_gapSensor !== 'undefined' && g_gapSensor.holdLive) {
+            g_gapSensor.liveBuffer.set(openTime, { time: openTime, o, h, l, c, v });
+        } else {
+            notifyWASM_candle(o, h, l, c, openTime, v);
+            if (openTime > lastWasmTime) lastWasmTime = openTime;
+        }
     }
 }
 
@@ -2511,9 +2784,14 @@ function handleHLCandle(data) {
     }
 
     // Push candle ke chart (hanya CURRENT_SYMBOL)
+    // 🔥 V30 GAP-SENSOR: saat gap fill jalan → tahan di buffer (race KASUS 3A)
     if (uiSymbol === CURRENT_SYMBOL && !isDownloading) {
-        notifyWASM_candle(o, h, l, c, openTime, v);
-        if (openTime > lastWasmTime) lastWasmTime = openTime;
+        if (typeof g_gapSensor !== 'undefined' && g_gapSensor.holdLive) {
+            g_gapSensor.liveBuffer.set(openTime, { time: openTime, o, h, l, c, v });
+        } else {
+            notifyWASM_candle(o, h, l, c, openTime, v);
+            if (openTime > lastWasmTime) lastWasmTime = openTime;
+        }
     } else if (downloadedSymbols.has(uiSymbol) && !isDownloading) {
         // Non-primary tab
         if (Module._wasm_push_candle_for_symbol) {
@@ -2668,7 +2946,10 @@ window.SetActiveSymbol = async function(newSym) {
                 hideLoadingOverlay();
                 logGood(`[SNAPSHOT] ✅ ${CURRENT_SYMBOL}: ${snapshotCount} bars loaded INSTANT!`);
 
-                // Gap fill di background
+                // 🔥 V30: sensor aktif — kalau gap fill di bawah mati, sensor yang retry
+                startGapSensor();
+
+                // Gap fill di background (V30: lewat gapFillUnified → auto-route + retry + holdLive)
                 (async () => {
                     try {
                         const existing = await getAllCandlesFromDB(CURRENT_SYMBOL);
@@ -2680,29 +2961,14 @@ window.SetActiveSymbol = async function(newSym) {
 
                             if (gapSeconds > 30) {
                                 logWarn(`[SNAPSHOT-GAP] ${Math.floor(gapSeconds/60)}m gap → background fill`);
-                                const gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestTime);
-                                if (gapCandles.length > 0) {
-                                    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
-                                    gapCandles.sort((a, b) => a.time - b.time);
-                                    for (const c of gapCandles) {
-                                        notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v || 1);
-                                        if (c.time > lastWasmTime) lastWasmTime = c.time;
-                                    }
-                                    if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
-                                    if (Module._wasm_trigger_goto_live) Module._wasm_trigger_goto_live();
-                                    if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
-                                    addToBuffer(CURRENT_SYMBOL, gapCandles);
-                                    await flushBuffer();
-                                    setTimeout(() => {
-                                        saveSnapshotWithSync(CURRENT_SYMBOL, 'after gap fill');
-                                    }, 1000);
-                                    logGood(`[SNAPSHOT-GAP] ✅ +${gapCandles.length} gap candles`);
-                                }
+                                await gapFillUnified(latestTime, 'SNAPSHOT-GAP');
+                                setTimeout(() => {
+                                    saveSnapshotWithSync(CURRENT_SYMBOL, 'after gap fill');
+                                }, 1000);
                             }
                         }
                     } catch(e) {
                         logWarn(`[SNAPSHOT-GAP] Error: ${e.message}`);
-                        if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
                     }
                 })();
 
@@ -2925,7 +3191,7 @@ window.SetActiveSymbol = async function(newSym) {
                                 //   2. loop wasm_prepend_candle (only ~197k, not 200k!)
                                 //   3. wasm_end_prepend() → sort + merge + offset viewCenterIndex
                                 //   4. wasm_rebuild_all_htfs()
-                                const prepended = pushCandlesViaPrepend(olderCandles);
+                                const prepended = await pushCandlesViaPrepend(olderCandles);
 
                                 if (prepended) {
                                     // ✅ Prepend berhasil — NO CLEAR, NO FULL REBUILD!
@@ -2982,52 +3248,14 @@ window.SetActiveSymbol = async function(newSym) {
             const gapMin = Math.floor(gapSec / 60);
 
             if (gapSec > 60) {
-                logInfo(`[BIN-GAP-BG] ${gapMin}m gap → background fill dari HL REST`);
-                (async () => {
-                    try {
-                        let gapCandles;
-                        if (gapMin > 4500) {
-                            gapCandles = await fetchHistoryPaginated(CURRENT_SYMBOL, gapMin);
-                        } else {
-                            gapCandles = await fetchGapCandles(CURRENT_SYMBOL, latestBinTime);
-                        }
-                        if (gapCandles && gapCandles.length > 0) {
-                            // 🔥 FIX: Set g_primaryBulkLoading=true supaya gap candle di-push dengan benar
-                            if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(1);
-                            isRendering = true;
-
-                            // Sort gap candles oldest→newest (penting supaya KASUS 1 jalan)
-                            gapCandles.sort((a, b) => a.time - b.time);
-
-                            // Push gap candles ke WASM langsung (live-like)
-                            for (const c of gapCandles) {
-                                notifyWASM_candle(c.o, c.h, c.l, c.c, c.time, c.v || 1);
-                                if (c.time > lastWasmTime) lastWasmTime = c.time;
-                            }
-                            if (Module._wasm_rebuild_all_htfs) Module._wasm_rebuild_all_htfs();
-
-                            // 🔥 FIX: Force re-upload VBO supaya candle baru langsung render
-                            if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
-
-                            // 🔥 FIX: Trigger GoToLive supaya chart auto-scroll ke candle terbaru
-                            if (Module._wasm_trigger_goto_live) Module._wasm_trigger_goto_live();
-
-                            // Clear primary loading flag
-                            if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
-                            isRendering = false;
-
-                            // Save to IDB background
-                            addToBuffer(CURRENT_SYMBOL, gapCandles);
-                            await flushBuffer();
-                            logGood(`[BIN-GAP-BG] ✅ +${gapCandles.length.toLocaleString()} gap candles pushed + saved`);
-                        }
-                    } catch(e) {
-                        logWarn(`[BIN-GAP-BG] Gap fill error: ${e.message}`);
-                        // 🔥 FIX: Clear flag kalau error (jangan biarkan stuck)
-                        if (Module._wasm_set_primary_loading) Module._wasm_set_primary_loading(0);
-                        isRendering = false;
-                    }
-                })();
+                // 🔥 V30: gap fill sekarang lewat gapFillUnified (GAP-SENSOR engine)
+                //   - auto-route provider (Gold→Binance | Crypto→Hyperliquid)
+                //   - retry + backoff kalau fetch mati (504/cors/network)
+                //     ← dulu: fire-and-forget, gagal 1x = chart stale selamanya (musti reload)
+                //   - holdLive buffer (race KASUS 3A aman)
+                //   - sensor 5s tetap pantau setelah ini — kalau masih gagal, sensor retry
+                logInfo(`[BIN-GAP-BG] ${gapMin}m gap → background fill via GAP-SENSOR engine`);
+                gapFillUnified(latestBinTime, 'BIN-GAP-BG');
             }
 
         } else {
@@ -3060,8 +3288,12 @@ window.SetActiveSymbol = async function(newSym) {
         isDownloading = false;
         g_initialLoadDone = true;
 
-        const source = usedBinary ? 'TURBO binary + BG gap' : 'HL REST + BG save';
-        logGood(`✅ ${CURRENT_SYMBOL} fully loaded! (source: ${source})`);
+        // 🔥 V30: sensor "chart lengkap sampai sekarang?" aktif.
+        //   Kalau BIN-GAP-BG di atas mati (504/cors/network), sensor ambil alih + retry backoff.
+        startGapSensor();
+
+        const source = usedBinary ? 'TURBO binary (gap dipantau sensor)' : 'HL REST + BG save';
+        logGood(`✅ ${CURRENT_SYMBOL} loaded! (source: ${source})`);
 
         if (pendingSymbolSwitch) {
             const next = pendingSymbolSwitch;
@@ -3174,7 +3406,7 @@ window.onNearLeftEdge = async function(oldestTime) {
     const older = await getOlderCandlesFromDB(CURRENT_SYMBOL, oldestTime, LAZY_CHUNK);
     if (older.length > 0) {
         logInfo(`[LAZY] IDB +${older.length} → prepend (no clear)`);
-        const prepended = pushCandlesViaPrepend(older);
+        const prepended = await pushCandlesViaPrepend(older);
         if (prepended) {
             // ✅ Prepend berhasil — NO CLEAR, NO FULL REBUILD!
             if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
@@ -3209,7 +3441,7 @@ window.onNearLeftEdge = async function(oldestTime) {
 
         if (chunkCandles.length > 0) {
             // 🔥 PREPEND: push langsung ke WASM tanpa clear chart
-            const prepended = pushCandlesViaPrepend(chunkCandles);
+            const prepended = await pushCandlesViaPrepend(chunkCandles);
 
             if (prepended) {
                 // ✅ Prepend berhasil — save ke IDB di BACKGROUND (non-blocking)
@@ -3330,7 +3562,7 @@ window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
     if (older.length > 0) {
         if (isPrimary) {
             logInfo(`${tag} IDB +${older.length} → prepend (no clear)`);
-            const prepended = pushCandlesViaPrepend(older);
+            const prepended = await pushCandlesViaPrepend(older);
             if (prepended) {
                 // ✅ Prepend berhasil — NO CLEAR, NO FULL REBUILD!
                 if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
@@ -3377,14 +3609,34 @@ window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
             addToBuffer(symbol, chunkCandles);
             await flushBuffer();
 
-            // Rebuild chart tab dengan data baru
+            // Sisipkan data baru ke chart tab
             if (isPrimary) {
-                if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
-                if (Module._wasm_clear_chart) Module._wasm_clear_chart();
-                await rebuildFullFromDB(symbol);
-                if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
-                if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
-                if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+                // 🔥 V28.2 NO-CLEAR: PREPEND murni (tanpa clear_chart + rebuild).
+                //   Path lama (clear+rebuildFullFromDB) bermasalah:
+                //   1. Chart blank sejenak (isLoading) + push SEMUA candle ulang
+                //   2. Baca-balik dari IDB bisa INKONSISTEN → data hilang diam-diam
+                //      (bukti console: rebuild 20.134 padahal 7.382+20.000=27.382 —
+                //       7.250 candle part terbaru hilang = gap 18 hari di chart!)
+                //   Prepend: engine KEEP data RAM-nya, cukup sisipkan candle lama
+                //   di depan → view di-anchor by TIME di wasm_end_prepend (TF-aware)
+                //   → chart tetap kelihatan, view tetap diam, data LENGKAP.
+                const prepended = await pushCandlesViaPrepend(chunkCandles);
+                if (prepended) {
+                    // ✅ VBO refresh wajib: prepend gak lewat clear_chart, jadi GPU
+                    //    instances harus di-rebuild dari window 10K yang baru
+                    if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+                    if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+                    logGood(`${tag} ✅ +${chunkCandles.length.toLocaleString()} candles prepended (no clear, no rebuild)`);
+                } else {
+                    // ⚠️ Fallback: WASM lama belum expose prepend API → clear+rebuild
+                    logWarn(`${tag} Prepend gagal → fallback rebuildFullFromDB`);
+                    if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
+                    if (Module._wasm_clear_chart) Module._wasm_clear_chart();
+                    await rebuildFullFromDB(symbol);
+                    if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
+                    if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+                    if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+                }
             } else {
                 if (Module._wasm_save_view_anchor_tab)
                     Module.ccall('wasm_save_view_anchor_tab', null, ['number'], [tabId]);
@@ -3420,13 +3672,24 @@ window.onNearLeftEdgeTab = async function(tabId, oldestTime) {
     await flushBuffer();
 
     if (isPrimary) {
-        if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
-        if (Module._wasm_clear_chart) Module._wasm_clear_chart();
-        await rebuildFullFromDB(symbol);
-        if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
-        // 🔥 FIX v6: Force VBO refresh (lazy load tab primary, dari HL REST)
-        if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
-        if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+        // 🔥 V28.2 NO-CLEAR: HL REST juga pakai prepend — konsisten dengan binary chunk.
+        //   Tanpa clear chart: view anchored by time, chart tetap kelihatan.
+        const prepended = await pushCandlesViaPrepend(olderCandles);
+        if (prepended) {
+            if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+            if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+            logGood(`${tag} ✅ +${olderCandles.length.toLocaleString()} candles prepended from HL REST (no clear)`);
+        } else {
+            // ⚠️ Fallback: clear+rebuild + anchor (path lama)
+            logWarn(`${tag} Prepend gagal → fallback rebuildFullFromDB`);
+            if (Module._wasm_save_view_anchor) Module._wasm_save_view_anchor();
+            if (Module._wasm_clear_chart) Module._wasm_clear_chart();
+            await rebuildFullFromDB(symbol);
+            if (Module._wasm_restore_view_anchor) Module._wasm_restore_view_anchor();
+            // 🔥 FIX v6: Force VBO refresh (lazy load tab primary, dari HL REST)
+            if (Module._wasm_force_vbo_refresh) Module._wasm_force_vbo_refresh();
+            if (Module._wasm_set_lazy_load_done) Module._wasm_set_lazy_load_done();
+        }
     } else {
         if (Module._wasm_save_view_anchor_tab)
             Module.ccall('wasm_save_view_anchor_tab', null, ['number'], [tabId]);

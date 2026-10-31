@@ -21,13 +21,16 @@
 // =============================================================
 
 const CACHE_VERSION   = 'mtv-cache-v1';
-// 🔥 STATIC bump v2 → v3 (V28 LAZY VIEW ANCHOR update):
-//    - dist/index.js + index.wasm: rebuild C++ (TF-aware time anchor saat
-//      prepend lazy load + g_forceXAxisUpdate paksa ImPlot re-apply X limits
-//      → view TIDAK loncat/mengikuti candle tua saat lazy load).
-//    Bump HANYA static — binary/index/nav tetap v1 (file .bin tidak berubah,
-//    tidak perlu re-download). Activate akan purge 'mtv-cache-v2-static' otomatis.
-const STATIC_CACHE    = `mtv-cache-v3-static`;
+// 🔥 STATIC bump v4 → v5 (V30 SENSORLAZY update):
+//    - web/websocket.js: PORT GAP-SENSOR ke base ON-DEMAND V29:
+//      sensor 5s pantau right-edge + gapFillUnified (auto-route + retry
+//      backoff + holdLive anti race KASUS 3A). BIN-GAP-BG & SNAPSHOT-GAP
+//      sekarang lewat jalur unified.
+//      ⚠️ preload semua part TETAP OFF (PLATFORM.BIN_PRELOAD=false) —
+//      data lama hanya diambil saat mesin minta (scroll kiri).
+//    - web/config.js: flag eksplisit BIN_PRELOAD / IDB_UPGRADE (default false).
+//    Bump HANYA static — binary/index/nav tetap v1 (file .bin tidak berubah).
+const STATIC_CACHE    = `mtv-cache-v6-static`;
 const BINARY_CACHE    = `${CACHE_VERSION}-binary`;
 const INDEX_CACHE     = `${CACHE_VERSION}-index`;
 const NAV_CACHE       = `${CACHE_VERSION}-nav`;

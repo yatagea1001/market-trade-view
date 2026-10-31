@@ -7,7 +7,11 @@
 
 const PLATFORM = {
     VERSION: "25.3.1",
-    MODE: "serverless",              // "serverless" = GitHub Pages, "server" = dengan backend
+    MODE: "auto",                    // "auto" = detect otomatis, "serverless" = paksa online, "server" = paksa localhost
+
+    // ── Server VPS Python (localhost) ─────────────────────────
+    WS_SERVER_URL: "ws://localhost:8765",      // WebSocket server candle_server_v18max6.py
+    WS_DETECT_TIMEOUT_MS: 1500,                // Timeout cek koneksi server (ms)
 
     // ── Data Provider ─────────────────────────────────────────
     DATA_PROVIDER: "multi",          // "multi" = routing per-symbol (HL + Binance)
@@ -30,6 +34,18 @@ const PLATFORM = {
     HISTORY_BARS:   5000,            // Bar history per request (max HL ~5000)
     LAZY_CHUNK:     5000,            // Bar per lazy load (scroll kiri)
     GAP_TIMEOUT_MS: 15000,           // Timeout untuk gap fill (ms)
+
+    // ── Load Strategy (V30 ON-DEMAND) ─────────────────────────
+    // false = data lama (bin part 1..N-1 / IDB 200k) HANYA diambil saat
+    //        MESIN minta: user scroll kiri → C++ fire onNearLeftEdge →
+    //        lazy load (IDB → bin part sebelumnya → REST).
+    //        Ini default V29/V30: reload instant, gak ada background
+    //        download 200k candle, gak ada freeze.
+    // true  = (mode lama) setelah render, background preload SEMUA part
+    //        .bin ke cache + auto-prepend seluruh IDB pasca-reload.
+    //        Besar bandwidth + CPU — hanya utk warm-cache mode.
+    BIN_PRELOAD: false,              // true → fetch semua part .bin di background setelah render
+    IDB_UPGRADE: false,              // true → auto-prepend seluruh isi IDB ke chart pasca-reload
 
     // ── Symbol Dictionary ─────────────────────────────────────
     // UI Name → Provider coin name
