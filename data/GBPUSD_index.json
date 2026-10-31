@@ -1,12 +1,12 @@
 {
   "symbol": "GBPUSD",
   "timeframe": "M1",
-  "parts": 6,
-  "total_candles": 250177,
-  "chunk_size": 50000,
+  "parts": 13,
+  "total_candles": 257265,
+  "chunk_size": 20000,
   "oldest_epoch": 1770413880,
-  "newest_epoch": 1792789080,
+  "newest_epoch": 1793388240,
   "oldest_date": "2026-02-06T21:38:00+00:00",
-  "newest_date": "2026-10-23T20:58:00+00:00",
-  "generated_at": "2026-10-24T19:41:20.953261+00:00"
+  "newest_date": "2026-10-30T19:24:00+00:00",
+  "generated_at": "2026-10-30T19:32:29.519948+00:00"
 }
