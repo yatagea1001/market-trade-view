@@ -1,0 +1,11 @@
+{
+  "engine_required": "V6.4",
+  "indicators": [
+    {
+      "file": "Opening_Range_Breakout.json"
+    },
+    {
+      "file": "RSI_Divergence.json"
+    }
+  ]
+}

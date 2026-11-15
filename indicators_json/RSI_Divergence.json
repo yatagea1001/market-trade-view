@@ -1,0 +1,8 @@
+{
+  "name": "RSI Divergence Detector",
+  "formula": "// RSI Divergence — sample bundled indicator\noverlay()\nlen = 14\nr = rsi(close, len)\nplot(r, color=blue, style=line)\n// note: full divergence logic needs at()/islast — see ORB for V6.4 pattern\n",
+  "engine_required": "V6.4",
+  "published_by": "creator",
+  "version": 1,
+  "description": "RSI line with divergence detection (placeholder)"
+}

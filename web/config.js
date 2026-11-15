@@ -29,6 +29,13 @@ const PLATFORM = {
     // ── Kunci API Pihak Ketiga ────────────────────────────────
     FINNHUB_API_KEY: "",             // (Dikosongkan, kita kembali 100% ke Hyperliquid)
 
+    // ── Bundled Indicators (V29.2) ────────────────────────────
+    // URL manifest indikator creator (repo GitHub kamu).
+    // Publish indikator: tombol 📦 Publish di Script Builder → upload JSON ke
+    // https://github.com/yatagea1001/market-trade-view → folder indicators_json/
+    // → update index.json → semua user lihat setelah refresh app.
+    INDICATORS_JSON_URL: "https://raw.githubusercontent.com/yatagea1001/market-trade-view/main/indicators_json/index.json",
+
     // ── Data Settings ─────────────────────────────────────────
     DEFAULT_SYMBOL: "BTCUSDT",       // Symbol default saat pertama buka
     HISTORY_BARS:   5000,            // Bar history per request (max HL ~5000)
