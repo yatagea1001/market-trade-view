@@ -30,11 +30,12 @@ const PLATFORM = {
     FINNHUB_API_KEY: "",             // (Dikosongkan, kita kembali 100% ke Hyperliquid)
 
     // ── Bundled Indicators (V29.2) ────────────────────────────
-    // URL manifest indikator creator (repo GitHub kamu).
-    // Publish indikator: tombol 📦 Publish di Script Builder → upload JSON ke
-    // https://github.com/yatagea1001/market-trade-view → folder indicators_json/
-    // → update index.json → semua user lihat setelah refresh app.
-    INDICATORS_JSON_URL: "https://raw.githubusercontent.com/yatagea1001/market-trade-view/main/indicators_json/index.json",
+    // LOCAL-FIRST: fetch dari folder indicators_json/ di web server
+    // (sejajar app.html — sama kayak data/BTCUSDT_index.json di-fetch lokal).
+    // Kalau lokal 404 (folder belum ada), bundled_indicators.js auto-fallback
+    // ke GitHub raw URL. Publish indikator: tombol 📦 Publish → upload JSON
+    // ke folder indicators_json/ (lokal + repo GitHub) → update index.json.
+    INDICATORS_JSON_URL: "indicators_json/index.json",
 
     // ── Data Settings ─────────────────────────────────────────
     DEFAULT_SYMBOL: "BTCUSDT",       // Symbol default saat pertama buka
