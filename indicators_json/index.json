@@ -6,6 +6,9 @@
     },
     {
       "file": "RSI_Divergence.json"
+    },
+    {
+      "file": "RSI_Divergence_Panel.json"
     }
   ]
 }

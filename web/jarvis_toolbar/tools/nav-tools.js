@@ -128,13 +128,18 @@ JT.NavTools = {
         return [...this.SCROLLABLE_TOOLS, this.ALERT_PINNED];
     },
 
-    // ── SVG icons untuk Candle Style (index 0-4) ──
+    // ── SVG icons untuk Candle Style (index 0-7, match enum CandleRenderStyle) ──
+    //   0 Candle, 1 Line, 2 Area, 3 FP Overlay, 4 FP Profile,
+    //   5 FP Bar, 6 TPO, 7 Heikin Ashi (V7.6)
     CANDLE_SVGS: [
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="8" width="4" height="10"/><line x1="8" y1="4" x2="8" y2="20"/><rect x="14" y="6" width="4" height="12"/><line x1="16" y1="2" x2="16" y2="22"/></svg>',
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 17 9 11 13 15 21 7"/></svg>',
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="6" width="14" height="12"/><line x1="5" y1="10" x2="19" y2="10"/><line x1="5" y1="14" x2="19" y2="14"/><line x1="12" y1="6" x2="12" y2="18"/></svg>',
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16"/><line x1="4" y1="8" x2="20" y2="8"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="16" x2="20" y2="16"/><line x1="8" y1="4" x2="8" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="16" y1="4" x2="16" y2="20"/></svg>',
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="10" width="8" height="4"/><rect x="13" y="8" width="8" height="8"/></svg>'
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="10" width="8" height="4"/><rect x="13" y="8" width="8" height="8"/></svg>',
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="9" width="7" height="6"/><rect x="13" y="7" width="7" height="10"/></svg>',
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="12" x2="20" y2="12" stroke-dasharray="3 2"/><rect x="6" y="6" width="12" height="12" fill="none"/><text x="12" y="15" font-size="6" text-anchor="middle" stroke="none" fill="currentColor">TPO</text></svg>',
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="7" width="5" height="12"/><line x1="7.5" y1="5" x2="7.5" y2="21"/><rect x="13" y="9" width="5" height="8"/><line x1="15.5" y1="7" x2="15.5" y2="17"/></svg>'
     ],
 
     // ── Event Binding ──
@@ -246,6 +251,19 @@ JT.NavTools = {
             btn.dataset.active = JT.State.replayActive ? 'true' : 'false';
             JT.Utils.flashButton(btn);
             return;
+        }
+
+        // 🔥 V7.6.5: Candle button (segIdx 2) → JS popup modern (CandleStylePopup)
+        // bukan ImGui popup C++ (##CandleStylePopup). Card click di popup →
+        // export _wasm_nav_set_candle_style. Fallback ke ImGui popup kalau
+        // CandleStylePopup belum ter-load (defensive).
+        if (segIdx === 2) {
+            if (window.JT && JT.CandleStylePopup) {
+                JT.CandleStylePopup.open();
+                JT.Utils.flashButton(btn);
+                return;
+            }
+            // fallback: lama (wasm_nav_click_segment → ImGui popup)
         }
 
         // Normal: panggil C++ untuk set active segment
