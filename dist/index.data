@@ -545,6 +545,14 @@ public:
     // Fungsi Update baru: Lebih cepat, cuma salin data mentah
     void UpdateData(const std::vector<Candle>& candles);
 
+    // 🔥 V7.5: TREND CANDLES — overload dengan trend per-bar (dari
+    // TrendCandleEngine::Compute). trend[i] ∈ [-1,+1]:
+    //   >0 uptrend → mix ke trendUpColor, <0 downtrend → trendDownColor,
+    //   |t|<trendNeutral → netral (fade ke trendFlatColor).
+    // Di-encode ke instance padding1 — layout buffer TETAP 32 byte.
+    void UpdateData(const std::vector<Candle>& candles,
+                    const std::vector<float>& trend);
+
     // Render Function
     void Render(float xMin, float xMax, float yMin, float yMax,
                 ImVec2 plotPos, ImVec2 plotSize, ImVec2 screenSize, float candleWidth);
@@ -562,6 +570,16 @@ public:
     // Hollow body mode — aktif saat FP style untuk lihat footprint lebih jelas
     // Body jadi frame kotak bolong, wick tetap solid line
     bool hollowBody = false;
+
+    // 🔥 V7.5: TREND CANDLE SETTINGS (dipakai shader tiap Render)
+    // trendEnabled = false → shader jalan jalur lama (zero cost).
+    bool  trendEnabled  = false;
+    float trendNeutral  = 0.30f;   // |t| di bawah ini → zona netral
+    bool  trendPaintWick= true;    // wick ikut di-tint tren
+    bool  trendFadeNeutral = true; // candle netral dipudarkan
+    ImVec4 trendUpColor   = ImVec4(0.10f, 1.00f, 0.30f, 1.0f);
+    ImVec4 trendDownColor = ImVec4(1.00f, 0.15f, 0.10f, 1.0f);
+    ImVec4 trendFlatColor = ImVec4(0.55f, 0.55f, 0.60f, 1.0f);
 
     // 🔥 FIX: Clear GPU instances saat switch symbol
     // Reset bufferCapacity juga → force glBufferData (full realloc) pada UpdateData berikutnya.
@@ -606,6 +624,15 @@ uniform vec4 uColorBear;
 uniform vec4 uWickColorBull;
 uniform vec4 uWickColorBear;
 
+// 🔥 V7.5: TREND CANDLES — aInstData2.z = trend ∈ [-1,+1]
+uniform float uTrendEnabled;   // 0 = jalur lama (zero cost)
+uniform float uTrendNeutral;   // |trend| < ini → zona netral
+uniform float uTrendPaintWick; // 1 = wick ikut di-tint
+uniform float uTrendFade;      // 1 = candle netral dipudarkan
+uniform vec4  uTrendUp;        // warna uptrend
+uniform vec4  uTrendDown;      // warna downtrend
+uniform vec4  uTrendFlat;      // warna netral/sideway
+
 out vec4 vColor;
 out vec2 vUV;   // koordinat 0..1 di dalam rect (untuk hollow discard di FS)
 
@@ -616,7 +643,8 @@ void main() {
     float high  = aInstData1.w;
     float low   = aInstData2.x;
     float type  = aInstData2.y; // 1.0 = Bull, 0.0 = Bear
-    
+    float trend = aInstData2.z; // 🔥 V7.5: [−1,+1], 0 = OFF/netral
+
     // 🔥 LOGIKA PEWARNAAN CANGGIH
     if (type > 0.5) {
         // BULLISH
@@ -626,6 +654,35 @@ void main() {
         // BEARISH
         if (uMode > 0.5) vColor = uWickColorBear; // Sedang render Wick? Pakai warna Wick Bear
         else             vColor = uColorBear;     // Sedang render Body? Pakai warna Body Bear
+    }
+
+    // 🔥 V7.5: TREND CANDLE COLORING — "candle ikut tren rata-rata".
+    // Semantik (sesuai request user):
+    //   Uptrend kuat  → SEMUA candle hijau  (bahkan yang close<open!)
+    //   Downtrend kuat→ SEMUA candle merah  (bahkan yang close>open!)
+    //   Netral/chop   → abu pudar
+    // Implementasi: warna dasar bull/bear di-mix ke warna tren
+    // dengan kekuatan |trend|. Trend > neutral → dominasi penuh
+    // (solid trend color), zona transisi → gradasi halus.
+    if (uTrendEnabled > 0.5 && abs(trend) > 0.0001) {
+        bool isWickPass = (uMode > 0.5);
+        if (!isWickPass || uTrendPaintWick > 0.5) {
+            vec4 tcol = (trend > 0.0) ? uTrendUp : uTrendDown;
+            float strength = abs(trend);
+            if (strength < uTrendNeutral) {
+                // Zona netral: pudar ke abu (atau tetap base kalau fade OFF)
+                if (uTrendFade > 0.5) {
+                    vColor = mix(vColor, uTrendFlat, 0.65);
+                    vColor.a *= 0.55;   // candle netral memudar
+                }
+            } else {
+                // Remap kekuatan di atas neutral → [0,1] supaya
+                // tepat di neutral = mulai tint, 1.0 = full tren
+                float k = clamp((strength - uTrendNeutral) / max(1.0 - uTrendNeutral, 0.001), 0.0, 1.0);
+                vColor.rgb = mix(vColor.rgb, tcol.rgb, k);
+                vColor.a   = max(vColor.a, tcol.a * k);
+            }
+        }
     }
 
     float yTop, yBtm;
@@ -5507,6 +5564,7 @@ using ExecutionResult = ToolExecutionResult;
 #include "OrderFlowRenderer.h"  // ← tiap tab punya OF renderer sendiri
 #include "TPOProfileRenderer.h" // ← tiap tab punya TPO renderer sendiri
 #include "CrosshairRenderer.h"  // ← tiap tab punya crosshair state sendiri
+#include "TrendCandles.h"       // 🔥 V7.5: trend engine per-tab (custom candle)
 
 enum CandleRenderStyle {
     RENDER_CANDLE,
@@ -5525,19 +5583,31 @@ enum CandleRenderStyle {
     // + POC (Point of Control) + VA (Value Area 70%) + HVN/LVN
     RENDER_TPO,
 
+    // ── HEIKIN-ASHI (V7.6) ─────────────────────────────────────
+    // Candle yang dihaluskan dari OHLC asli:
+    //   HA_close = (O+H+L+C)/4
+    //   HA_open  = (prev_HA_open + prev_HA_close)/2  (seed = (O+C)/2)
+    //   HA_high  = max(H, HA_open, HA_close)
+    //   HA_low   = min(L, HA_open, HA_close)
+    // Di-render pakai GPU candle shader yang SAMA (gak ada shader baru) —
+    // cuma OHLC di-upload ke VBO sudah ditimpa nilai HA. Body berurutan
+    // lebih halus → tren kelihatan jelas (konsekutif hijau = uptrend kuat).
+    RENDER_HEIKIN_ASHI,
+
     RENDER_STYLE_COUNT  // sentinel untuk cycling
 };
 
 static inline const char* CandleStyleName(CandleRenderStyle s) {
     switch(s) {
-        case RENDER_CANDLE:     return "Candle";
-        case RENDER_LINE:       return "Line";
-        case RENDER_AREA:       return "Area";
-        case RENDER_FP_OVERLAY: return "Footprint X-Ray";
-        case RENDER_FP_PROFILE: return "FP Profile";
-        case RENDER_FP_BAR:     return "FP Bar";
-        case RENDER_TPO:        return "TPO Profile";
-        default:                return "Candle";
+        case RENDER_CANDLE:      return "Candle";
+        case RENDER_LINE:        return "Line";
+        case RENDER_AREA:        return "Area";
+        case RENDER_FP_OVERLAY:  return "Footprint X-Ray";
+        case RENDER_FP_PROFILE:  return "FP Profile";
+        case RENDER_FP_BAR:      return "FP Bar";
+        case RENDER_TPO:         return "TPO Profile";
+        case RENDER_HEIKIN_ASHI: return "Heikin Ashi";
+        default:                 return "Candle";
     }
 }
 
@@ -5579,6 +5649,25 @@ struct ChartTabState {
     ImVec2 savedPlotPos      = {0.f, 0.f}; // disimpan saat BeginPlot
     ImVec2 savedPlotSize     = {0.f, 0.f}; // disimpan saat BeginPlot
     bool   plotBoundsReady   = false;       // true setelah frame pertama render
+};
+
+// ─────────────────────────────────────────────
+// 🔥 V7.6.2: HEIKIN-ASHI SETTINGS (per-tab)
+// Konfigurasi overlay status HA — model MQL5 Heikin_Ashi_Overlay.mq5
+// input table. Diatur via RenderHASettings popup (OrderFlowSettingsUI.h).
+// Status label di-chart digambar HANYA saat showStatus=true.
+// ─────────────────────────────────────────────
+enum HACorner { HA_CORNER_TL = 0, HA_CORNER_TR, HA_CORNER_BL, HA_CORNER_BR };
+struct HASettings {
+    bool  showStatus   = true;        // tampilkan label status di chart
+    bool  showRun      = true;        // tampilkan run length
+    bool  showStrong   = true;        // tampilkan tag (strong)
+    float strongEpsMul = 0.5f;        // sensitivitas "no shadow" = tickSize * strongEpsMul
+                                      //   (fallback rentang*0.5% * strongEpsMul/0.5)
+    float bullRGB[3]   = { 50.f/255.f, 215.f/255.f, 100.f/255.f };  // hijau (buy)
+    float bearRGB[3]   = {255.f/255.f,  85.f/255.f,  85.f/255.f };  // merah (sell)
+    int   corner       = HA_CORNER_TL;  // posisi label (MT5 ENUM_BASE_CORNER analog)
+    float fontSize     = 0.0f;         // 0 = default ImGui font
 };
 
 // ─────────────────────────────────────────────
@@ -5624,6 +5713,11 @@ struct ChartTab {
     // Sama seperti OrderFlowRenderer — tiap tab punya instance sendiri
     TPOProfileRenderer tpoRenderer;
 
+    // 🔥 V7.5: TREND CANDLE ENGINE PER-TAB — custom candlestick
+    // "candle ikut tren rata-rata": uptrend → semua hijau, downtrend
+    // → semua merah. CPU compute incremental + GPU tint via padding1.
+    TrendCandleEngine trendEngine;
+
     CandleRenderStyle renderStyle = RENDER_CANDLE;
     ImVec4 lineColor = {0.2f, 0.7f, 1.f, 1.f};
 
@@ -5646,6 +5740,10 @@ struct ChartTab {
     //    - Square/Circle/Alphabet (right panel)
     //    - Overlay on Chart (GOMSBR style — squares di chart)
     bool showTPOOverlay = false;
+
+    // 🔥 V7.6.2: HEIKIN-ASHI settings — konfigurasi status label HA.
+    // Lihat struct HASettings di atas. Dipakai saat renderStyle == RENDER_HEIKIN_ASHI.
+    HASettings haCfg;
 
     // ── SMART SYNC (Zero Copy Per Frame) ──────────────────────
     // Buffer candle milik tab ini — tidak di-copy ulang tiap frame
